@@ -127,6 +127,23 @@ namespace {
         return QueueReservation{};
     }
 
+    [[nodiscard]] bool offloadQueueSupportsSurface(
+            const vk::Vulkan& vk,
+            const OffloadQueueInfo& offload,
+            VkSurfaceKHR surface) {
+        if (!vk.fi().GetPhysicalDeviceSurfaceSupportKHR)
+            return false;
+
+        VkBool32 supported{VK_FALSE};
+        const auto res = vk.fi().GetPhysicalDeviceSurfaceSupportKHR(
+            vk.physdev(), offload.familyIndex, surface, &supported);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res,
+                "vkGetPhysicalDeviceSurfaceSupportKHR() failed");
+
+        return supported == VK_TRUE;
+    }
+
     // instance-wide info initialized at instance creation(s)
     struct InstanceInfo {
         std::vector<VkInstance> handles; // there may be several instances
@@ -421,15 +438,9 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
 
         try {
-            // retire old swapchain. Virtual images must outlive Root contexts,
-            // but a retired WSI swapchain can no longer be acquired/presented.
-            if (info->oldSwapchain) {
-                layer_info->root.removeSwapchainContext(info->oldSwapchain);
-                instance_info->virtualSwapchains.erase(info->oldSwapchain);
-                instance_info->swapchainInfos.erase(info->oldSwapchain);
-                instance_info->swapchains.erase(info->oldSwapchain);
-            }
-
+            // Do not tear down oldSwapchain here. Its application-visible
+            // virtual VkImage handles remain valid until vkDestroySwapchainKHR
+            // is called for that handle, including during resize/recreation.
             layer_info->root.update(); // ensure config is up to date
 
             // create underlying real swapchain
@@ -465,14 +476,20 @@ namespace {
 
                 if (queueIt != instance_info->offloadQueues.end() && spec.supported()) {
                     try {
-                        virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
-                            it->second,
-                            queueIt->second.queue,
-                            queueIt->second.mutex,
-                            realImages.size(),
-                            spec);
-                        applicationImages = virtualRuntime->imageHandles();
-                        virtualized = true;
+                        if (!offloadQueueSupportsSurface(
+                                it->second, queueIt->second, newInfo.surface)) {
+                            std::cerr << "lsfg-vk: dedicated fixed-pacing queue cannot "
+                                "present to this surface; falling back to synchronous 3B path\n";
+                        } else {
+                            virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
+                                it->second,
+                                queueIt->second.queue,
+                                queueIt->second.mutex,
+                                realImages.size(),
+                                spec);
+                            applicationImages = virtualRuntime->imageHandles();
+                            virtualized = true;
+                        }
                     } catch (const std::exception& e) {
                         std::cerr << "lsfg-vk: virtual swapchain setup failed; "
                             "falling back to synchronous 3B path:\n";

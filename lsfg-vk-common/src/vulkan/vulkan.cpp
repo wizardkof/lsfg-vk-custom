@@ -307,7 +307,10 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,
-                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr,
+        .GetPhysicalDeviceSurfaceSupportKHR = graphical ?
+            ipa<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>(mpa, i,
+                "vkGetPhysicalDeviceSurfaceSupportKHR") : nullptr
     };
 }
 

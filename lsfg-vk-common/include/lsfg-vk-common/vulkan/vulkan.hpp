@@ -31,6 +31,7 @@ namespace vk {
 
         // extension functions
         PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
+        PFN_vkGetPhysicalDeviceSurfaceSupportKHR GetPhysicalDeviceSurfaceSupportKHR;
     };
 
     /// initialize vulkan instance function pointers
