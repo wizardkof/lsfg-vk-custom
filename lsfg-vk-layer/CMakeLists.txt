@@ -2,7 +2,8 @@ set(LAYER_SOURCES
     "src/entrypoint.cpp"
     "src/fixed_frame_scheduler.cpp"
     "src/instance.cpp"
-    "src/swapchain.cpp")
+    "src/swapchain.cpp"
+    "src/virtual_swapchain_state.cpp")
 
 add_library(lsfg-vk-layer SHARED ${LAYER_SOURCES})
 
