@@ -1,5 +1,6 @@
 set(LAYER_SOURCES
     "src/entrypoint.cpp"
+    "src/fixed_frame_scheduler.cpp"
     "src/instance.cpp"
     "src/swapchain.cpp")
 

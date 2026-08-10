@@ -11,11 +11,13 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,20 @@ using namespace lsfgvk;
 using namespace lsfgvk::layer;
 
 namespace {
+    [[nodiscard]] bool isFixedMode(const ls::GameConf& profile) {
+        return profile.frame_generation_mode == ls::FrameGenerationMode::Fixed;
+    }
+
+    [[nodiscard]] bool isAdaptiveBypass(const ls::GameConf& profile) {
+        return !isFixedMode(profile) && profile.multiplier == 1;
+    }
+
+    [[nodiscard]] size_t generatedFrameCapacity(const ls::GameConf& profile) {
+        if (isFixedMode(profile))
+            return FixedFrameScheduler::DEFAULT_MAX_GENERATED_FRAMES;
+        return profile.multiplier > 1 ? profile.multiplier - 1 : 0;
+    }
+
     VkImageMemoryBarrier barrierHelper(VkImage handle,
             VkAccessFlags srcAccessMask,
             VkAccessFlags dstAccessMask,
@@ -57,7 +73,11 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
 
     switch (profile.pacing) {
         case ls::Pacing::None:
-            createInfo.minImageCount += profile.multiplier;
+            // Preserve the exact Adaptive expansion. Fixed reserves enough real
+            // swapchain images for its maximum dynamic generation capacity.
+            createInfo.minImageCount += isFixedMode(profile)
+                ? FixedFrameScheduler::DEFAULT_MAX_GENERATED_FRAMES + 1
+                : profile.multiplier;
             if (maxImages && createInfo.minImageCount > maxImages)
                 createInfo.minImageCount = maxImages;
 
@@ -69,17 +89,18 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
 Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             ls::GameConf profile, SwapchainInfo info) :
         instance(backend),
+        fixedScheduler(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
-    // multiplier == 1: keep the Vulkan layer/profile active, but bypass LSFG.
-    // This leaves the real swapchain usable so hot reload can turn FG back on.
-    if (this->profile.multiplier == 1)
+    // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
+    // bypasses LSFG. Fixed mode ignores multiplier and remains active.
+    if (isAdaptiveBypass(this->profile))
         return;
 
     const VkExtent2D extent = this->info.extent;
     const bool hdr = this->info.format > 57;
 
     std::vector<int> sourceFds(2);
-    std::vector<int> destinationFds(this->profile.multiplier - 1);
+    std::vector<int> destinationFds(generatedFrameCapacity(this->profile));
 
     this->sourceImages.reserve(sourceFds.size());
     for (int& fd : sourceFds)
@@ -137,8 +158,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
-    // 1x = OFF: pass the original application frame straight through.
-    if (this->profile.multiplier == 1) {
+    // Adaptive 1x = OFF: pass the original application frame straight through.
+    // Fixed mode intentionally ignores multiplier.
+    if (isAdaptiveBypass(this->profile)) {
         const VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .pNext = next_chain,
@@ -154,9 +176,35 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     const auto& swapchainImage = this->info.images.at(imageIdx);
     const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
 
-    // schedule frame generation
+    const bool fixedMode = isFixedMode(this->profile);
+    FixedFrameScheduler::Plan fixedPlan{};
+    if (fixedMode) {
+        const auto now = std::chrono::steady_clock::now();
+        if (this->lastSourcePresent.has_value()) {
+            fixedPlan = this->fixedScheduler.plan(
+                std::chrono::duration_cast<FixedFrameScheduler::Duration>(
+                    now - *this->lastSourcePresent));
+        }
+        this->lastSourcePresent = now;
+
+        // If the application itself is faster than the requested output target,
+        // pace the real-frame path instead of attempting negative interpolation.
+        if (fixedPlan.sourceDelay > FixedFrameScheduler::Duration::zero())
+            std::this_thread::sleep_for(fixedPlan.sourceDelay);
+    }
+
+    const size_t generatedFrames = fixedMode
+        ? fixedPlan.timestamps.size()
+        : this->destinationImages.size();
+
+    // Schedule frame generation. Adaptive continues through the original API.
+    // Fixed uses the dynamic backend, including zero generated frames, so the
+    // backend's temporal history advances for every real application frame.
     try {
-        this->instance.get().scheduleFrames(this->ctx.get());
+        if (fixedMode)
+            this->instance.get().scheduleFrames(this->ctx.get(), fixedPlan.timestamps);
+        else
+            this->instance.get().scheduleFrames(this->ctx.get());
     } catch (const std::exception& e) {
         throw ls::error("failed to schedule frames", e);
     }
@@ -216,12 +264,29 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     );
 
     cmdbuf.end(vk);
-    cmdbuf.submit(vk,
-        semaphores, VK_NULL_HANDLE, 0,
-        {}, this->syncSemaphore->handle(), this->idx++
-    );
 
-    for (size_t i = 0; i < this->destinationImages.size(); i++) {
+    // With zero generated frames there is no post-copy pass to own renderFence
+    // or provide the binary semaphore used by the final QueuePresentKHR. Attach
+    // both to the source copy in that case.
+    vk::Semaphore* zeroPresentSemaphore{};
+    if (generatedFrames == 0) {
+        auto& pcs = this->postCopySemaphores.at(
+            this->idx % this->postCopySemaphores.size());
+        zeroPresentSemaphore = &pcs.second;
+        cmdbuf.submit(vk,
+            semaphores, VK_NULL_HANDLE, 0,
+            { zeroPresentSemaphore->handle() },
+            this->syncSemaphore->handle(), this->idx++,
+            this->renderFence->handle()
+        );
+    } else {
+        cmdbuf.submit(vk,
+            semaphores, VK_NULL_HANDLE, 0,
+            {}, this->syncSemaphore->handle(), this->idx++
+        );
+    }
+
+    for (size_t i = 0; i < generatedFrames; i++) {
         auto& pcs = this->postCopySemaphores.at(this->idx % this->postCopySemaphores.size());
         auto& destinationImage = this->destinationImages.at(i);
         auto& pass = this->passes.at(i);
@@ -284,7 +349,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         cmdbuf.submit(vk,
             waitSemaphores, this->syncSemaphore->handle(), this->idx,
             signalSemaphores, VK_NULL_HANDLE, 0,
-            i == this->destinationImages.size() - 1 ? this->renderFence->handle() : VK_NULL_HANDLE
+            i == generatedFrames - 1 ? this->renderFence->handle() : VK_NULL_HANDLE
         );
 
         // present swapchain image
@@ -306,11 +371,15 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
 
     // present original swapchain image
-    auto& lastPCS = this->postCopySemaphores.at((this->idx - 1) % this->postCopySemaphores.size());
+    const VkSemaphore finalWaitSemaphore = generatedFrames
+        ? this->postCopySemaphores.at(
+            (this->idx - 1) % this->postCopySemaphores.size()).second.handle()
+        : zeroPresentSemaphore->handle();
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .pNext = generatedFrames ? nullptr : next_chain,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &lastPCS.second.handle(),
+        .pWaitSemaphores = &finalWaitSemaphore,
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &imageIdx,

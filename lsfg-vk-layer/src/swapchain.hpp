@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "fixed_frame_scheduler.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
@@ -12,7 +13,9 @@
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -76,6 +79,9 @@ namespace lsfgvk::layer {
         ls::owned_ptr<ls::R<backend::Context>> ctx;
         size_t idx{1};
         size_t fidx{0}; // real frame index
+
+        FixedFrameScheduler fixedScheduler;
+        std::optional<std::chrono::steady_clock::time_point> lastSourcePresent;
 
         ls::GameConf profile;
         SwapchainInfo info;
