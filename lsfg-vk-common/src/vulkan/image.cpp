@@ -16,16 +16,18 @@ namespace {
     /// create a image
     ls::owned_ptr<VkImage> createImage(const vk::Vulkan& vk,
             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
-            bool external) {
+            bool external, const vk::ImageCreateOptions& options) {
         VkImage handle{};
 
         const VkExternalMemoryImageCreateInfo externalInfo{
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = options.pNext,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR
         };
         const VkImageCreateInfo imageInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = external ? &externalInfo : nullptr,
+            .pNext = external ? &externalInfo : options.pNext,
+            .flags = options.flags,
             .imageType = VK_IMAGE_TYPE_2D,
             .format = format,
             .extent = {
@@ -37,7 +39,10 @@ namespace {
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+            .sharingMode = options.sharingMode,
+            .queueFamilyIndexCount = static_cast<uint32_t>(options.queueFamilyIndices.size()),
+            .pQueueFamilyIndices = options.queueFamilyIndices.empty()
+                ? nullptr : options.queueFamilyIndices.data()
         };
         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -156,9 +161,20 @@ Image::Image(const vk::Vulkan& vk,
             VkImageUsageFlags usage,
             std::optional<int> importFd,
             std::optional<int*> exportFd) :
+        Image(vk, extent, format, usage, importFd, exportFd, ImageCreateOptions{}) {
+}
+
+Image::Image(const vk::Vulkan& vk,
+            VkExtent2D extent,
+            VkFormat format,
+            VkImageUsageFlags usage,
+            std::optional<int> importFd,
+            std::optional<int*> exportFd,
+            const ImageCreateOptions& options) :
         image(createImage(vk,
             extent, format, usage,
-            importFd.has_value() || exportFd.has_value()
+            importFd.has_value() || exportFd.has_value(),
+            options
         )),
         memory(allocateMemory(vk,
             *this->image,
