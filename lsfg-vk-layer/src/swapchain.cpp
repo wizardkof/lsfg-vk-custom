@@ -70,6 +70,11 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             ls::GameConf profile, SwapchainInfo info) :
         instance(backend),
         profile(std::move(profile)), info(std::move(info)) {
+    // multiplier == 1: keep the Vulkan layer/profile active, but bypass LSFG.
+    // This leaves the real swapchain usable so hot reload can turn FG back on.
+    if (this->profile.multiplier == 1)
+        return;
+
     const VkExtent2D extent = this->info.extent;
     const bool hdr = this->info.format > 57;
 
@@ -132,6 +137,20 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
+    // 1x = OFF: pass the original application frame straight through.
+    if (this->profile.multiplier == 1) {
+        const VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = next_chain,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        return vk.df().QueuePresentKHR(queue, &presentInfo);
+    }
+
     const auto& swapchainImage = this->info.images.at(imageIdx);
     const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
 
