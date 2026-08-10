@@ -105,6 +105,8 @@ namespace lsfgvk::backend {
         /// schedule frames
         /// (see lsfg-vk documentation)
         void scheduleFrames();
+        /// schedule zero or more frames at explicit interpolation timestamps
+        void scheduleFrames(const std::vector<float>& timestamps);
     private:
         std::pair<vk::Image, vk::Image> sourceImages;
         std::vector<vk::Image> destImages;
@@ -548,6 +550,32 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
     cmdbuf.submit(ctx.vk); // wait for completion
 }
 
+void Instance::scheduleFrames(
+        Context& context,
+        const std::vector<float>& timestamps) { // NOLINT (static)
+#ifdef LSFGVK_TESTING_RENDERDOC
+    const auto& impl = this->m_impl;
+    if (impl->getRenderDocAPI()) {
+        impl->getRenderDocAPI()->StartFrameCapture(
+            RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(impl->getVulkan().inst()),
+            nullptr);
+    }
+#endif
+    try {
+        context.scheduleFrames(timestamps);
+    } catch (const std::exception& e) {
+        throw backend::error("Unable to schedule fixed-target frames", e);
+    }
+#ifdef LSFGVK_TESTING_RENDERDOC
+    if (impl->getRenderDocAPI()) {
+        impl->getVulkan().df().DeviceWaitIdle(impl->getVulkan().dev());
+        impl->getRenderDocAPI()->EndFrameCapture(
+            RENDERDOC_DEVICEPOINTER_FROM_VKINSTANCE(impl->getVulkan().inst()),
+            nullptr);
+    }
+#endif
+}
+
 void Instance::scheduleFrames(Context& context) { // NOLINT (static)
 #ifdef LSFGVK_TESTING_RENDERDOC
     const auto& impl = this->m_impl;
@@ -623,6 +651,82 @@ void Context::scheduleFrames() {
     }
 
     this->idx += this->destImages.size();
+    this->fidx++;
+}
+
+void Context::scheduleFrames(const std::vector<float>& timestamps) {
+    if (timestamps.size() > this->destImages.size())
+        throw backend::error("requested more generated frames than the context capacity");
+
+    float previous = 0.0F;
+    for (const float timestamp : timestamps) {
+        if (!(timestamp > 0.0F && timestamp < 1.0F))
+            throw backend::error("frame generation timestamp must be between 0 and 1");
+        if (timestamp <= previous)
+            throw backend::error("frame generation timestamps must be strictly increasing");
+        previous = timestamp;
+    }
+
+    // Wait for the previous source-frame processing to complete before updating
+    // host-visible constant buffers that may still be referenced by the GPU.
+    if (this->fidx && !this->cmdbufFence.wait(this->ctx.vk))
+        throw backend::error("Timeout waiting for previous frame to complete");
+    this->cmdbufFence.reset(this->ctx.vk);
+
+    for (size_t i = 0; i < timestamps.size(); ++i) {
+        auto constants = backend::getDefaultConstantBuffer(
+            i, timestamps.size(), this->ctx.flow);
+        constants.timestamp = timestamps.at(i);
+        this->ctx.constantBuffers.at(i).update(this->ctx.vk, constants);
+    }
+
+    // Schedule the same pre-pass used by the adaptive path. This must run even
+    // when no intermediate frame is generated so temporal history advances.
+    const auto& prepass = this->cmdbufs.at(0);
+    prepass.begin(ctx.vk);
+
+    this->mipmaps.render(ctx.vk, prepass, this->fidx);
+    for (size_t i = 0; i < 7; ++i) {
+        this->alpha0.at(6 - i).render(ctx.vk, prepass);
+        this->alpha1.at(6 - i).render(ctx.vk, prepass, this->fidx);
+    }
+    this->beta0.render(ctx.vk, prepass, this->fidx);
+    this->beta1.render(ctx.vk, prepass);
+
+    prepass.end(ctx.vk);
+    prepass.submit(this->ctx.vk,
+        {}, this->syncSemaphore.handle(), this->idx,
+        {}, this->prepassSemaphore.handle(), this->idx,
+        timestamps.empty() ? this->cmdbufFence.handle() : VK_NULL_HANDLE
+    );
+
+    this->idx++;
+
+    // Schedule only the generated-frame passes requested for this source frame.
+    for (size_t i = 0; i < timestamps.size(); ++i) {
+        const auto& cmdbuf = this->cmdbufs.at(i + 1);
+        cmdbuf.begin(ctx.vk);
+
+        const auto& pass = this->passes.at(i);
+        for (size_t j = 0; j < 7; ++j) {
+            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
+            pass.gamma1.at(j).render(ctx.vk, cmdbuf);
+
+            if (j < 4) continue;
+            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
+            pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
+        }
+        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
+
+        cmdbuf.end(ctx.vk);
+        cmdbuf.submit(this->ctx.vk,
+            {}, this->prepassSemaphore.handle(), this->idx - 1,
+            {}, this->syncSemaphore.handle(), this->idx + i,
+            i == timestamps.size() - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE
+        );
+    }
+
+    this->idx += timestamps.size();
     this->fidx++;
 }
 

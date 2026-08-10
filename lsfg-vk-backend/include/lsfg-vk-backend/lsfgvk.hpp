@@ -115,6 +115,21 @@ namespace lsfgvk::backend {
         void scheduleFrames(Context& context);
 
         ///
+        /// Schedule zero or more generated frames using explicit interpolation timestamps.
+        ///
+        /// The context still processes the real source frame when timestamps is empty,
+        /// keeping temporal history and synchronization in step with the application.
+        ///
+        /// @param context Context to use.
+        /// @param timestamps Strictly increasing normalized timestamps in the range (0, 1).
+        /// @throws backend::error on failure.
+        ///
+        void scheduleFrames(
+            Context& context,
+            const std::vector<float>& timestamps
+        );
+
+        ///
         /// Close a frame generation context
         ///
         /// @param context Context to close.

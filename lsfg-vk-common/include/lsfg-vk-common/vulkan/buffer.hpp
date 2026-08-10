@@ -32,6 +32,21 @@ namespace vk {
         Buffer(const vk::Vulkan& vk, const void* data, size_t size,
             VkBufferUsageFlags usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
+        /// update an existing buffer without reallocating it
+        /// @param vk the vulkan instance
+        /// @param data data uploaded to the buffer
+        template<typename T>
+        void update(const vk::Vulkan& vk, const T& data) {
+            this->update(vk, reinterpret_cast<const void*>(&data), sizeof(T));
+        }
+
+        /// update an existing buffer without reallocating it
+        /// @param vk the vulkan instance
+        /// @param data data uploaded to the buffer
+        /// @param size size of the data in bytes
+        /// @throws ls::vulkan_error on failure or if size exceeds buffer capacity
+        void update(const vk::Vulkan& vk, const void* data, size_t size);
+
         /// get the buffer handle
         /// @return the buffer handle
         [[nodiscard]] const auto& handle() const { return this->buffer.get(); }
