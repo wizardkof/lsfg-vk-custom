@@ -166,6 +166,7 @@ void Root::modifySwapchainCreateInfo(const vk::Vulkan& vk, VkSwapchainCreateInfo
 
 void Root::createSwapchainContext(const vk::Vulkan& vk,
         VkSwapchainKHR swapchain, const SwapchainInfo& info) {
+    const std::scoped_lock lock(this->swapchainMutex);
     if (!this->active_profile.has_value())
         throw ls::error("attempted to create swapchain context while layer is inactive");
     const auto& profile = *this->active_profile;
@@ -209,6 +210,35 @@ void Root::createSwapchainContext(const vk::Vulkan& vk,
         Swapchain(vk, this->backend.mut(), profile, info));
 }
 
+VkResult Root::presentSwapchain(const vk::Vulkan& vk,
+        VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
+        VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
+        const std::vector<VkSemaphore>& semaphores,
+        std::stop_token stopToken,
+        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
+    const std::scoped_lock lock(this->swapchainMutex);
+    const auto it = this->swapchains.find(swapchain);
+    if (it == this->swapchains.end())
+        throw ls::error("swapchain context not found");
+
+    return it->second.present(vk, queue, std::move(queueMutex), swapchain,
+        nextChain, imageIndex, semaphores, stopToken, sourcePresentTime);
+}
+
+void Root::recreateSwapchainContext(const vk::Vulkan& vk,
+        VkSwapchainKHR swapchain, const SwapchainInfo& info) {
+    const std::scoped_lock lock(this->swapchainMutex);
+    if (!this->active_profile.has_value())
+        throw ls::error("attempted to recreate swapchain context while layer is inactive");
+    if (!this->backend.has_value())
+        throw ls::error("attempted to recreate swapchain context without backend");
+
+    this->swapchains.erase(swapchain);
+    this->swapchains.emplace(swapchain,
+        Swapchain(vk, this->backend.mut(), *this->active_profile, info));
+}
+
 void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {
+    const std::scoped_lock lock(this->swapchainMutex);
     this->swapchains.erase(swapchain);
 }

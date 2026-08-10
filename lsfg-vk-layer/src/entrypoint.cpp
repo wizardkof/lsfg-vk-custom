@@ -352,6 +352,15 @@ namespace {
 
     // destroy device
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
+        // A well-behaved application destroys swapchains first, but stop any
+        // remaining workers defensively before their VkDevice/queue disappears.
+        for (auto& [swapchain, runtime] : instance_info->virtualSwapchains) {
+            const auto swapchainIt = instance_info->swapchains.find(swapchain);
+            if (swapchainIt != instance_info->swapchains.end()
+                    && swapchainIt->second.get().dev() == device)
+                runtime->stop();
+        }
+
         instance_info->offloadQueues.erase(device);
 
         // destroy layer instance
@@ -438,9 +447,24 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
 
         try {
-            // Do not tear down oldSwapchain here. Its application-visible
-            // virtual VkImage handles remain valid until vkDestroySwapchainKHR
-            // is called for that handle, including during resize/recreation.
+            // vkCreateSwapchainKHR retires oldSwapchain immediately. Retired
+            // swapchains cannot acquire new real WSI images, so stop/join our
+            // asynchronous worker before the driver sees oldSwapchain. Keep
+            // the runtime and application-visible virtual VkImages alive until
+            // vkDestroySwapchainKHR, but drain hidden queue work first.
+            if (info && info->oldSwapchain != VK_NULL_HANDLE) {
+                const auto oldRuntime =
+                    instance_info->virtualSwapchains.find(info->oldSwapchain);
+                if (oldRuntime != instance_info->virtualSwapchains.end()) {
+                    oldRuntime->second->stop();
+                    const auto idle = it->second.df().DeviceWaitIdle(device);
+                    if (idle != VK_SUCCESS)
+                        throw ls::vulkan_error(idle,
+                            "vkDeviceWaitIdle() failed while retiring old swapchain");
+                    std::cerr << "lsfg-vk: retired old Fixed presentation worker before swapchain recreation\n";
+                }
+            }
+
             layer_info->root.update(); // ensure config is up to date
 
             // create underlying real swapchain
@@ -520,7 +544,50 @@ namespace {
             try {
                 layer_info->root.createSwapchainContext(
                     it->second, *swapchain, swapchainInfo);
+
+                if (virtualRuntime) {
+                    const auto& offload = instance_info->offloadQueues.at(device);
+                    const auto workerQueue = offload.queue;
+                    const auto workerMutex = offload.mutex;
+                    const auto workerSwapchain = *swapchain;
+                    virtualRuntime->startWorker(
+                        [workerSwapchain, workerQueue, workerMutex, device](
+                                uint32_t imageIndex,
+                                VkSemaphore readySemaphore,
+                                void* nextChain,
+                                std::stop_token stopToken,
+                                std::chrono::steady_clock::time_point sourcePresentTime) -> VkResult {
+                            const auto deviceIt = instance_info->devices.find(device);
+                            if (deviceIt == instance_info->devices.end())
+                                return VK_ERROR_DEVICE_LOST;
+
+                            try {
+                                return layer_info->root.presentSwapchain(
+                                    deviceIt->second,
+                                    workerQueue,
+                                    workerMutex,
+                                    workerSwapchain,
+                                    nextChain,
+                                    imageIndex,
+                                    { readySemaphore },
+                                    stopToken,
+                                    sourcePresentTime);
+                            } catch (const ls::vulkan_error& e) {
+                                if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
+                                    std::cerr << "lsfg-vk: asynchronous fixed presentation failed:\n";
+                                    std::cerr << "- " << e.what() << '\n';
+                                }
+                                return e.error();
+                            } catch (const std::exception& e) {
+                                std::cerr << "lsfg-vk: asynchronous fixed presentation failed:\n";
+                                std::cerr << "- " << e.what() << '\n';
+                                return VK_ERROR_UNKNOWN;
+                            }
+                        });
+                    std::cerr << "lsfg-vk: asynchronous Fixed presentation worker enabled\n";
+                }
             } catch (...) {
+                layer_info->root.removeSwapchainContext(*swapchain);
                 instance_info->swapchainInfos.erase(*swapchain);
                 throw;
             }
@@ -629,8 +696,8 @@ namespace {
                         continue;
                     }
 
-                    layer_info->root.removeSwapchainContext(swapchain);
-                    layer_info->root.createSwapchainContext(vk, swapchain, swapchainInfo);
+                    layer_info->root.recreateSwapchainContext(
+                        vk, swapchain, swapchainInfo);
                 }
 
                 std::cerr << "lsfg-vk: updated lsfg-vk configuration\n";
@@ -640,7 +707,18 @@ namespace {
             }
         }
 
-        // present each swapchain
+        // Present each swapchain. A single virtual Fixed swapchain with no
+        // pNext chain is the fast asynchronous path. pNext-bearing or batched
+        // presents remain synchronous through the worker so caller-owned data
+        // stays alive and legacy multi-swapchain behavior is preserved.
+        bool allVirtual = info->swapchainCount > 0;
+        for (size_t i = 0; i < info->swapchainCount; ++i) {
+            if (!instance_info->virtualSwapchains.contains(info->pSwapchains[i])) {
+                allVirtual = false;
+                break;
+            }
+        }
+
         for (size_t i = 0; i < info->swapchainCount; i++) {
             const auto& swapchain = info->pSwapchains[i];
 
@@ -648,39 +726,42 @@ namespace {
             if (it == instance_info->swapchains.end())
                 return VK_ERROR_INITIALIZATION_FAILED;
 
-            auto virtualIt = instance_info->virtualSwapchains.find(swapchain);
-            bool virtualPresentBegun{};
-            try {
-                std::vector<VkSemaphore> waitSemaphores;
+            std::vector<VkSemaphore> waitSemaphores;
+            // For an all-virtual batch the dedicated queue establishes FIFO
+            // ordering after the first bridge submit, so the application's
+            // binary present semaphores are consumed exactly once.
+            if (!allVirtual || i == 0) {
                 waitSemaphores.reserve(info->waitSemaphoreCount);
-
                 for (size_t j = 0; j < info->waitSemaphoreCount; j++)
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
+            }
 
+            auto virtualIt = instance_info->virtualSwapchains.find(swapchain);
+            try {
                 if (virtualIt != instance_info->virtualSwapchains.end()) {
-                    virtualPresentBegun =
-                        virtualIt->second->beginPresent(info->pImageIndices[i]);
-                    if (!virtualPresentBegun) {
-                        result = VK_ERROR_OUT_OF_DATE_KHR;
-                        if (info->pResults)
-                            info->pResults[i] = result;
-                        continue;
-                    }
+                    const bool synchronous = info->pNext != nullptr
+                        || info->swapchainCount != 1;
+                    result = virtualIt->second->queuePresent(
+                        queue,
+                        info->pImageIndices[i],
+                        waitSemaphores,
+                        const_cast<void*>(info->pNext),
+                        synchronous);
+                } else {
+                    result = layer_info->root.presentSwapchain(
+                        it->second,
+                        queue,
+                        nullptr,
+                        swapchain,
+                        const_cast<void*>(info->pNext),
+                        info->pImageIndices[i],
+                        waitSemaphores);
                 }
-
-                auto& context = layer_info->root.getSwapchainContext(swapchain);
-                result = context.present(it->second,
-                    queue, swapchain,
-                    const_cast<void*>(info->pNext),
-                    info->pImageIndices[i],
-                    { waitSemaphores.begin(), waitSemaphores.end() }
-                );
             } catch (const ls::vulkan_error& e) {
                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
                     std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain presentation:\n";
                     std::cerr << "- " << e.what() << '\n';
-                } // silently swallow out-of-date errors
-
+                }
                 result = e.error();
             } catch (const std::exception& e) {
                 std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain presentation:\n";
@@ -688,10 +769,7 @@ namespace {
                 result = VK_ERROR_UNKNOWN;
             }
 
-            if (virtualPresentBegun)
-                virtualIt->second->completePresent(info->pImageIndices[i]);
-
-            if (result != VK_SUCCESS && info->pResults)
+            if (info->pResults)
                 info->pResults[i] = result;
         }
 
@@ -707,13 +785,24 @@ namespace {
         if (it == instance_info->devices.end())
             return;
 
-        layer_info->root.removeSwapchainContext(swapchain);
-
         const auto runtime = instance_info->virtualSwapchains.find(swapchain);
         if (runtime != instance_info->virtualSwapchains.end()) {
             runtime->second->stop();
-            instance_info->virtualSwapchains.erase(runtime);
+            // The asynchronous worker can leave GPU work queued when a stop
+            // request interrupts a bounded acquire/fence wait. Swapchain
+            // destruction is rare, so conservatively drain the device before
+            // destroying worker-owned synchronization and swapchain resources.
+            const auto idle = it->second.df().DeviceWaitIdle(device);
+            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
+                std::cerr << "lsfg-vk: vkDeviceWaitIdle() failed during virtual swapchain destruction: "
+                    << idle << '\n';
+            }
         }
+
+        layer_info->root.removeSwapchainContext(swapchain);
+
+        if (runtime != instance_info->virtualSwapchains.end())
+            instance_info->virtualSwapchains.erase(runtime);
 
         instance_info->swapchainInfos.erase(swapchain);
         instance_info->swapchains.erase(swapchain);

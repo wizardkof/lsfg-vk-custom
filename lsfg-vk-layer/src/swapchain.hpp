@@ -15,7 +15,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
@@ -25,8 +28,8 @@ namespace lsfgvk::layer {
 
     /// swapchain info struct
     struct SwapchainInfo {
-        // Images exposed to the application. In the synchronous 3C2B2A bridge
-        // these are virtual images; otherwise they are the real swapchain images.
+        // Images exposed to the application. In the Fixed virtual path these
+        // are persistent virtual images; otherwise they are the real WSI images.
         std::vector<VkImage> images;
         // Underlying WSI images. Empty/non-distinct for the legacy path.
         std::vector<VkImage> realImages;
@@ -63,9 +66,12 @@ namespace lsfgvk::layer {
         /// @param semaphores semaphores to wait on before presenting
         /// @throws ls::vulkan_error on vulkan errors
         VkResult present(const vk::Vulkan& vk,
-            VkQueue queue, VkSwapchainKHR swapchain,
+            VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
+            VkSwapchainKHR swapchain,
             void* next_chain, uint32_t imageIdx,
-            const std::vector<VkSemaphore>& semaphores);
+            const std::vector<VkSemaphore>& semaphores,
+            std::stop_token stopToken = {},
+            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt);
     private:
         std::vector<vk::Image> sourceImages;
         std::vector<vk::Image> destinationImages;

@@ -16,7 +16,10 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -63,6 +66,25 @@ namespace {
                 .layerCount = 1
             }
         };
+    }
+
+    VkResult acquireRealSwapchainImage(const vk::Vulkan& vk,
+            VkSwapchainKHR swapchain, VkSemaphore semaphore,
+            uint32_t* imageIndex, std::stop_token stopToken) {
+        constexpr uint64_t WORKER_ACQUIRE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
+        while (true) {
+            if (stopToken.stop_possible() && stopToken.stop_requested())
+                return VK_ERROR_OUT_OF_DATE_KHR;
+
+            const uint64_t timeout = stopToken.stop_possible()
+                ? WORKER_ACQUIRE_SLICE_NS
+                : UINT64_MAX;
+            const auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                timeout, semaphore, VK_NULL_HANDLE, imageIndex);
+            if (res == VK_TIMEOUT && stopToken.stop_possible())
+                continue;
+            return res;
+        }
     }
 }
 
@@ -160,9 +182,12 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
 }
 
 VkResult Swapchain::present(const vk::Vulkan& vk,
-        VkQueue queue, VkSwapchainKHR swapchain,
+        VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
+        VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
-        const std::vector<VkSemaphore>& semaphores) {
+        const std::vector<VkSemaphore>& semaphores,
+        std::stop_token stopToken,
+        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
     // Adaptive 1x = OFF: pass the original application frame straight through.
     // Fixed mode intentionally ignores multiplier.
     if (isAdaptiveBypass(this->profile)) {
@@ -185,9 +210,10 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
 
     const bool fixedMode = isFixedMode(this->profile);
+    const bool workerOffload = this->info.virtualized && fixedMode && queueMutex;
     FixedFrameScheduler::Plan fixedPlan{};
     if (fixedMode) {
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = sourcePresentTime.value_or(std::chrono::steady_clock::now());
         if (this->lastSourcePresent.has_value()) {
             fixedPlan = this->fixedScheduler.plan(
                 std::chrono::duration_cast<FixedFrameScheduler::Duration>(
@@ -281,17 +307,35 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto& pcs = this->postCopySemaphores.at(
             this->idx % this->postCopySemaphores.size());
         zeroPresentSemaphore = &pcs.second;
-        cmdbuf.submit(vk,
-            semaphores, VK_NULL_HANDLE, 0,
-            { zeroPresentSemaphore->handle() },
-            this->syncSemaphore->handle(), this->idx++,
-            this->info.virtualized ? VK_NULL_HANDLE : this->renderFence->handle()
-        );
+        if (workerOffload) {
+            const std::scoped_lock queueLock(*queueMutex);
+            cmdbuf.submit(vk, queue,
+                semaphores, VK_NULL_HANDLE, 0,
+                { zeroPresentSemaphore->handle() },
+                this->syncSemaphore->handle(), this->idx++,
+                VK_NULL_HANDLE
+            );
+        } else {
+            cmdbuf.submit(vk,
+                semaphores, VK_NULL_HANDLE, 0,
+                { zeroPresentSemaphore->handle() },
+                this->syncSemaphore->handle(), this->idx++,
+                this->info.virtualized ? VK_NULL_HANDLE : this->renderFence->handle()
+            );
+        }
     } else {
-        cmdbuf.submit(vk,
-            semaphores, VK_NULL_HANDLE, 0,
-            {}, this->syncSemaphore->handle(), this->idx++
-        );
+        if (workerOffload) {
+            const std::scoped_lock queueLock(*queueMutex);
+            cmdbuf.submit(vk, queue,
+                semaphores, VK_NULL_HANDLE, 0,
+                {}, this->syncSemaphore->handle(), this->idx++
+            );
+        } else {
+            cmdbuf.submit(vk,
+                semaphores, VK_NULL_HANDLE, 0,
+                {}, this->syncSemaphore->handle(), this->idx++
+            );
+        }
     }
 
     for (size_t i = 0; i < generatedFrames; i++) {
@@ -301,11 +345,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
         // acquire underlying real swapchain image
         uint32_t aqImageIdx{};
-        auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-            UINT64_MAX, pass.acquireSemaphore.handle(),
-            VK_NULL_HANDLE,
-            &aqImageIdx
-        );
+        auto res = acquireRealSwapchainImage(vk, swapchain,
+            pass.acquireSemaphore.handle(), &aqImageIdx,
+            workerOffload ? stopToken : std::stop_token{});
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
@@ -355,13 +397,22 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         };
 
         passCmdbuf.end(vk);
-        passCmdbuf.submit(vk,
-            waitSemaphores, this->syncSemaphore->handle(), this->idx,
-            signalSemaphores, VK_NULL_HANDLE, 0,
-            (!this->info.virtualized && i == generatedFrames - 1)
-                ? this->renderFence->handle()
-                : VK_NULL_HANDLE
-        );
+        if (workerOffload) {
+            const std::scoped_lock queueLock(*queueMutex);
+            passCmdbuf.submit(vk, queue,
+                waitSemaphores, this->syncSemaphore->handle(), this->idx,
+                signalSemaphores, VK_NULL_HANDLE, 0,
+                VK_NULL_HANDLE
+            );
+        } else {
+            passCmdbuf.submit(vk,
+                waitSemaphores, this->syncSemaphore->handle(), this->idx,
+                signalSemaphores, VK_NULL_HANDLE, 0,
+                (!this->info.virtualized && i == generatedFrames - 1)
+                    ? this->renderFence->handle()
+                    : VK_NULL_HANDLE
+            );
+        }
 
         // Generated frames never carry the application's pNext when the
         // application is rendering into virtual images. The logical present
@@ -375,7 +426,12 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             .pSwapchains = &swapchain,
             .pImageIndices = &aqImageIdx,
         };
-        res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        if (workerOffload) {
+            const std::scoped_lock queueLock(*queueMutex);
+            res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        } else {
+            res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
 
@@ -407,15 +463,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
 
     // Virtual swapchain path: the application's image cannot be passed to WSI.
-    // Acquire a real image, copy the logical source frame into it, and present
-    // that real image. Stage 3C2B2A waits for this copy before recycling the
-    // virtual image; 3C2B2B will move this same operation onto the worker.
+    // The Fixed worker acquires a real image, copies the logical source frame
+    // into it and presents on the dedicated queue. The virtual image is not
+    // recycled until the GPU has finished reading it.
     uint32_t realImageIdx{};
-    auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-        UINT64_MAX,
-        this->virtualFinalAcquireSemaphore->handle(),
-        VK_NULL_HANDLE,
-        &realImageIdx);
+    auto res = acquireRealSwapchainImage(vk, swapchain,
+        this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
+        workerOffload ? stopToken : std::stop_token{});
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
@@ -456,16 +510,30 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     );
     finalCmdbuf.end(vk);
 
-    finalCmdbuf.submit(vk,
-        {
-            finalWaitSemaphore,
-            this->virtualFinalAcquireSemaphore->handle()
-        },
-        VK_NULL_HANDLE, 0,
-        { this->virtualFinalPresentSemaphore->handle() },
-        VK_NULL_HANDLE, 0,
-        this->renderFence->handle()
-    );
+    if (workerOffload) {
+        const std::scoped_lock queueLock(*queueMutex);
+        finalCmdbuf.submit(vk, queue,
+            {
+                finalWaitSemaphore,
+                this->virtualFinalAcquireSemaphore->handle()
+            },
+            VK_NULL_HANDLE, 0,
+            { this->virtualFinalPresentSemaphore->handle() },
+            VK_NULL_HANDLE, 0,
+            this->renderFence->handle()
+        );
+    } else {
+        finalCmdbuf.submit(vk,
+            {
+                finalWaitSemaphore,
+                this->virtualFinalAcquireSemaphore->handle()
+            },
+            VK_NULL_HANDLE, 0,
+            { this->virtualFinalPresentSemaphore->handle() },
+            VK_NULL_HANDLE, 0,
+            this->renderFence->handle()
+        );
+    }
 
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -476,15 +544,29 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         .pSwapchains = &swapchain,
         .pImageIndices = &realImageIdx,
     };
-    res = vk.df().QueuePresentKHR(queue, &presentInfo);
+    if (workerOffload) {
+        const std::scoped_lock queueLock(*queueMutex);
+        res = vk.df().QueuePresentKHR(queue, &presentInfo);
+    } else {
+        res = vk.df().QueuePresentKHR(queue, &presentInfo);
+    }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
 
-    // The application may reacquire this virtual image as soon as QueuePresent
-    // returns. Ensure the GPU has finished reading it before the runtime marks
-    // it Available again.
-    if (!this->renderFence->wait(vk, UINT64_MAX))
+    // The application may reacquire this virtual image only after the worker
+    // completes it. Use bounded waits in worker mode so swapchain destruction
+    // can request cancellation instead of joining a thread stuck in an
+    // infinite fence wait.
+    if (workerOffload) {
+        constexpr uint64_t WORKER_FENCE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
+        while (!this->renderFence->wait(vk, WORKER_FENCE_SLICE_NS)) {
+            if (stopToken.stop_requested())
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_DATE_KHR,
+                    "fixed presentation worker stopped");
+        }
+    } else if (!this->renderFence->wait(vk, UINT64_MAX)) {
         throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+    }
 
     this->fidx++;
     return res;

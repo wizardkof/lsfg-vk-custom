@@ -4,44 +4,73 @@
 
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
+#include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "virtual_swapchain_image_spec.hpp"
 #include "virtual_swapchain_state.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <stop_token>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <vulkan/vulkan_core.h>
 
 namespace lsfgvk::layer {
 
-    /// Owns the application-visible images of a virtual swapchain.
-    ///
-    /// Stage 3C2B2A intentionally keeps presentation synchronous. This object
-    /// lives outside Root/Swapchain contexts so hot-reloading a profile cannot
-    /// destroy VkImage handles that were already returned to the application.
+    /// Owns the application-visible images and asynchronous presentation worker
+    /// of a virtual swapchain. The worker is deliberately independent from the
+    /// Root-owned Swapchain object so hot reload never changes the lifetime of
+    /// VkImage handles already returned to the application.
     class VirtualSwapchainRuntime {
     public:
+        using Presenter = std::function<VkResult(
+            uint32_t imageIndex,
+            VkSemaphore readySemaphore,
+            void* nextChain,
+            std::stop_token stopToken,
+            std::chrono::steady_clock::time_point sourcePresentTime)>;
+
         VirtualSwapchainRuntime(const vk::Vulkan& vk,
             VkQueue offloadQueue,
             std::shared_ptr<std::mutex> offloadMutex,
             size_t imageCount,
             const VirtualSwapchainImageSpec& spec);
+        ~VirtualSwapchainRuntime();
 
         [[nodiscard]] VkResult getImages(uint32_t* count, VkImage* images) const noexcept;
 
         [[nodiscard]] VkResult acquire(uint64_t timeout,
             VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) noexcept;
 
-        [[nodiscard]] bool beginPresent(uint32_t imageIndex) noexcept;
-        void completePresent(uint32_t imageIndex) noexcept;
+        /// Start the single consumer that owns Fixed-mode presentation work.
+        void startWorker(Presenter presenter);
+
+        /// Consume the application's present wait semaphores on the source
+        /// presentation queue, then publish the virtual image to the worker.
+        /// This keeps future application frames from blocking the dedicated
+        /// offload queue ahead of the current worker frame. When synchronous
+        /// is true, this call waits for the worker result so nextChain remains
+        /// valid for the full presentation operation.
+        [[nodiscard]] VkResult queuePresent(VkQueue sourceQueue,
+            uint32_t imageIndex,
+            const std::vector<VkSemaphore>& waitSemaphores,
+            void* nextChain,
+            bool synchronous) noexcept;
+
         void stop() noexcept;
 
         [[nodiscard]] std::vector<VkImage> imageHandles() const;
+        [[nodiscard]] bool workerRunning() const noexcept;
+        [[nodiscard]] VkResult workerResult() const noexcept;
 
         VirtualSwapchainRuntime(const VirtualSwapchainRuntime&) = delete;
         VirtualSwapchainRuntime& operator=(const VirtualSwapchainRuntime&) = delete;
@@ -49,14 +78,43 @@ namespace lsfgvk::layer {
         VirtualSwapchainRuntime& operator=(VirtualSwapchainRuntime&&) = delete;
 
     private:
+        struct Completion {
+            std::mutex mutex;
+            std::condition_variable cv;
+            VkResult result{VK_SUCCESS};
+            bool done{};
+        };
+
+        struct Job {
+            void* nextChain{};
+            std::chrono::steady_clock::time_point sourcePresentTime;
+            std::shared_ptr<Completion> completion;
+        };
+
         [[nodiscard]] VkResult signalAcquire(VkSemaphore semaphore, VkFence fence) const noexcept;
+        [[nodiscard]] VkResult bridgePresentWaits(VkQueue sourceQueue,
+            uint32_t imageIndex,
+            const std::vector<VkSemaphore>& waitSemaphores) const noexcept;
+        void workerLoop(std::stop_token stopToken) noexcept;
+        void finishCompletion(const std::shared_ptr<Completion>& completion,
+            VkResult result) noexcept;
+        void failPending(VkResult result) noexcept;
 
         ls::R<const vk::Vulkan> vk;
         VkQueue offloadQueue{VK_NULL_HANDLE};
         std::shared_ptr<std::mutex> offloadMutex;
         std::vector<vk::Image> images;
+        std::vector<vk::Semaphore> readySemaphores;
         VirtualSwapchainState state;
+
         std::atomic<uint64_t> presentSerial{1};
+        std::atomic<VkResult> asyncResult{VK_SUCCESS};
+        std::atomic_bool stopping{false};
+
+        mutable std::mutex jobsMutex;
+        std::unordered_map<uint64_t, Job> jobs;
+        Presenter presenter;
+        std::jthread worker;
     };
 
 }

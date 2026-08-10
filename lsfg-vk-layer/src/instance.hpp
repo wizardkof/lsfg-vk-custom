@@ -9,8 +9,13 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "swapchain.hpp"
 
+#include <chrono>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <unordered_map>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -73,6 +78,16 @@ namespace lsfgvk::layer {
 
             return it->second;
         }
+        /// present through a swapchain context while protecting it from hot reload
+        VkResult presentSwapchain(const vk::Vulkan& vk,
+            VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
+            VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
+            const std::vector<VkSemaphore>& semaphores,
+            std::stop_token stopToken = {},
+            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt);
+        /// atomically replace a swapchain context after a configuration reload
+        void recreateSwapchainContext(const vk::Vulkan& vk, VkSwapchainKHR swapchain,
+            const SwapchainInfo& info);
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
@@ -81,6 +96,7 @@ namespace lsfgvk::layer {
         std::optional<ls::GameConf> active_profile;
 
         ls::lazy<backend::Instance> backend;
+        std::mutex swapchainMutex;
         std::unordered_map<VkSwapchainKHR, Swapchain> swapchains;
     };
 

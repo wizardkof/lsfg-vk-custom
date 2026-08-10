@@ -6,9 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -29,6 +31,7 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
         throw ls::error("virtual swapchain image specification is not supported");
 
     this->images.reserve(imageCount);
+    this->readySemaphores.reserve(imageCount);
     for (size_t i = 0; i < imageCount; ++i) {
         auto formatList = spec.makeFormatListInfo();
         const void* pNext = spec.hasFormatList ? &formatList : nullptr;
@@ -40,7 +43,12 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
             std::nullopt,
             std::nullopt,
             spec.imageOptions(pNext));
+        this->readySemaphores.emplace_back(vk);
     }
+}
+
+VirtualSwapchainRuntime::~VirtualSwapchainRuntime() {
+    this->stop();
 }
 
 VkResult VirtualSwapchainRuntime::getImages(uint32_t* count, VkImage* images) const noexcept {
@@ -80,6 +88,10 @@ VkResult VirtualSwapchainRuntime::acquire(uint64_t timeout,
     if (!imageIndex)
         return VK_ERROR_INITIALIZATION_FAILED;
 
+    const auto pending = this->asyncResult.load();
+    if (pending != VK_SUCCESS && pending != VK_SUBOPTIMAL_KHR)
+        return pending;
+
     std::optional<uint32_t> acquired;
     if (timeout == 0) {
         acquired = this->state.tryAcquire();
@@ -94,6 +106,9 @@ VkResult VirtualSwapchainRuntime::acquire(uint64_t timeout,
     }
 
     if (!acquired.has_value()) {
+        const auto result = this->asyncResult.load();
+        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+            return result;
         if (this->state.stopped())
             return VK_ERROR_OUT_OF_DATE_KHR;
         return timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
@@ -106,26 +121,208 @@ VkResult VirtualSwapchainRuntime::acquire(uint64_t timeout,
     }
 
     *imageIndex = *acquired;
-    return VK_SUCCESS;
+    return pending == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
 }
 
-bool VirtualSwapchainRuntime::beginPresent(uint32_t imageIndex) noexcept {
+void VirtualSwapchainRuntime::startWorker(Presenter presenter) {
+    if (!presenter)
+        throw ls::error("virtual swapchain worker requires a presenter");
+    if (this->worker.joinable())
+        throw ls::error("virtual swapchain worker already started");
+
+    this->presenter = std::move(presenter);
+    this->stopping.store(false);
+    this->worker = std::jthread([this](std::stop_token stopToken) {
+        this->workerLoop(stopToken);
+    });
+}
+
+VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
+        uint32_t imageIndex,
+        const std::vector<VkSemaphore>& waitSemaphores) const noexcept {
+    if (sourceQueue == VK_NULL_HANDLE || imageIndex >= this->readySemaphores.size())
+        return VK_ERROR_OUT_OF_DATE_KHR;
+
+    std::vector<VkPipelineStageFlags> stages(
+        waitSemaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    const auto ready = this->readySemaphores.at(imageIndex).handle();
+    const VkSubmitInfo submitInfo{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size()),
+        .pWaitSemaphores = waitSemaphores.empty() ? nullptr : waitSemaphores.data(),
+        .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
+        .commandBufferCount = 0,
+        .pCommandBuffers = nullptr,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &ready
+    };
+
+    // vkQueuePresentKHR requires host access to its queue to be externally
+    // synchronized by the caller. The layer is executing inside that call, so
+    // this bridge submit can safely consume the same present waits on the
+    // application's source queue before returning control to the application.
+    return this->vk.get().df().QueueSubmit(
+        sourceQueue, 1, &submitInfo, VK_NULL_HANDLE);
+}
+
+VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
+        uint32_t imageIndex,
+        const std::vector<VkSemaphore>& waitSemaphores,
+        void* nextChain,
+        bool synchronous) noexcept {
+    if (!this->worker.joinable() || !this->presenter || this->stopping.load()) {
+        const auto result = this->asyncResult.load();
+        return result == VK_SUCCESS ? VK_ERROR_OUT_OF_DATE_KHR : result;
+    }
+
+    const auto pending = this->asyncResult.load();
+    if (pending != VK_SUCCESS && pending != VK_SUBOPTIMAL_KHR)
+        return pending;
+
     const auto serial = this->presentSerial.fetch_add(1);
-    if (!this->state.queuePresent(imageIndex, serial))
-        return false;
+    auto completion = synchronous ? std::make_shared<Completion>() : nullptr;
+    {
+        const std::scoped_lock lock(this->jobsMutex);
+        this->jobs.emplace(serial, Job {
+            .nextChain = nextChain,
+            .sourcePresentTime = std::chrono::steady_clock::now(),
+            .completion = completion
+        });
+    }
 
-    const auto present = this->state.waitPresent(VirtualSwapchainState::Duration::zero());
-    return present.has_value()
-        && present->imageIndex == imageIndex
-        && present->serial == serial;
+    // Queue the application's wait semaphores before publishing the job. This
+    // preserves vkQueuePresentKHR semaphore-consumption semantics while still
+    // allowing the CPU call to return before WSI presentation is performed.
+    const auto bridge = this->bridgePresentWaits(
+        sourceQueue, imageIndex, waitSemaphores);
+    if (bridge != VK_SUCCESS) {
+        {
+            const std::scoped_lock lock(this->jobsMutex);
+            this->jobs.erase(serial);
+        }
+        (void)this->state.release(imageIndex);
+        return bridge;
+    }
+
+    if (!this->state.queuePresent(imageIndex, serial)) {
+        {
+            const std::scoped_lock lock(this->jobsMutex);
+            this->jobs.erase(serial);
+        }
+        this->asyncResult.store(VK_ERROR_OUT_OF_DATE_KHR);
+        this->stopping.store(true);
+        this->state.stop();
+        this->finishCompletion(completion, VK_ERROR_OUT_OF_DATE_KHR);
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
+    if (!completion)
+        return pending == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+
+    std::unique_lock lock(completion->mutex);
+    completion->cv.wait(lock, [&]() {
+        return completion->done || this->stopping.load();
+    });
+    if (!completion->done) {
+        const auto result = this->asyncResult.load();
+        return result == VK_SUCCESS ? VK_ERROR_OUT_OF_DATE_KHR : result;
+    }
+    return completion->result;
 }
 
-void VirtualSwapchainRuntime::completePresent(uint32_t imageIndex) noexcept {
-    (void)this->state.complete(imageIndex);
+void VirtualSwapchainRuntime::finishCompletion(
+        const std::shared_ptr<Completion>& completion,
+        VkResult result) noexcept {
+    if (!completion)
+        return;
+
+    {
+        const std::scoped_lock lock(completion->mutex);
+        completion->result = result;
+        completion->done = true;
+    }
+    completion->cv.notify_all();
+}
+
+void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
+    while (!stopToken.stop_requested()) {
+        const auto present = this->state.waitPresent(
+            VirtualSwapchainState::Duration::max());
+        if (!present.has_value())
+            break;
+
+        Job job{};
+        {
+            const std::scoped_lock lock(this->jobsMutex);
+            const auto it = this->jobs.find(present->serial);
+            if (it == this->jobs.end()) {
+                this->asyncResult.store(VK_ERROR_UNKNOWN);
+                this->stopping.store(true);
+                this->state.stop();
+                break;
+            }
+            job = std::move(it->second);
+            this->jobs.erase(it);
+        }
+
+        VkResult result{VK_ERROR_UNKNOWN};
+        try {
+            result = this->presenter(
+                present->imageIndex,
+                this->readySemaphores.at(present->imageIndex).handle(),
+                job.nextChain,
+                stopToken,
+                job.sourcePresentTime);
+        } catch (...) {
+            result = VK_ERROR_UNKNOWN;
+        }
+
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+            (void)this->state.complete(present->imageIndex);
+            if (result == VK_SUBOPTIMAL_KHR)
+                this->asyncResult.store(result);
+        } else {
+            this->asyncResult.store(result);
+            this->stopping.store(true);
+            this->state.stop();
+        }
+
+        this->finishCompletion(job.completion, result);
+        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+            break;
+    }
+}
+
+void VirtualSwapchainRuntime::failPending(VkResult result) noexcept {
+    std::vector<std::shared_ptr<Completion>> completions;
+    {
+        const std::scoped_lock lock(this->jobsMutex);
+        completions.reserve(this->jobs.size());
+        for (auto& [serial, job] : this->jobs) {
+            (void)serial;
+            if (job.completion)
+                completions.push_back(std::move(job.completion));
+        }
+        this->jobs.clear();
+    }
+
+    for (const auto& completion : completions)
+        this->finishCompletion(completion, result);
 }
 
 void VirtualSwapchainRuntime::stop() noexcept {
+    this->stopping.store(true);
     this->state.stop();
+    if (this->worker.joinable()) {
+        this->worker.request_stop();
+        if (this->worker.get_id() != std::this_thread::get_id())
+            this->worker.join();
+    }
+
+    auto result = this->asyncResult.load();
+    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+        result = VK_ERROR_OUT_OF_DATE_KHR;
+    this->failPending(result);
 }
 
 std::vector<VkImage> VirtualSwapchainRuntime::imageHandles() const {
@@ -134,4 +331,12 @@ std::vector<VkImage> VirtualSwapchainRuntime::imageHandles() const {
     for (const auto& image : this->images)
         handles.push_back(image.handle());
     return handles;
+}
+
+bool VirtualSwapchainRuntime::workerRunning() const noexcept {
+    return this->worker.joinable() && !this->stopping.load();
+}
+
+VkResult VirtualSwapchainRuntime::workerResult() const noexcept {
+    return this->asyncResult.load();
 }
