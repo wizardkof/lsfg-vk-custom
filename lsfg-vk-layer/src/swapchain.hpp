@@ -25,11 +25,16 @@ namespace lsfgvk::layer {
 
     /// swapchain info struct
     struct SwapchainInfo {
+        // Images exposed to the application. In the synchronous 3C2B2A bridge
+        // these are virtual images; otherwise they are the real swapchain images.
         std::vector<VkImage> images;
+        // Underlying WSI images. Empty/non-distinct for the legacy path.
+        std::vector<VkImage> realImages;
         VkFormat format;
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
         VkPresentModeKHR presentMode;
+        bool virtualized{};
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
@@ -74,6 +79,12 @@ namespace lsfgvk::layer {
         };
         std::vector<RenderPass> passes;
         std::vector<std::pair<vk::Semaphore, vk::Semaphore>> postCopySemaphores;
+
+        // Final real-frame copy resources used only when the application renders
+        // into virtual swapchain images.
+        ls::lazy<vk::CommandBuffer> virtualFinalCommandBuffer;
+        ls::lazy<vk::Semaphore> virtualFinalAcquireSemaphore;
+        ls::lazy<vk::Semaphore> virtualFinalPresentSemaphore;
 
         ls::R<backend::Instance> instance;
         ls::owned_ptr<ls::R<backend::Context>> ctx;

@@ -4,7 +4,8 @@ set(LAYER_SOURCES
     "src/instance.cpp"
     "src/swapchain.cpp"
     "src/virtual_swapchain_state.cpp"
-    "src/virtual_swapchain_image_spec.cpp")
+    "src/virtual_swapchain_image_spec.cpp"
+    "src/virtual_swapchain_runtime.cpp")
 
 add_library(lsfg-vk-layer SHARED ${LAYER_SOURCES})
 

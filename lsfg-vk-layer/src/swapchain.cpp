@@ -138,6 +138,11 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
 
     this->renderCommandBuffer.emplace(vk);
     this->renderFence.emplace(vk);
+    if (this->info.virtualized) {
+        this->virtualFinalCommandBuffer.emplace(vk);
+        this->virtualFinalAcquireSemaphore.emplace(vk);
+        this->virtualFinalPresentSemaphore.emplace(vk);
+    }
     for (size_t i = 0; i < this->destinationImages.size(); i++) {
         this->passes.emplace_back(RenderPass {
             .commandBuffer = vk::CommandBuffer(vk),
@@ -174,6 +179,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
 
     const auto& swapchainImage = this->info.images.at(imageIdx);
+    const auto& outputImages = this->info.virtualized
+        ? this->info.realImages
+        : this->info.images;
     const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
 
     const bool fixedMode = isFixedMode(this->profile);
@@ -232,7 +240,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
     this->renderFence->reset(vk);
 
-    // copy swapchain image into backend source image
+    // copy application-visible swapchain image into backend source image
     const auto& cmdbuf = *this->renderCommandBuffer;
     cmdbuf.begin(vk);
 
@@ -265,9 +273,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
     cmdbuf.end(vk);
 
-    // With zero generated frames there is no post-copy pass to own renderFence
-    // or provide the binary semaphore used by the final QueuePresentKHR. Attach
-    // both to the source copy in that case.
+    // With zero generated frames there is no generated post-copy pass. Keep a
+    // binary semaphore to chain either the legacy final present or the virtual
+    // real-frame copy.
     vk::Semaphore* zeroPresentSemaphore{};
     if (generatedFrames == 0) {
         auto& pcs = this->postCopySemaphores.at(
@@ -277,7 +285,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             semaphores, VK_NULL_HANDLE, 0,
             { zeroPresentSemaphore->handle() },
             this->syncSemaphore->handle(), this->idx++,
-            this->renderFence->handle()
+            this->info.virtualized ? VK_NULL_HANDLE : this->renderFence->handle()
         );
     } else {
         cmdbuf.submit(vk,
@@ -291,7 +299,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto& destinationImage = this->destinationImages.at(i);
         auto& pass = this->passes.at(i);
 
-        // acquire swapchain image
+        // acquire underlying real swapchain image
         uint32_t aqImageIdx{};
         auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
             UINT64_MAX, pass.acquireSemaphore.handle(),
@@ -301,13 +309,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
-        const auto& aquiredSwapchainImage = this->info.images.at(aqImageIdx);
+        const auto& acquiredSwapchainImage = outputImages.at(aqImageIdx);
 
-        // copy backend destination image into swapchain image
-        auto& cmdbuf = pass.commandBuffer;
-        cmdbuf.begin(vk);
+        // copy backend destination image into real swapchain image
+        auto& passCmdbuf = pass.commandBuffer;
+        passCmdbuf.begin(vk);
 
-        cmdbuf.blitImage(vk,
+        passCmdbuf.blitImage(vk,
             {
                 barrierHelper(destinationImage.handle(),
                     VK_ACCESS_NONE,
@@ -315,17 +323,17 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
                 ),
-                barrierHelper(aquiredSwapchainImage,
+                barrierHelper(acquiredSwapchainImage,
                     VK_ACCESS_NONE,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                 ),
             },
-            { destinationImage.handle(), aquiredSwapchainImage },
+            { destinationImage.handle(), acquiredSwapchainImage },
             destinationImage.getExtent(),
             {
-                barrierHelper(aquiredSwapchainImage,
+                barrierHelper(acquiredSwapchainImage,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_MEMORY_READ_BIT,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -335,8 +343,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         );
 
         std::vector<VkSemaphore> waitSemaphores{ pass.acquireSemaphore.handle() };
-        if (i) { // non-first pass
-            const auto& prevPCS = this->postCopySemaphores.at((this->idx - 1) % this->postCopySemaphores.size());
+        if (i) {
+            const auto& prevPCS = this->postCopySemaphores.at(
+                (this->idx - 1) % this->postCopySemaphores.size());
             waitSemaphores.push_back(prevPCS.second.handle());
         }
 
@@ -345,48 +354,137 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             pcs.second.handle()
         };
 
-        cmdbuf.end(vk);
-        cmdbuf.submit(vk,
+        passCmdbuf.end(vk);
+        passCmdbuf.submit(vk,
             waitSemaphores, this->syncSemaphore->handle(), this->idx,
             signalSemaphores, VK_NULL_HANDLE, 0,
-            i == generatedFrames - 1 ? this->renderFence->handle() : VK_NULL_HANDLE
+            (!this->info.virtualized && i == generatedFrames - 1)
+                ? this->renderFence->handle()
+                : VK_NULL_HANDLE
         );
 
-        // present swapchain image
+        // Generated frames never carry the application's pNext when the
+        // application is rendering into virtual images. The logical present
+        // metadata belongs to the final real application frame.
         const VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = i ? nullptr : next_chain,
+            .pNext = (!this->info.virtualized && !i) ? next_chain : nullptr,
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &pcs.first.handle(),
             .swapchainCount = 1,
             .pSwapchains = &swapchain,
             .pImageIndices = &aqImageIdx,
         };
-        res = vk.df().QueuePresentKHR(queue,
-            &presentInfo);
+        res = vk.df().QueuePresentKHR(queue, &presentInfo);
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
 
         this->idx++;
     }
 
-    // present original swapchain image
     const VkSemaphore finalWaitSemaphore = generatedFrames
         ? this->postCopySemaphores.at(
             (this->idx - 1) % this->postCopySemaphores.size()).second.handle()
         : zeroPresentSemaphore->handle();
+
+    if (!this->info.virtualized) {
+        // Legacy Adaptive/Fixed-3B path: application image is a real WSI image.
+        const VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = generatedFrames ? nullptr : next_chain,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &finalWaitSemaphore,
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+
+        this->fidx++;
+        return res;
+    }
+
+    // Virtual swapchain path: the application's image cannot be passed to WSI.
+    // Acquire a real image, copy the logical source frame into it, and present
+    // that real image. Stage 3C2B2A waits for this copy before recycling the
+    // virtual image; 3C2B2B will move this same operation onto the worker.
+    uint32_t realImageIdx{};
+    auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+        UINT64_MAX,
+        this->virtualFinalAcquireSemaphore->handle(),
+        VK_NULL_HANDLE,
+        &realImageIdx);
+    if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+        throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
+
+    const auto& realImage = outputImages.at(realImageIdx);
+    const auto& finalCmdbuf = *this->virtualFinalCommandBuffer;
+    finalCmdbuf.begin(vk);
+    finalCmdbuf.blitImage(vk,
+        {
+            barrierHelper(swapchainImage,
+                VK_ACCESS_NONE,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+            ),
+            barrierHelper(realImage,
+                VK_ACCESS_NONE,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            ),
+        },
+        { swapchainImage, realImage },
+        this->info.extent,
+        {
+            barrierHelper(swapchainImage,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_MEMORY_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            ),
+            barrierHelper(realImage,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_MEMORY_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+            ),
+        }
+    );
+    finalCmdbuf.end(vk);
+
+    finalCmdbuf.submit(vk,
+        {
+            finalWaitSemaphore,
+            this->virtualFinalAcquireSemaphore->handle()
+        },
+        VK_NULL_HANDLE, 0,
+        { this->virtualFinalPresentSemaphore->handle() },
+        VK_NULL_HANDLE, 0,
+        this->renderFence->handle()
+    );
+
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = generatedFrames ? nullptr : next_chain,
+        .pNext = next_chain,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &finalWaitSemaphore,
+        .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
-        .pImageIndices = &imageIdx,
+        .pImageIndices = &realImageIdx,
     };
-    auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
+    res = vk.df().QueuePresentKHR(queue, &presentInfo);
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+
+    // The application may reacquire this virtual image as soon as QueuePresent
+    // returns. Ensure the GPU has finished reading it before the runtime marks
+    // it Available again.
+    if (!this->renderFence->wait(vk, UINT64_MAX))
+        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
 
     this->fidx++;
     return res;

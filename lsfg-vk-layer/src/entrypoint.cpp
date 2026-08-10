@@ -5,12 +5,16 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "swapchain.hpp"
+#include "virtual_swapchain_image_spec.hpp"
+#include "virtual_swapchain_runtime.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -35,6 +39,7 @@ namespace {
         VkQueue queue{VK_NULL_HANDLE};
         uint32_t familyIndex{};
         uint32_t queueIndex{};
+        std::shared_ptr<std::mutex> mutex{std::make_shared<std::mutex>()};
     };
 
     struct QueueReservation {
@@ -131,6 +136,8 @@ namespace {
         std::unordered_map<VkDevice, OffloadQueueInfo> offloadQueues;
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
+        std::unordered_map<VkSwapchainKHR, std::unique_ptr<VirtualSwapchainRuntime>>
+            virtualSwapchains;
     }* instance_info; // NOLINT (global variable)
 
     // create instance
@@ -414,22 +421,18 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
 
         try {
-            // retire old swapchain
+            // retire old swapchain. Virtual images must outlive Root contexts,
+            // but a retired WSI swapchain can no longer be acquired/presented.
             if (info->oldSwapchain) {
-                const auto& info_mapping = instance_info->swapchainInfos.find(info->oldSwapchain);
-                if (info_mapping != instance_info->swapchainInfos.end())
-                    instance_info->swapchainInfos.erase(info_mapping);
-
-                const auto& mapping = instance_info->swapchains.find(info->oldSwapchain);
-                if (mapping != instance_info->swapchains.end())
-                    instance_info->swapchains.erase(mapping);
-
                 layer_info->root.removeSwapchainContext(info->oldSwapchain);
+                instance_info->virtualSwapchains.erase(info->oldSwapchain);
+                instance_info->swapchainInfos.erase(info->oldSwapchain);
+                instance_info->swapchains.erase(info->oldSwapchain);
             }
 
             layer_info->root.update(); // ensure config is up to date
 
-            // create swapchain
+            // create underlying real swapchain
             VkSwapchainCreateInfoKHR newInfo = *info;
             layer_info->root.modifySwapchainCreateInfo(it->second, newInfo,
                 [=, newInfo = &newInfo]() {
@@ -440,29 +443,74 @@ namespace {
                 }
             );
 
-            // get all swapchain images
             uint32_t imageCount{};
             auto res = it->second.df().GetSwapchainImagesKHR(device, *swapchain,
                 &imageCount, VK_NULL_HANDLE);
             if (res != VK_SUCCESS || imageCount == 0)
                 throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
 
-            std::vector<VkImage> swapchainImages(imageCount);
+            std::vector<VkImage> realImages(imageCount);
             res = it->second.df().GetSwapchainImagesKHR(device, *swapchain,
-                &imageCount, swapchainImages.data());
+                &imageCount, realImages.data());
             if (res != VK_SUCCESS)
                 throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
 
-            auto& info = instance_info->swapchainInfos.emplace(*swapchain, SwapchainInfo {
-                .images = std::move(swapchainImages),
-                .format = newInfo.imageFormat,
-                .colorSpace = newInfo.imageColorSpace,
-                .extent = newInfo.imageExtent,
-                .presentMode = newInfo.presentMode
-            }).first->second;
+            std::unique_ptr<VirtualSwapchainRuntime> virtualRuntime;
+            std::vector<VkImage> applicationImages = realImages;
+            bool virtualized{};
 
-            // create lsfg-vk swapchain
-            layer_info->root.createSwapchainContext(it->second, *swapchain, info);
+            if (layer_info->root.fixedMode()) {
+                const auto queueIt = instance_info->offloadQueues.find(device);
+                const auto spec = makeVirtualSwapchainImageSpec(newInfo);
+
+                if (queueIt != instance_info->offloadQueues.end() && spec.supported()) {
+                    try {
+                        virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
+                            it->second,
+                            queueIt->second.queue,
+                            queueIt->second.mutex,
+                            realImages.size(),
+                            spec);
+                        applicationImages = virtualRuntime->imageHandles();
+                        virtualized = true;
+                    } catch (const std::exception& e) {
+                        std::cerr << "lsfg-vk: virtual swapchain setup failed; "
+                            "falling back to synchronous 3B path:\n";
+                        std::cerr << "- " << e.what() << '\n';
+                    }
+                } else if (!spec.supported()) {
+                    std::cerr << "lsfg-vk: swapchain flags are not supported by the "
+                        "virtual bridge; falling back to synchronous 3B path\n";
+                }
+            }
+
+            auto [infoIt, inserted] = instance_info->swapchainInfos.emplace(
+                *swapchain,
+                SwapchainInfo {
+                    .images = std::move(applicationImages),
+                    .realImages = std::move(realImages),
+                    .format = newInfo.imageFormat,
+                    .colorSpace = newInfo.imageColorSpace,
+                    .extent = newInfo.imageExtent,
+                    .presentMode = newInfo.presentMode,
+                    .virtualized = virtualized
+                });
+            if (!inserted)
+                throw ls::error("swapchain info already exists");
+
+            auto& swapchainInfo = infoIt->second;
+
+            try {
+                layer_info->root.createSwapchainContext(
+                    it->second, *swapchain, swapchainInfo);
+            } catch (...) {
+                instance_info->swapchainInfos.erase(*swapchain);
+                throw;
+            }
+
+            if (virtualRuntime)
+                instance_info->virtualSwapchains.emplace(
+                    *swapchain, std::move(virtualRuntime));
 
             instance_info->swapchains.emplace(*swapchain,
                 ls::R<vk::Vulkan>(it->second));
@@ -477,6 +525,62 @@ namespace {
             std::cerr << "- " << e.what() << '\n';
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+    }
+
+
+
+    VkResult myvkGetSwapchainImagesKHR(
+            VkDevice device,
+            VkSwapchainKHR swapchain,
+            uint32_t* count,
+            VkImage* images) {
+        const auto runtime = instance_info->virtualSwapchains.find(swapchain);
+        if (runtime != instance_info->virtualSwapchains.end())
+            return runtime->second->getImages(count, images);
+
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt == instance_info->devices.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        return deviceIt->second.df().GetSwapchainImagesKHR(
+            device, swapchain, count, images);
+    }
+
+    VkResult myvkAcquireNextImageKHR(
+            VkDevice device,
+            VkSwapchainKHR swapchain,
+            uint64_t timeout,
+            VkSemaphore semaphore,
+            VkFence fence,
+            uint32_t* imageIndex) {
+        const auto runtime = instance_info->virtualSwapchains.find(swapchain);
+        if (runtime != instance_info->virtualSwapchains.end())
+            return runtime->second->acquire(timeout, semaphore, fence, imageIndex);
+
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt == instance_info->devices.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        return deviceIt->second.df().AcquireNextImageKHR(
+            device, swapchain, timeout, semaphore, fence, imageIndex);
+    }
+
+    VkResult myvkAcquireNextImage2KHR(
+            VkDevice device,
+            const VkAcquireNextImageInfoKHR* info,
+            uint32_t* imageIndex) {
+        if (!info)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        const auto runtime = instance_info->virtualSwapchains.find(info->swapchain);
+        if (runtime != instance_info->virtualSwapchains.end()) {
+            return runtime->second->acquire(
+                info->timeout, info->semaphore, info->fence, imageIndex);
+        }
+
+        auto next = reinterpret_cast<PFN_vkAcquireNextImage2KHR>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkAcquireNextImage2KHR"));
+        if (!next)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        return next(device, info, imageIndex);
     }
 
     VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
@@ -496,10 +600,20 @@ namespace {
         if (reload) {
             try {
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
-                    auto& info = instance_info->swapchainInfos.at(swapchain);
+                    auto& swapchainInfo = instance_info->swapchainInfos.at(swapchain);
+
+                    // A virtual swapchain's VkImage handles were already returned
+                    // to the application. Fixed -> Adaptive therefore requires a
+                    // real swapchain recreation instead of destroying/replacing
+                    // those images during hot reload.
+                    if (swapchainInfo.virtualized && !layer_info->root.fixedMode()) {
+                        std::cerr << "lsfg-vk: frame_generation_mode change from Fixed "
+                            "requires swapchain recreation; keeping current Fixed context\n";
+                        continue;
+                    }
 
                     layer_info->root.removeSwapchainContext(swapchain);
-                    layer_info->root.createSwapchainContext(vk, swapchain, info);
+                    layer_info->root.createSwapchainContext(vk, swapchain, swapchainInfo);
                 }
 
                 std::cerr << "lsfg-vk: updated lsfg-vk configuration\n";
@@ -517,12 +631,25 @@ namespace {
             if (it == instance_info->swapchains.end())
                 return VK_ERROR_INITIALIZATION_FAILED;
 
+            auto virtualIt = instance_info->virtualSwapchains.find(swapchain);
+            bool virtualPresentBegun{};
             try {
                 std::vector<VkSemaphore> waitSemaphores;
                 waitSemaphores.reserve(info->waitSemaphoreCount);
 
                 for (size_t j = 0; j < info->waitSemaphoreCount; j++)
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
+
+                if (virtualIt != instance_info->virtualSwapchains.end()) {
+                    virtualPresentBegun =
+                        virtualIt->second->beginPresent(info->pImageIndices[i]);
+                    if (!virtualPresentBegun) {
+                        result = VK_ERROR_OUT_OF_DATE_KHR;
+                        if (info->pResults)
+                            info->pResults[i] = result;
+                        continue;
+                    }
+                }
 
                 auto& context = layer_info->root.getSwapchainContext(swapchain);
                 result = context.present(it->second,
@@ -544,6 +671,9 @@ namespace {
                 result = VK_ERROR_UNKNOWN;
             }
 
+            if (virtualPresentBegun)
+                virtualIt->second->completePresent(info->pImageIndices[i]);
+
             if (result != VK_SUCCESS && info->pResults)
                 info->pResults[i] = result;
         }
@@ -560,17 +690,18 @@ namespace {
         if (it == instance_info->devices.end())
             return;
 
-        const auto& info_mapping = instance_info->swapchainInfos.find(swapchain);
-        if (info_mapping != instance_info->swapchainInfos.end())
-            instance_info->swapchainInfos.erase(info_mapping);
-
-        const auto& mapping = instance_info->swapchains.find(swapchain);
-        if (mapping != instance_info->swapchains.end())
-            instance_info->swapchains.erase(mapping);
-
         layer_info->root.removeSwapchainContext(swapchain);
 
-        // destroy swapchain
+        const auto runtime = instance_info->virtualSwapchains.find(swapchain);
+        if (runtime != instance_info->virtualSwapchains.end()) {
+            runtime->second->stop();
+            instance_info->virtualSwapchains.erase(runtime);
+        }
+
+        instance_info->swapchainInfos.erase(swapchain);
+        instance_info->swapchains.erase(swapchain);
+
+        // destroy underlying real swapchain
         it->second.df().DestroySwapchainKHR(device, swapchain, alloc);
     }
 }
@@ -603,6 +734,9 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkDestroyDevice", VKPTR(myvkDestroyDevice) },
                 { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
                 { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
+                { "vkGetSwapchainImagesKHR", VKPTR(myvkGetSwapchainImagesKHR) },
+                { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },
+                { "vkAcquireNextImage2KHR", VKPTR(myvkAcquireNextImage2KHR) },
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR
