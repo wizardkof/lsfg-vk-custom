@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -30,12 +31,104 @@ namespace {
         Root root;
     }* layer_info; // NOLINT (global variable)
 
+    struct OffloadQueueInfo {
+        VkQueue queue{VK_NULL_HANDLE};
+        uint32_t familyIndex{};
+        uint32_t queueIndex{};
+    };
+
+    struct QueueReservation {
+        std::vector<VkDeviceQueueCreateInfo> queueInfos;
+        std::vector<float> priorities;
+        std::optional<uint32_t> queueInfoIndex;
+        uint32_t familyIndex{};
+        uint32_t queueIndex{};
+
+        [[nodiscard]] bool valid() const { return this->queueInfoIndex.has_value(); }
+
+        void apply(VkDeviceCreateInfo& info) {
+            if (!this->valid())
+                return;
+            info.queueCreateInfoCount = static_cast<uint32_t>(this->queueInfos.size());
+            info.pQueueCreateInfos = this->queueInfos.data();
+        }
+    };
+
+    QueueReservation reserveOffloadGraphicsQueue(
+            VkPhysicalDevice physdev,
+            const vk::VulkanInstanceFuncs& funcs,
+            const VkDeviceCreateInfo& info) {
+        QueueReservation result{};
+        if (!info.queueCreateInfoCount || !info.pQueueCreateInfos)
+            return result;
+
+        uint32_t familyCount{};
+        funcs.GetPhysicalDeviceQueueFamilyProperties(physdev, &familyCount, nullptr);
+        if (!familyCount)
+            return result;
+
+        std::vector<VkQueueFamilyProperties> families(familyCount);
+        funcs.GetPhysicalDeviceQueueFamilyProperties(physdev, &familyCount, families.data());
+
+        std::optional<uint32_t> graphicsFamily;
+        for (uint32_t i = 0; i < familyCount; ++i) {
+            if (families.at(i).queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                graphicsFamily = i;
+                break;
+            }
+        }
+        if (!graphicsFamily.has_value())
+            return result;
+
+        result.queueInfos.assign(
+            info.pQueueCreateInfos,
+            info.pQueueCreateInfos + info.queueCreateInfoCount);
+
+        for (size_t i = 0; i < result.queueInfos.size(); ++i) {
+            auto& queueInfo = result.queueInfos.at(i);
+            if (queueInfo.queueFamilyIndex != *graphicsFamily)
+                continue;
+            // vkGetDeviceQueue() is only valid for queues created with flags == 0.
+            if (queueInfo.flags != 0)
+                continue;
+
+            const uint32_t available = families.at(*graphicsFamily).queueCount;
+            uint32_t requested{};
+            for (const auto& candidate : result.queueInfos) {
+                if (candidate.queueFamilyIndex == *graphicsFamily)
+                    requested += candidate.queueCount;
+            }
+            if (requested >= available)
+                return QueueReservation{};
+
+            result.priorities.reserve(queueInfo.queueCount + 1);
+            if (queueInfo.pQueuePriorities) {
+                result.priorities.assign(
+                    queueInfo.pQueuePriorities,
+                    queueInfo.pQueuePriorities + queueInfo.queueCount);
+            } else {
+                result.priorities.assign(queueInfo.queueCount, 1.0F);
+            }
+            result.priorities.push_back(1.0F);
+
+            result.familyIndex = *graphicsFamily;
+            result.queueIndex = queueInfo.queueCount;
+            result.queueInfoIndex = static_cast<uint32_t>(i);
+            queueInfo.queueCount++;
+            queueInfo.pQueuePriorities = result.priorities.data();
+            return result;
+        }
+
+        return QueueReservation{};
+    }
+
     // instance-wide info initialized at instance creation(s)
     struct InstanceInfo {
         std::vector<VkInstance> handles; // there may be several instances
         vk::VulkanInstanceFuncs funcs;
 
         std::unordered_map<VkDevice, vk::Vulkan> devices;
+        std::unordered_map<VkDevice, OffloadQueueInfo> offloadQueues;
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
     }* instance_info; // NOLINT (global variable)
@@ -160,9 +253,18 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        // Fixed pacing needs a queue that is never exposed to the application.
+        // Reserve one only when Fixed is active so Adaptive device creation stays unchanged.
+        QueueReservation offloadReservation{};
+
         // create device
         try {
             VkDeviceCreateInfo newInfo = *info;
+            if (layer_info->root.fixedMode()) {
+                offloadReservation = reserveOffloadGraphicsQueue(physdev, instance_info->funcs, newInfo);
+                offloadReservation.apply(newInfo);
+            }
+
             layer_info->root.modifyDeviceCreateInfo(newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = instance_info->funcs.CreateDevice(physdev, newInfo, alloc, device);
@@ -193,11 +295,41 @@ namespace {
             std::cerr << "- " << e.what() << '\n';
         }
 
+        if (offloadReservation.valid()) {
+            const auto it = instance_info->devices.find(*device);
+            if (it != instance_info->devices.end()) {
+                VkQueue queue{VK_NULL_HANDLE};
+                it->second.df().GetDeviceQueue(
+                    *device,
+                    offloadReservation.familyIndex,
+                    offloadReservation.queueIndex,
+                    &queue);
+
+                if (queue != VK_NULL_HANDLE) {
+                    auto res = setLoaderData(*device, queue);
+                    if (res != VK_SUCCESS) {
+                        std::cerr << "lsfg-vk: failed to attach loader data to fixed-pacing queue\n";
+                    } else {
+                        instance_info->offloadQueues.emplace(*device, OffloadQueueInfo {
+                            .queue = queue,
+                            .familyIndex = offloadReservation.familyIndex,
+                            .queueIndex = offloadReservation.queueIndex
+                        });
+                    }
+                }
+            }
+        } else if (layer_info->root.fixedMode()) {
+            std::cerr << "lsfg-vk: no spare graphics queue is available for asynchronous fixed pacing; "
+                "the current synchronous Fixed path will remain in use\n";
+        }
+
         return VK_SUCCESS;
     }
 
     // destroy device
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
+        instance_info->offloadQueues.erase(device);
+
         // destroy layer instance
         auto it = instance_info->devices.find(device);
         if (it != instance_info->devices.end())

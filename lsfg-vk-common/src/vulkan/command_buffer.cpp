@@ -245,6 +245,52 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
 }
 
 
+void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
+        std::vector<VkSemaphore> waitSemaphores,
+        VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
+        std::vector<VkSemaphore> signalSemaphores,
+        VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
+        VkFence fence) const {
+    if (waitTimelineSemaphore)
+        waitSemaphores.push_back(waitTimelineSemaphore);
+
+    std::vector<uint64_t> waitValues(waitSemaphores.size(), 0);
+    if (waitTimelineSemaphore)
+        waitValues.back() = waitValue;
+
+    if (signalTimelineSemaphore)
+        signalSemaphores.push_back(signalTimelineSemaphore);
+
+    std::vector<uint64_t> signalValues(signalSemaphores.size(), 0);
+    if (signalTimelineSemaphore)
+        signalValues.back() = signalValue;
+
+    const VkTimelineSemaphoreSubmitInfo timelineInfo{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = static_cast<uint32_t>(waitValues.size()),
+        .pWaitSemaphoreValues = waitValues.data(),
+        .signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size()),
+        .pSignalSemaphoreValues = signalValues.data()
+    };
+    std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(),
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    const VkSubmitInfo submitInfo{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &timelineInfo,
+        .waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size()),
+        .pWaitSemaphores = waitSemaphores.data(),
+        .pWaitDstStageMask = waitStages.data(),
+        .commandBufferCount = 1,
+        .pCommandBuffers = &*this->commandBuffer,
+        .signalSemaphoreCount = static_cast<uint32_t>(signalSemaphores.size()),
+        .pSignalSemaphores = signalSemaphores.data()
+    };
+    auto res = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
+    if (res != VK_SUCCESS)
+        throw ls::vulkan_error(res, "vkQueueSubmit() failed");
+}
+
+
 void CommandBuffer::submit(const vk::Vulkan& vk) const {
     const VkSubmitInfo submitInfo{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,

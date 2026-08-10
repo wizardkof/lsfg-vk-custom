@@ -27,6 +27,13 @@ namespace lsfgvk::layer {
         /// @return true if active
         [[nodiscard]] bool active() const { return this->active_profile.has_value(); }
 
+        /// check if the active profile uses fixed-target frame generation
+        /// @return true when fixed mode is active
+        [[nodiscard]] bool fixedMode() const {
+            return this->active_profile.has_value()
+                && this->active_profile->frame_generation_mode == ls::FrameGenerationMode::Fixed;
+        }
+
         /// ensure the layer is up-to-date
         /// @return true if the configuration was updated
         bool update();

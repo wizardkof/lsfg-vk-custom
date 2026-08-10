@@ -92,6 +92,24 @@ namespace vk {
             VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
             VkFence fence = VK_NULL_HANDLE) const;
 
+        /// submit the command buffer on an explicit queue
+        /// @param vk the vulkan instance
+        /// @param queue queue to submit on; must belong to the command pool queue family
+        /// @param waitSemaphores binary semaphores to wait on
+        /// @param waitTimelineSemaphore optional timeline semaphore to wait on
+        /// @param waitValue timeline value to wait for
+        /// @param signalSemaphores binary semaphores to signal
+        /// @param signalTimelineSemaphore optional timeline semaphore to signal
+        /// @param signalValue timeline value to signal
+        /// @param fence optional fence to signal on completion
+        /// @throws ls::vulkan_error on failure
+        void submit(const vk::Vulkan& vk, VkQueue queue,
+            std::vector<VkSemaphore> waitSemaphores,
+            VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
+            std::vector<VkSemaphore> signalSemaphores,
+            VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
+            VkFence fence = VK_NULL_HANDLE) const;
+
         /// submit the command buffer instantly
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
