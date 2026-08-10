@@ -24,6 +24,13 @@ namespace ls {
         /// do not perform any pacing (vsync+novrr)
         None
     };
+    /// frame generation policy
+    enum class FrameGenerationMode : uint8_t {
+        /// preserve the existing multiplier-based behavior
+        Adaptive,
+        /// target an explicit output FPS independently of display refresh
+        Fixed
+    };
 
     /// game profile configuration
     struct GameConf {
@@ -35,6 +42,10 @@ namespace ls {
         std::optional<std::string> gpu;
         /// multiplier for frame generation
         size_t multiplier{2};
+        /// frame generation policy
+        FrameGenerationMode frame_generation_mode{FrameGenerationMode::Adaptive};
+        /// output FPS target used only by Fixed mode
+        uint32_t target_fps{0};
         /// non-inverted flow scale
         float flow_scale{1.00F};
         /// use performance mode

@@ -41,6 +41,8 @@ active_in = [ # see the wiki for more info
 ]
 # gpu = 'NVIDIA GeForce RTX 5080' # see the wiki for more info
 multiplier = 4
+frame_generation_mode = 'adaptive'
+target_fps = 0
 flow_scale = 0.85
 performance_mode = true
 pacing = 'none' # see the wiki for more info
@@ -50,6 +52,8 @@ name = "2x FG / 100%"
 active_in = 'GenshinImpact.exe'
 gpu = 'NVIDIA GeForce RTX 5080'
 multiplier = 2
+frame_generation_mode = 'adaptive'
+target_fps = 0
 )";
         ofs.close();
     } catch (const std::filesystem::filesystem_error& e) {
@@ -106,6 +110,14 @@ namespace {
             return Pacing::None;
         throw ls::error("unknown pacing method: " + str);
     }
+    /// parse frame generation mode from string
+    FrameGenerationMode frameGenerationModeFromString(const std::string& str) {
+        if (str == "adaptive" || str == "adaptative")
+            return FrameGenerationMode::Adaptive;
+        if (str == "fixed")
+            return FrameGenerationMode::Fixed;
+        throw ls::error("unknown frame_generation_mode: " + str);
+    }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
         const GlobalConf conf{
@@ -125,6 +137,9 @@ namespace {
             .active_in = activityFromString(tbl["active_in"]),
             .gpu = tbl["gpu"].value<std::string>(),
             .multiplier = tbl["multiplier"].value_or(2U),
+            .frame_generation_mode = frameGenerationModeFromString(
+                tbl["frame_generation_mode"].value_or<std::string>("adaptive")),
+            .target_fps = tbl["target_fps"].value_or(0U),
             .flow_scale = tbl["flow_scale"].value_or(1.0F),
             .performance_mode = tbl["performance_mode"].value_or(false),
             .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none"))
@@ -132,6 +147,8 @@ namespace {
 
         if (conf.multiplier < 1)
             throw ls::error("multiplier must be at least 1");
+        if (conf.frame_generation_mode == FrameGenerationMode::Fixed && conf.target_fps == 0)
+            throw ls::error("target_fps must be greater than 0 in fixed mode");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)
             throw ls::error("flow_scale must be between 0.25 and 1.0");
 
@@ -164,7 +181,9 @@ namespace {
             .gpu = std::nullopt,
 
             .multiplier = 2,
-            .flow_scale = 1.0F,
+                        .frame_generation_mode = FrameGenerationMode::Adaptive,
+            .target_fps = 0,
+.flow_scale = 1.0F,
             .performance_mode = false,
             .pacing = Pacing::None
         };
@@ -173,6 +192,12 @@ namespace {
         if (gpu) conf.gpu = std::string(gpu);
         const char* multiplier = std::getenv("LSFGVK_MULTIPLIER");
         if (multiplier) conf.multiplier = static_cast<size_t>(std::stoul(multiplier));
+        const char* frame_generation_mode = std::getenv("LSFGVK_FRAME_GENERATION_MODE");
+        if (frame_generation_mode)
+            conf.frame_generation_mode = frameGenerationModeFromString(frame_generation_mode);
+        const char* target_fps = std::getenv("LSFGVK_TARGET_FPS");
+        if (target_fps)
+            conf.target_fps = static_cast<uint32_t>(std::stoul(target_fps));
         const char* flow_scale = std::getenv("LSFGVK_FLOW_SCALE");
         if (flow_scale) conf.flow_scale = std::stof(flow_scale);
         const char* performance = std::getenv("LSFGVK_PERFORMANCE_MODE");
@@ -182,6 +207,8 @@ namespace {
 
         if (conf.multiplier < 1)
             throw ls::error("multiplier must be at least 1");
+        if (conf.frame_generation_mode == FrameGenerationMode::Fixed && conf.target_fps == 0)
+            throw ls::error("target_fps must be greater than 0 in fixed mode");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)
             throw ls::error("flow_scale must be between 0.25 and 1.0");
 
@@ -240,6 +267,15 @@ void ConfigFile::write(const std::filesystem::path& path) const {
         if (conf.gpu)
             profile.insert("gpu", conf.gpu.value_or(""));
         profile.insert("multiplier", static_cast<int64_t>(conf.multiplier));
+        switch (conf.frame_generation_mode) {
+            case FrameGenerationMode::Adaptive:
+                profile.insert("frame_generation_mode", "adaptive");
+                break;
+            case FrameGenerationMode::Fixed:
+                profile.insert("frame_generation_mode", "fixed");
+                break;
+        }
+        profile.insert("target_fps", static_cast<int64_t>(conf.target_fps));
         profile.insert("flow_scale", conf.flow_scale);
         profile.insert("performance_mode", conf.performance_mode);
         switch (conf.pacing) {
