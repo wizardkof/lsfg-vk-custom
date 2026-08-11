@@ -51,6 +51,45 @@ namespace {
         SharedInternallySynchronized
     };
 
+    enum class SwapchainMaintenanceFamily {
+        None,
+        KHR,
+        EXT
+    };
+
+    constexpr const char* SURFACE_MAINTENANCE_KHR = "VK_KHR_surface_maintenance1";
+    constexpr const char* SURFACE_MAINTENANCE_EXT = "VK_EXT_surface_maintenance1";
+    constexpr const char* SWAPCHAIN_MAINTENANCE_KHR = "VK_KHR_swapchain_maintenance1";
+    constexpr const char* SWAPCHAIN_MAINTENANCE_EXT = "VK_EXT_swapchain_maintenance1";
+    constexpr const char* GET_SURFACE_CAPABILITIES_2_KHR = "VK_KHR_get_surface_capabilities2";
+    constexpr const char* SURFACE_KHR = "VK_KHR_surface";
+
+    [[nodiscard]] const char* maintenanceFamilyName(SwapchainMaintenanceFamily family) {
+        switch (family) {
+            case SwapchainMaintenanceFamily::KHR:
+                return "KHR";
+            case SwapchainMaintenanceFamily::EXT:
+                return "EXT";
+            case SwapchainMaintenanceFamily::None:
+                return "none";
+        }
+        return "none";
+    }
+
+    [[nodiscard]] const char* surfaceMaintenanceExtension(
+            SwapchainMaintenanceFamily family) {
+        return family == SwapchainMaintenanceFamily::KHR
+            ? SURFACE_MAINTENANCE_KHR
+            : SURFACE_MAINTENANCE_EXT;
+    }
+
+    [[nodiscard]] const char* swapchainMaintenanceExtension(
+            SwapchainMaintenanceFamily family) {
+        return family == SwapchainMaintenanceFamily::KHR
+            ? SWAPCHAIN_MAINTENANCE_KHR
+            : SWAPCHAIN_MAINTENANCE_EXT;
+    }
+
     struct QueueReservation {
         std::vector<VkDeviceQueueCreateInfo> queueInfos;
         std::vector<float> priorities;
@@ -130,6 +169,66 @@ namespace {
         }
     };
 
+    [[nodiscard]] bool extensionEnabled(
+            const char* const* names, uint32_t count, const char* extensionName) {
+        if (!count || !names)
+            return false;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (names[i] && std::string(names[i]) == extensionName)
+                return true;
+        }
+        return false;
+    }
+
+    void appendExtension(std::vector<const char*>& extensions, const char* name) {
+        if (!extensionEnabled(extensions.data(),
+                static_cast<uint32_t>(extensions.size()), name))
+            extensions.push_back(name);
+    }
+
+    [[nodiscard]] bool hasInstanceExtension(
+            PFN_vkGetInstanceProcAddr getInstanceProcAddr, const char* extensionName) {
+        if (!getInstanceProcAddr)
+            return false;
+        const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            getInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+        if (!enumerate)
+            return false;
+
+        uint32_t count{};
+        auto res = enumerate(nullptr, &count, nullptr);
+        if (res != VK_SUCCESS || !count)
+            return false;
+
+        std::vector<VkExtensionProperties> extensions(count);
+        res = enumerate(nullptr, &count, extensions.data());
+        if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+            return false;
+        extensions.resize(count);
+
+        return std::ranges::any_of(extensions,
+            [extensionName](const VkExtensionProperties& extension) {
+                return std::string(extension.extensionName) == extensionName;
+            });
+    }
+
+    [[nodiscard]] SwapchainMaintenanceFamily selectSurfaceMaintenanceFamily(
+            PFN_vkGetInstanceProcAddr getInstanceProcAddr,
+            const VkInstanceCreateInfo& info) {
+        if (!layer_info->root.active()
+                || !extensionEnabled(info.ppEnabledExtensionNames,
+                    info.enabledExtensionCount, SURFACE_KHR)
+                || !hasInstanceExtension(getInstanceProcAddr,
+                    GET_SURFACE_CAPABILITIES_2_KHR))
+            return SwapchainMaintenanceFamily::None;
+
+        if (hasInstanceExtension(getInstanceProcAddr, SURFACE_MAINTENANCE_KHR))
+            return SwapchainMaintenanceFamily::KHR;
+        if (hasInstanceExtension(getInstanceProcAddr, SURFACE_MAINTENANCE_EXT))
+            return SwapchainMaintenanceFamily::EXT;
+        return SwapchainMaintenanceFamily::None;
+    }
+
     [[nodiscard]] bool hasDeviceExtension(
             VkPhysicalDevice physdev,
             const vk::VulkanInstanceFuncs& funcs,
@@ -151,6 +250,49 @@ namespace {
             [extensionName](const VkExtensionProperties& extension) {
                 return std::string(extension.extensionName) == extensionName;
             });
+    }
+
+    [[nodiscard]] bool supportsSwapchainMaintenance(
+            VkPhysicalDevice physdev,
+            const vk::VulkanInstanceFuncs& funcs,
+            PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2,
+            SwapchainMaintenanceFamily family) {
+        if (family == SwapchainMaintenanceFamily::None
+                || !getPhysicalDeviceFeatures2
+                || !hasDeviceExtension(physdev, funcs,
+                    swapchainMaintenanceExtension(family)))
+            return false;
+
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenanceFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR
+        };
+        VkPhysicalDeviceFeatures2 features{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &maintenanceFeatures
+        };
+        getPhysicalDeviceFeatures2(physdev, &features);
+        return maintenanceFeatures.swapchainMaintenance1 == VK_TRUE;
+    }
+
+    void enableSwapchainMaintenanceFeature(
+            VkDeviceCreateInfo& info,
+            VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR& storage) {
+        auto* current = reinterpret_cast<VkBaseOutStructure*>(
+            const_cast<void*>(info.pNext));
+        while (current) {
+            if (current->sType
+                    == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR) {
+                auto* features = reinterpret_cast<
+                    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR*>(current);
+                features->swapchainMaintenance1 = VK_TRUE;
+                return;
+            }
+            current = current->pNext;
+        }
+
+        storage.pNext = const_cast<void*>(info.pNext);
+        storage.swapchainMaintenance1 = VK_TRUE;
+        info.pNext = &storage;
     }
 
     [[nodiscard]] bool supportsInternallySynchronizedQueues(
@@ -367,12 +509,178 @@ namespace {
         return {};
     }
 
+    [[nodiscard]] bool hasSwapchainPresentModesCreateInfo(
+            const VkSwapchainCreateInfoKHR& info) {
+        auto* next = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
+        while (next) {
+            if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR)
+                return true;
+            next = next->pNext;
+        }
+        return false;
+    }
+
+    struct SurfacePresentModeCaps {
+        uint32_t minImageCount{};
+        uint32_t maxImageCount{};
+        VkImageUsageFlags supportedUsageFlags{};
+        std::vector<VkPresentModeKHR> compatibleModes;
+    };
+
+    [[nodiscard]] std::optional<SurfacePresentModeCaps> querySurfacePresentModeCaps(
+            const vk::Vulkan& vk,
+            PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getCapabilities2,
+            VkSurfaceKHR surface, VkPresentModeKHR mode) {
+        if (!getCapabilities2)
+            return std::nullopt;
+
+        VkSurfacePresentModeKHR surfaceMode{
+            .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
+            .presentMode = mode
+        };
+        VkPhysicalDeviceSurfaceInfo2KHR surfaceInfo{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+            .pNext = &surfaceMode,
+            .surface = surface
+        };
+        VkSurfacePresentModeCompatibilityKHR compatibility{
+            .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR
+        };
+        VkSurfaceCapabilities2KHR capabilities{
+            .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+            .pNext = &compatibility
+        };
+
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            compatibility.presentModeCount = 0;
+            compatibility.pPresentModes = nullptr;
+            auto res = getCapabilities2(vk.physdev(), &surfaceInfo, &capabilities);
+            if (res != VK_SUCCESS)
+                return std::nullopt;
+
+            std::vector<VkPresentModeKHR> compatible(compatibility.presentModeCount);
+            if (compatible.empty()) {
+                return SurfacePresentModeCaps {
+                    .minImageCount = capabilities.surfaceCapabilities.minImageCount,
+                    .maxImageCount = capabilities.surfaceCapabilities.maxImageCount,
+                    .supportedUsageFlags = capabilities.surfaceCapabilities.supportedUsageFlags,
+                    .compatibleModes = {}
+                };
+            }
+
+            compatibility.pPresentModes = compatible.data();
+            res = getCapabilities2(vk.physdev(), &surfaceInfo, &capabilities);
+            if (res == VK_SUCCESS) {
+                compatible.resize(compatibility.presentModeCount);
+                return SurfacePresentModeCaps {
+                    .minImageCount = capabilities.surfaceCapabilities.minImageCount,
+                    .maxImageCount = capabilities.surfaceCapabilities.maxImageCount,
+                    .supportedUsageFlags = capabilities.surfaceCapabilities.supportedUsageFlags,
+                    .compatibleModes = std::move(compatible)
+                };
+            }
+            if (res != VK_INCOMPLETE)
+                return std::nullopt;
+        }
+
+        return std::nullopt;
+    }
+
+    [[nodiscard]] bool containsPresentMode(
+            const std::vector<VkPresentModeKHR>& modes, VkPresentModeKHR mode) {
+        return std::ranges::find(modes, mode) != modes.end();
+    }
+
+    [[nodiscard]] uint32_t commonMaximumImageCount(
+            uint32_t first, uint32_t second) {
+        if (!first)
+            return second;
+        if (!second)
+            return first;
+        return std::min(first, second);
+    }
+
+    [[nodiscard]] bool prepareDualPresentModeDeclaration(
+            const vk::Vulkan& vk,
+            PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getCapabilities2,
+            SwapchainMaintenanceFamily family,
+            VkSwapchainCreateInfoKHR& info,
+            std::vector<VkPresentModeKHR>& modeStorage,
+            VkSwapchainPresentModesCreateInfoKHR& createInfoStorage) {
+        if (family == SwapchainMaintenanceFamily::None
+                || hasSwapchainPresentModesCreateInfo(info))
+            return false;
+
+        const auto supported = querySurfacePresentModes(vk, info.surface);
+        const auto initialCaps = querySurfacePresentModeCaps(
+            vk, getCapabilities2, info.surface, info.presentMode);
+        if (!initialCaps.has_value())
+            return false;
+
+        std::vector<VkPresentModeKHR> alternatives;
+        if (info.presentMode != VK_PRESENT_MODE_FIFO_KHR)
+            alternatives.push_back(VK_PRESENT_MODE_FIFO_KHR);
+        if (info.presentMode != VK_PRESENT_MODE_MAILBOX_KHR)
+            alternatives.push_back(VK_PRESENT_MODE_MAILBOX_KHR);
+        if (info.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR)
+            alternatives.push_back(VK_PRESENT_MODE_IMMEDIATE_KHR);
+
+        const auto requiredUsage = info.imageUsage;
+        if ((initialCaps->supportedUsageFlags & requiredUsage) != requiredUsage)
+            return false;
+
+        for (const auto alternative : alternatives) {
+            if (!containsPresentMode(supported, alternative)
+                    || !containsPresentMode(initialCaps->compatibleModes, alternative))
+                continue;
+
+            const auto alternativeCaps = querySurfacePresentModeCaps(
+                vk, getCapabilities2, info.surface, alternative);
+            if (!alternativeCaps.has_value()
+                    || !containsPresentMode(alternativeCaps->compatibleModes, info.presentMode)
+                    || (alternativeCaps->supportedUsageFlags & requiredUsage) != requiredUsage)
+                continue;
+
+            const uint32_t commonMin = std::max(
+                info.minImageCount,
+                std::max(initialCaps->minImageCount, alternativeCaps->minImageCount));
+            const uint32_t commonMax = commonMaximumImageCount(
+                initialCaps->maxImageCount, alternativeCaps->maxImageCount);
+            if (commonMax && commonMin > commonMax)
+                continue;
+
+            info.minImageCount = commonMin;
+            modeStorage = { info.presentMode, alternative };
+            createInfoStorage = VkSwapchainPresentModesCreateInfoKHR {
+                .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
+                .pNext = info.pNext,
+                .presentModeCount = static_cast<uint32_t>(modeStorage.size()),
+                .pPresentModes = modeStorage.data()
+            };
+            info.pNext = &createInfoStorage;
+
+            std::cerr << "lsfg-vk: dual present modes declared: initial="
+                << fixedPresentModeName(modeStorage.at(0))
+                << " alternate=" << fixedPresentModeName(modeStorage.at(1))
+                << " family=" << maintenanceFamilyName(family)
+                << " min-images=" << info.minImageCount << "\n";
+            return true;
+        }
+
+        return false;
+    }
+
     // instance-wide info initialized at instance creation(s)
     struct InstanceInfo {
         std::vector<VkInstance> handles; // there may be several instances
         vk::VulkanInstanceFuncs funcs;
 
         std::unordered_map<VkDevice, vk::Vulkan> devices;
+        SwapchainMaintenanceFamily surfaceMaintenanceFamily{
+            SwapchainMaintenanceFamily::None
+        };
+        std::unordered_map<VkDevice, SwapchainMaintenanceFamily>
+            swapchainMaintenanceFamilies;
         std::unordered_map<VkDevice, OffloadQueueInfo> offloadQueues;
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
@@ -424,6 +732,23 @@ namespace {
 
         try {
             VkInstanceCreateInfo newInfo = *info;
+            const auto maintenanceFamily = selectSurfaceMaintenanceFamily(
+                layer_info->GetInstanceProcAddr, newInfo);
+            std::vector<const char*> maintenanceExtensions;
+            if (maintenanceFamily != SwapchainMaintenanceFamily::None) {
+                if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
+                    maintenanceExtensions.assign(
+                        newInfo.ppEnabledExtensionNames,
+                        newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount);
+                }
+                appendExtension(maintenanceExtensions, GET_SURFACE_CAPABILITIES_2_KHR);
+                appendExtension(maintenanceExtensions,
+                    surfaceMaintenanceExtension(maintenanceFamily));
+                newInfo.enabledExtensionCount =
+                    static_cast<uint32_t>(maintenanceExtensions.size());
+                newInfo.ppEnabledExtensionNames = maintenanceExtensions.data();
+            }
+
             layer_info->root.modifyInstanceCreateInfo(newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = vkCreateInstance(newInfo, alloc, instance);
@@ -438,7 +763,16 @@ namespace {
                         layer_info->GetInstanceProcAddr, true),
                 };
 
+            if (instance_info->handles.empty())
+                instance_info->surfaceMaintenanceFamily = maintenanceFamily;
             instance_info->handles.push_back(*instance);
+
+            if (maintenanceFamily != SwapchainMaintenanceFamily::None)
+                std::cerr << "lsfg-vk: dual-ready surface maintenance enabled: "
+                    << maintenanceFamilyName(maintenanceFamily) << "\n";
+            else if (layer_info->root.active())
+                std::cerr << "lsfg-vk: surface maintenance unavailable; "
+                    "dual present-mode declaration will use legacy fallback\n";
 
             return VK_SUCCESS;
         } catch (const ls::vulkan_error& e) {
@@ -505,6 +839,13 @@ namespace {
         // capable of entering the asynchronous Fixed path after a future mode
         // switch while leaving worker/swapchain activation gated by fixedMode().
         QueueReservation offloadReservation{};
+        SwapchainMaintenanceFamily deviceMaintenanceFamily{
+            SwapchainMaintenanceFamily::None
+        };
+        std::vector<const char*> maintenanceDeviceExtensions;
+        VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenanceFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR
+        };
 
         // create device
         try {
@@ -516,6 +857,24 @@ namespace {
                 offloadReservation = reserveOffloadGraphicsQueue(
                     physdev, instance_info->funcs, getPhysicalDeviceFeatures2, newInfo);
                 offloadReservation.apply(newInfo);
+
+                const auto requestedFamily = instance_info->surfaceMaintenanceFamily;
+                if (supportsSwapchainMaintenance(
+                        physdev, instance_info->funcs,
+                        getPhysicalDeviceFeatures2, requestedFamily)) {
+                    deviceMaintenanceFamily = requestedFamily;
+                    if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
+                        maintenanceDeviceExtensions.assign(
+                            newInfo.ppEnabledExtensionNames,
+                            newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount);
+                    }
+                    appendExtension(maintenanceDeviceExtensions,
+                        swapchainMaintenanceExtension(deviceMaintenanceFamily));
+                    newInfo.enabledExtensionCount =
+                        static_cast<uint32_t>(maintenanceDeviceExtensions.size());
+                    newInfo.ppEnabledExtensionNames = maintenanceDeviceExtensions.data();
+                    enableSwapchainMaintenanceFeature(newInfo, maintenanceFeatures);
+                }
             }
 
             layer_info->root.modifyDeviceCreateInfo(newInfo,
@@ -546,6 +905,17 @@ namespace {
         } catch (const std::exception& e) {
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk initialization:\n";
             std::cerr << "- " << e.what() << '\n';
+        }
+
+        if (deviceMaintenanceFamily != SwapchainMaintenanceFamily::None
+                && instance_info->devices.contains(*device)) {
+            instance_info->swapchainMaintenanceFamilies.emplace(
+                *device, deviceMaintenanceFamily);
+            std::cerr << "lsfg-vk: dual-ready swapchain maintenance enabled: "
+                << maintenanceFamilyName(deviceMaintenanceFamily) << "\n";
+        } else if (layer_info->root.active()) {
+            std::cerr << "lsfg-vk: swapchain maintenance feature unavailable; "
+                "dual present-mode declaration will use legacy fallback\n";
         }
 
         if (offloadReservation.valid()) {
@@ -627,6 +997,7 @@ namespace {
         }
 
         instance_info->offloadQueues.erase(device);
+        instance_info->swapchainMaintenanceFamilies.erase(device);
 
         // destroy layer instance
         auto it = instance_info->devices.find(device);
@@ -807,6 +1178,10 @@ namespace {
             VkSwapchainCreateInfoKHR newInfo = *info;
             const VkPresentModeKHR applicationPresentMode = newInfo.presentMode;
             bool fixedAsyncPresentModeEligible{};
+            std::vector<VkPresentModeKHR> dualPresentModes;
+            VkSwapchainPresentModesCreateInfoKHR dualPresentModesInfo{
+                .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR
+            };
             layer_info->root.modifySwapchainCreateInfo(it->second, newInfo,
                 [&, newInfo = &newInfo]() {
                     // Only the asynchronous Fixed path changes WSI mode. The
@@ -834,6 +1209,32 @@ namespace {
                             if (selected == VK_PRESENT_MODE_FIFO_KHR)
                                 std::cerr << " fallback";
                             std::cerr << '\n';
+                        }
+                    }
+
+                    const auto maintenanceIt =
+                        instance_info->swapchainMaintenanceFamilies.find(device);
+                    if (maintenanceIt != instance_info->swapchainMaintenanceFamilies.end()) {
+                        if (hasSwapchainPresentModesCreateInfo(*newInfo)) {
+                            std::cerr << "lsfg-vk: application present-mode declaration preserved; "
+                                "LSFG dual declaration not injected\n";
+                        } else {
+                            const auto getCapabilities2 = reinterpret_cast<
+                                PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+                                    layer_info->GetInstanceProcAddr(
+                                        instance_info->handles.front(),
+                                        "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+                            try {
+                                if (!prepareDualPresentModeDeclaration(
+                                        it->second, getCapabilities2, maintenanceIt->second,
+                                        *newInfo, dualPresentModes, dualPresentModesInfo)) {
+                                    std::cerr << "lsfg-vk: compatible dual present modes unavailable; "
+                                        "keeping legacy WSI swapchain\n";
+                                }
+                            } catch (const std::exception& e) {
+                                std::cerr << "lsfg-vk: dual present-mode query failed; "
+                                    "keeping legacy WSI swapchain:\n- " << e.what() << '\n';
+                            }
                         }
                     }
 
