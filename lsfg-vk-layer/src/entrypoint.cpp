@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "instance.hpp"
+#include "fixed_present_mode.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -39,29 +40,143 @@ namespace {
         VkQueue queue{VK_NULL_HANDLE};
         uint32_t familyIndex{};
         uint32_t queueIndex{};
+        uint32_t applicationQueueIndex{};
+        bool sharedWithApplication{};
         std::shared_ptr<std::mutex> mutex{std::make_shared<std::mutex>()};
+    };
+
+    enum class QueueReservationMode {
+        None,
+        DedicatedSpare,
+        SharedInternallySynchronized
     };
 
     struct QueueReservation {
         std::vector<VkDeviceQueueCreateInfo> queueInfos;
         std::vector<float> priorities;
+        std::vector<const char*> enabledExtensions;
         std::optional<uint32_t> queueInfoIndex;
+        std::optional<uint32_t> internalQueueInfoIndex;
         uint32_t familyIndex{};
         uint32_t queueIndex{};
+        uint32_t applicationQueueIndex{};
+        float internalPriority{1.0F};
+        QueueReservationMode mode{QueueReservationMode::None};
+        VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR internalSyncFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR,
+            .pNext = nullptr,
+            .internallySynchronizedQueues = VK_TRUE
+        };
 
-        [[nodiscard]] bool valid() const { return this->queueInfoIndex.has_value(); }
+        [[nodiscard]] bool valid() const {
+            return this->mode != QueueReservationMode::None
+                && this->queueInfoIndex.has_value();
+        }
+        [[nodiscard]] bool shared() const {
+            return this->mode == QueueReservationMode::SharedInternallySynchronized;
+        }
 
         void apply(VkDeviceCreateInfo& info) {
             if (!this->valid())
                 return;
+
+            if (this->mode == QueueReservationMode::DedicatedSpare) {
+                this->queueInfos.at(*this->queueInfoIndex).pQueuePriorities =
+                    this->priorities.data();
+            } else if (this->shared()) {
+                this->queueInfos.at(*this->internalQueueInfoIndex).pQueuePriorities =
+                    &this->internalPriority;
+
+                this->enabledExtensions.clear();
+                if (info.enabledExtensionCount && info.ppEnabledExtensionNames) {
+                    this->enabledExtensions.assign(
+                        info.ppEnabledExtensionNames,
+                        info.ppEnabledExtensionNames + info.enabledExtensionCount);
+                }
+                const auto ext = std::ranges::find_if(this->enabledExtensions,
+                    [](const char* name) {
+                        return name && std::string(name)
+                            == VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME;
+                    });
+                if (ext == this->enabledExtensions.end())
+                    this->enabledExtensions.push_back(
+                        VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME);
+                info.enabledExtensionCount =
+                    static_cast<uint32_t>(this->enabledExtensions.size());
+                info.ppEnabledExtensionNames = this->enabledExtensions.data();
+
+                bool featureAlreadyPresent{};
+                auto* current = reinterpret_cast<VkBaseOutStructure*>(
+                    const_cast<void*>(info.pNext));
+                while (current) {
+                    if (current->sType
+                            == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR) {
+                        auto* features = reinterpret_cast<
+                            VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR*>(current);
+                        features->internallySynchronizedQueues = VK_TRUE;
+                        featureAlreadyPresent = true;
+                        break;
+                    }
+                    current = current->pNext;
+                }
+                if (!featureAlreadyPresent) {
+                    this->internalSyncFeatures.pNext = const_cast<void*>(info.pNext);
+                    info.pNext = &this->internalSyncFeatures;
+                }
+            }
+
             info.queueCreateInfoCount = static_cast<uint32_t>(this->queueInfos.size());
             info.pQueueCreateInfos = this->queueInfos.data();
         }
     };
 
+    [[nodiscard]] bool hasDeviceExtension(
+            VkPhysicalDevice physdev,
+            const vk::VulkanInstanceFuncs& funcs,
+            const char* extensionName) {
+        uint32_t count{};
+        auto res = funcs.EnumerateDeviceExtensionProperties(
+            physdev, nullptr, &count, nullptr);
+        if (res != VK_SUCCESS || !count)
+            return false;
+
+        std::vector<VkExtensionProperties> extensions(count);
+        res = funcs.EnumerateDeviceExtensionProperties(
+            physdev, nullptr, &count, extensions.data());
+        if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+            return false;
+        extensions.resize(count);
+
+        return std::ranges::any_of(extensions,
+            [extensionName](const VkExtensionProperties& extension) {
+                return std::string(extension.extensionName) == extensionName;
+            });
+    }
+
+    [[nodiscard]] bool supportsInternallySynchronizedQueues(
+            VkPhysicalDevice physdev,
+            const vk::VulkanInstanceFuncs& funcs,
+            PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2) {
+        if (!getPhysicalDeviceFeatures2
+                || !hasDeviceExtension(physdev, funcs,
+                    VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME))
+            return false;
+
+        VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR syncFeatures{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR
+        };
+        VkPhysicalDeviceFeatures2 features{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &syncFeatures
+        };
+        getPhysicalDeviceFeatures2(physdev, &features);
+        return syncFeatures.internallySynchronizedQueues == VK_TRUE;
+    }
+
     QueueReservation reserveOffloadGraphicsQueue(
             VkPhysicalDevice physdev,
             const vk::VulkanInstanceFuncs& funcs,
+            PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2,
             const VkDeviceCreateInfo& info) {
         QueueReservation result{};
         if (!info.queueCreateInfoCount || !info.pQueueCreateInfos)
@@ -93,7 +208,8 @@ namespace {
             auto& queueInfo = result.queueInfos.at(i);
             if (queueInfo.queueFamilyIndex != *graphicsFamily)
                 continue;
-            // vkGetDeviceQueue() is only valid for queues created with flags == 0.
+            // The application's logical queue indices are defined by the
+            // flags==0 request. Non-zero flag groups use vkGetDeviceQueue2().
             if (queueInfo.flags != 0)
                 continue;
 
@@ -103,25 +219,78 @@ namespace {
                 if (candidate.queueFamilyIndex == *graphicsFamily)
                     requested += candidate.queueCount;
             }
-            if (requested >= available)
-                return QueueReservation{};
-
-            result.priorities.reserve(queueInfo.queueCount + 1);
-            if (queueInfo.pQueuePriorities) {
-                result.priorities.assign(
-                    queueInfo.pQueuePriorities,
-                    queueInfo.pQueuePriorities + queueInfo.queueCount);
-            } else {
-                result.priorities.assign(queueInfo.queueCount, 1.0F);
-            }
-            result.priorities.push_back(1.0F);
 
             result.familyIndex = *graphicsFamily;
-            result.queueIndex = queueInfo.queueCount;
             result.queueInfoIndex = static_cast<uint32_t>(i);
-            queueInfo.queueCount++;
-            queueInfo.pQueuePriorities = result.priorities.data();
-            return result;
+
+            if (requested < available) {
+                result.priorities.reserve(queueInfo.queueCount + 1);
+                if (queueInfo.pQueuePriorities) {
+                    result.priorities.assign(
+                        queueInfo.pQueuePriorities,
+                        queueInfo.pQueuePriorities + queueInfo.queueCount);
+                } else {
+                    result.priorities.assign(queueInfo.queueCount, 1.0F);
+                }
+                result.priorities.push_back(1.0F);
+
+                result.queueIndex = queueInfo.queueCount;
+                result.applicationQueueIndex = result.queueIndex;
+                result.mode = QueueReservationMode::DedicatedSpare;
+                queueInfo.queueCount++;
+                return result;
+            }
+
+            // If the application already consumes the full graphics family,
+            // split its final flags==0 logical queue into a separate internally
+            // synchronized queue. The layer remaps the application's original
+            // logical index to that same VkQueue, allowing the Fixed worker and
+            // application to share it without external queue synchronization.
+            if (requested == available
+                    && queueInfo.queueCount > 0
+                    && supportsInternallySynchronizedQueues(
+                        physdev, funcs, getPhysicalDeviceFeatures2)) {
+                const bool duplicateInternalGroup = std::ranges::any_of(
+                    result.queueInfos,
+                    [graphicsFamily](const VkDeviceQueueCreateInfo& candidate) {
+                        return candidate.queueFamilyIndex == *graphicsFamily
+                            && candidate.flags
+                                == VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
+                    });
+                if (duplicateInternalGroup)
+                    return QueueReservation{};
+
+                const uint32_t logicalIndex = queueInfo.queueCount - 1;
+                result.internalPriority = queueInfo.pQueuePriorities
+                    ? queueInfo.pQueuePriorities[logicalIndex]
+                    : 1.0F;
+                result.applicationQueueIndex = logicalIndex;
+                result.queueIndex = 0; // index within the internally-synchronized flags group
+                result.mode = QueueReservationMode::SharedInternallySynchronized;
+
+                if (queueInfo.queueCount == 1) {
+                    queueInfo.flags =
+                        VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR;
+                    result.internalQueueInfoIndex = static_cast<uint32_t>(i);
+                } else {
+                    const auto originalQueueInfo = queueInfo;
+                    queueInfo.queueCount--;
+                    VkDeviceQueueCreateInfo internalQueueInfo{
+                        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                        .pNext = originalQueueInfo.pNext,
+                        .flags = VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR,
+                        .queueFamilyIndex = *graphicsFamily,
+                        .queueCount = 1,
+                        .pQueuePriorities = nullptr
+                    };
+                    result.queueInfos.push_back(internalQueueInfo);
+                    result.internalQueueInfoIndex =
+                        static_cast<uint32_t>(result.queueInfos.size() - 1);
+                }
+                return result;
+            }
+
+            return QueueReservation{};
         }
 
         return QueueReservation{};
@@ -142,6 +311,60 @@ namespace {
                 "vkGetPhysicalDeviceSurfaceSupportKHR() failed");
 
         return supported == VK_TRUE;
+    }
+
+    std::vector<VkPresentModeKHR> querySurfacePresentModes(
+            const vk::Vulkan& vk, VkSurfaceKHR surface) {
+        if (!vk.fi().GetPhysicalDeviceSurfacePresentModesKHR)
+            return {VK_PRESENT_MODE_FIFO_KHR};
+
+        uint32_t count{};
+        auto res = vk.fi().GetPhysicalDeviceSurfacePresentModesKHR(
+            vk.physdev(), surface, &count, nullptr);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res,
+                "vkGetPhysicalDeviceSurfacePresentModesKHR() failed");
+
+        while (count) {
+            std::vector<VkPresentModeKHR> modes(count);
+            uint32_t written = count;
+            res = vk.fi().GetPhysicalDeviceSurfacePresentModesKHR(
+                vk.physdev(), surface, &written, modes.data());
+            if (res == VK_SUCCESS) {
+                modes.resize(written);
+                return modes;
+            }
+            if (res != VK_INCOMPLETE)
+                throw ls::vulkan_error(res,
+                    "vkGetPhysicalDeviceSurfacePresentModesKHR() failed");
+
+            // The set may have grown between the count and data queries. Ask
+            // for a fresh count instead of assuming 'written' is the total.
+            res = vk.fi().GetPhysicalDeviceSurfacePresentModesKHR(
+                vk.physdev(), surface, &count, nullptr);
+            if (res != VK_SUCCESS)
+                throw ls::vulkan_error(res,
+                    "vkGetPhysicalDeviceSurfacePresentModesKHR() failed");
+        }
+        return {VK_PRESENT_MODE_FIFO_KHR};
+    }
+
+    std::vector<VkPresentModeKHR> swapchainCreationAllowedPresentModes(
+            const VkSwapchainCreateInfoKHR& info) {
+        auto* next = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
+        while (next) {
+            if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT) {
+                const auto* modes =
+                    reinterpret_cast<const VkSwapchainPresentModesCreateInfoEXT*>(next);
+                if (!modes->presentModeCount || !modes->pPresentModes)
+                    return {};
+                return std::vector<VkPresentModeKHR>(
+                    modes->pPresentModes,
+                    modes->pPresentModes + modes->presentModeCount);
+            }
+            next = next->pNext;
+        }
+        return {};
     }
 
     // instance-wide info initialized at instance creation(s)
@@ -285,7 +508,11 @@ namespace {
         try {
             VkDeviceCreateInfo newInfo = *info;
             if (layer_info->root.fixedMode()) {
-                offloadReservation = reserveOffloadGraphicsQueue(physdev, instance_info->funcs, newInfo);
+                const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
+                    PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
+                        instance_info->handles.front(), "vkGetPhysicalDeviceFeatures2"));
+                offloadReservation = reserveOffloadGraphicsQueue(
+                    physdev, instance_info->funcs, getPhysicalDeviceFeatures2, newInfo);
                 offloadReservation.apply(newInfo);
             }
 
@@ -323,11 +550,24 @@ namespace {
             const auto it = instance_info->devices.find(*device);
             if (it != instance_info->devices.end()) {
                 VkQueue queue{VK_NULL_HANDLE};
-                it->second.df().GetDeviceQueue(
-                    *device,
-                    offloadReservation.familyIndex,
-                    offloadReservation.queueIndex,
-                    &queue);
+                if (offloadReservation.shared()) {
+                    const VkDeviceQueueInfo2 queueInfo{
+                        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+                        .flags = VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR,
+                        .queueFamilyIndex = offloadReservation.familyIndex,
+                        .queueIndex = offloadReservation.queueIndex
+                    };
+                    const auto getDeviceQueue2 = reinterpret_cast<PFN_vkGetDeviceQueue2>(
+                        instance_info->funcs.GetDeviceProcAddr(*device, "vkGetDeviceQueue2"));
+                    if (getDeviceQueue2)
+                        getDeviceQueue2(*device, &queueInfo, &queue);
+                } else {
+                    it->second.df().GetDeviceQueue(
+                        *device,
+                        offloadReservation.familyIndex,
+                        offloadReservation.queueIndex,
+                        &queue);
+                }
 
                 if (queue != VK_NULL_HANDLE) {
                     auto res = setLoaderData(*device, queue);
@@ -337,14 +577,21 @@ namespace {
                         instance_info->offloadQueues.emplace(*device, OffloadQueueInfo {
                             .queue = queue,
                             .familyIndex = offloadReservation.familyIndex,
-                            .queueIndex = offloadReservation.queueIndex
+                            .queueIndex = offloadReservation.queueIndex,
+                            .applicationQueueIndex = offloadReservation.applicationQueueIndex,
+                            .sharedWithApplication = offloadReservation.shared()
                         });
+                        if (offloadReservation.shared())
+                            std::cerr << "lsfg-vk: Fixed worker sharing internally synchronized graphics queue "
+                                << offloadReservation.familyIndex << ':'
+                                << offloadReservation.applicationQueueIndex << "\n";
                     }
                 }
             }
         } else if (layer_info->root.fixedMode()) {
-            std::cerr << "lsfg-vk: no spare graphics queue is available for asynchronous fixed pacing; "
-                "the current synchronous Fixed path will remain in use\n";
+            std::cerr << "lsfg-vk: no dedicated or internally synchronized graphics queue "
+                "is available for asynchronous fixed pacing; the current synchronous Fixed "
+                "path will remain in use\n";
         }
 
         return VK_SUCCESS;
@@ -403,6 +650,77 @@ namespace {
         }
 
         vkDestroyInstance(instance, alloc);
+    }
+
+    // Preserve the application's original flags==0 logical queue view when
+    // Fixed had to split the final queue into an internally synchronized group.
+    void myvkGetDeviceQueue(
+            VkDevice device,
+            uint32_t queueFamilyIndex,
+            uint32_t queueIndex,
+            VkQueue* queue) {
+        if (!queue)
+            return;
+
+        if (instance_info) {
+            const auto offload = instance_info->offloadQueues.find(device);
+            if (offload != instance_info->offloadQueues.end()
+                    && offload->second.sharedWithApplication
+                    && offload->second.familyIndex == queueFamilyIndex
+                    && offload->second.applicationQueueIndex == queueIndex) {
+                *queue = offload->second.queue;
+                return;
+            }
+
+            const auto it = instance_info->devices.find(device);
+            if (it != instance_info->devices.end()) {
+                it->second.df().GetDeviceQueue(
+                    device, queueFamilyIndex, queueIndex, queue);
+                return;
+            }
+
+            if (instance_info->funcs.GetDeviceProcAddr) {
+                const auto next = reinterpret_cast<PFN_vkGetDeviceQueue>(
+                    instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue"));
+                if (next) {
+                    next(device, queueFamilyIndex, queueIndex, queue);
+                    return;
+                }
+            }
+        }
+
+        *queue = VK_NULL_HANDLE;
+    }
+
+    void myvkGetDeviceQueue2(
+            VkDevice device,
+            const VkDeviceQueueInfo2* queueInfo,
+            VkQueue* queue) {
+        if (!queue)
+            return;
+
+        if (instance_info && queueInfo) {
+            const auto offload = instance_info->offloadQueues.find(device);
+            if (offload != instance_info->offloadQueues.end()
+                    && offload->second.sharedWithApplication
+                    && queueInfo->flags == 0
+                    && offload->second.familyIndex == queueInfo->queueFamilyIndex
+                    && offload->second.applicationQueueIndex == queueInfo->queueIndex) {
+                *queue = offload->second.queue;
+                return;
+            }
+
+            if (instance_info->funcs.GetDeviceProcAddr) {
+                const auto next = reinterpret_cast<PFN_vkGetDeviceQueue2>(
+                    instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue2"));
+                if (next) {
+                    next(device, queueInfo, queue);
+                    return;
+                }
+            }
+        }
+
+        *queue = VK_NULL_HANDLE;
     }
 
     // get optional function pointer override
@@ -469,8 +787,38 @@ namespace {
 
             // create underlying real swapchain
             VkSwapchainCreateInfoKHR newInfo = *info;
+            const VkPresentModeKHR applicationPresentMode = newInfo.presentMode;
+            bool fixedAsyncPresentModeEligible{};
             layer_info->root.modifySwapchainCreateInfo(it->second, newInfo,
-                [=, newInfo = &newInfo]() {
+                [&, newInfo = &newInfo]() {
+                    // Only the asynchronous Fixed path changes WSI mode. The
+                    // Adaptive and synchronous 3B paths retain their existing
+                    // FIFO behavior. Eligibility is checked before creation so
+                    // an unavailable dedicated presentation queue cannot alter
+                    // legacy swapchain semantics.
+                    if (layer_info->root.fixedMode()) {
+                        const auto queueIt = instance_info->offloadQueues.find(device);
+                        const auto spec = makeVirtualSwapchainImageSpec(*newInfo);
+                        if (queueIt != instance_info->offloadQueues.end()
+                                && spec.supported()
+                                && offloadQueueSupportsSurface(
+                                    it->second, queueIt->second, newInfo->surface)) {
+                            const auto supported = querySurfacePresentModes(
+                                it->second, newInfo->surface);
+                            const auto allowed = swapchainCreationAllowedPresentModes(*newInfo);
+                            const auto selected = selectFixedPresentMode(
+                                supported, allowed, applicationPresentMode);
+                            newInfo->presentMode = selected;
+                            fixedAsyncPresentModeEligible = true;
+
+                            std::cerr << "lsfg-vk: Fixed WSI present mode: "
+                                << fixedPresentModeName(selected);
+                            if (selected == VK_PRESENT_MODE_FIFO_KHR)
+                                std::cerr << " fallback";
+                            std::cerr << '\n';
+                        }
+                    }
+
                     auto res = it->second.df().CreateSwapchainKHR(
                         device, newInfo, alloc, swapchain);
                     if (res != VK_SUCCESS)
@@ -498,30 +846,29 @@ namespace {
                 const auto queueIt = instance_info->offloadQueues.find(device);
                 const auto spec = makeVirtualSwapchainImageSpec(newInfo);
 
-                if (queueIt != instance_info->offloadQueues.end() && spec.supported()) {
+                if (fixedAsyncPresentModeEligible
+                        && queueIt != instance_info->offloadQueues.end()
+                        && spec.supported()) {
                     try {
-                        if (!offloadQueueSupportsSurface(
-                                it->second, queueIt->second, newInfo.surface)) {
-                            std::cerr << "lsfg-vk: dedicated fixed-pacing queue cannot "
-                                "present to this surface; falling back to synchronous 3B path\n";
-                        } else {
-                            virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
-                                it->second,
-                                queueIt->second.queue,
-                                queueIt->second.mutex,
-                                realImages.size(),
-                                spec);
-                            applicationImages = virtualRuntime->imageHandles();
-                            virtualized = true;
-                        }
+                        virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
+                            it->second,
+                            queueIt->second.queue,
+                            queueIt->second.mutex,
+                            realImages.size(),
+                            spec);
+                        applicationImages = virtualRuntime->imageHandles();
+                        virtualized = true;
                     } catch (const std::exception& e) {
-                        std::cerr << "lsfg-vk: virtual swapchain setup failed; "
-                            "falling back to synchronous 3B path:\n";
+                        std::cerr << "lsfg-vk: virtual swapchain setup failed after "
+                            "Fixed WSI mode selection; falling back to synchronous 3B path:\n";
                         std::cerr << "- " << e.what() << '\n';
                     }
                 } else if (!spec.supported()) {
                     std::cerr << "lsfg-vk: swapchain flags are not supported by the "
                         "virtual bridge; falling back to synchronous 3B path\n";
+                } else if (!fixedAsyncPresentModeEligible) {
+                    std::cerr << "lsfg-vk: asynchronous Fixed WSI prerequisites unavailable; "
+                        "keeping FIFO synchronous 3B path\n";
                 }
             }
 
@@ -839,6 +1186,8 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkCreateDevice", VKPTR(myvkCreateDevice) },
                 { "vkDestroyDevice", VKPTR(myvkDestroyDevice) },
                 { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
+                { "vkGetDeviceQueue", VKPTR(myvkGetDeviceQueue) },
+                { "vkGetDeviceQueue2", VKPTR(myvkGetDeviceQueue2) },
                 { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
                 { "vkGetSwapchainImagesKHR", VKPTR(myvkGetSwapchainImagesKHR) },
                 { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },

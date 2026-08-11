@@ -86,6 +86,20 @@ int main() {
     {
         VkSwapchainCreateInfoKHR info{};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        info.flags = VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR
+            | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR
+            | VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        const auto spec = makeVirtualSwapchainImageSpec(info);
+        assert(spec.supported());
+        assert(spec.unsupportedSwapchainFlags == 0);
+        assert(spec.imageFlags == 0);
+    }
+
+    {
+        VkSwapchainCreateInfoKHR info{};
+        info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.flags = VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
 

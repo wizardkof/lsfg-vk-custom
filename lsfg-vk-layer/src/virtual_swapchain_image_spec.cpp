@@ -28,8 +28,15 @@ VirtualSwapchainImageSpec lsfgvk::layer::makeVirtualSwapchainImageSpec(
     spec.usage = info.imageUsage;
     spec.sharingMode = info.imageSharingMode;
 
+    // These WSI-only flags control presentation behavior of the real swapchain
+    // and do not imply VkImageCreateFlags for the application-visible virtual
+    // images. Keep them on the real WSI swapchain, but do not reject the
+    // virtual bridge because of them.
     constexpr VkSwapchainCreateFlagsKHR supportedFlags =
-        VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
+        VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR
+        | VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR
+        | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR
+        | VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
     spec.unsupportedSwapchainFlags = info.flags & ~supportedFlags;
 
     if (info.flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)

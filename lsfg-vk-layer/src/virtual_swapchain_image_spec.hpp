@@ -50,8 +50,10 @@ namespace lsfgvk::layer {
     };
 
     /// Extract image-creation details from a swapchain create info without
-    /// touching the real swapchain. Only mutable-format is supported for now;
-    /// other swapchain creation flags are surfaced as unsupported.
+    /// touching the real swapchain. Image-affecting flags are mirrored when
+    /// supported; presentation-only WSI flags can remain on the real swapchain
+    /// without becoming VkImageCreateFlags. Other flags are surfaced as
+    /// unsupported so runtime integration can fall back safely.
     [[nodiscard]] VirtualSwapchainImageSpec
     makeVirtualSwapchainImageSpec(const VkSwapchainCreateInfoKHR& info);
 
