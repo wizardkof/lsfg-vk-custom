@@ -19,7 +19,7 @@ You will need the following dependencies:
 - CMake (version 3.10 or higher)
 - Ninja build system (other build systems may work, but Ninja is recommended)
 - Vulkan SDK
-- Qt6 and Qt6Quick (only needed when building lsfg-vk-ui)
+- Qt6, Qt6 Quick and Qt6 Quick Controls 2 (only needed when building lsfg-vk-ui)
 
 The list of required packages may vary depending on your operating system. Below are the installation commands for some common Linux distributions.
 ```bash
@@ -76,6 +76,7 @@ However, lsfg-vk provides several CMake options to customize the build process:
 - `LSFGVK_BUILD_VK_LAYER`: Set to `On` to build the Vulkan layer (default is `On`).
 - `LSFGVK_BUILD_UI`: Set to `On` to build the user interface (default is `Off`).
 - `LSFGVK_BUILD_CLI`: Set to `On` to build the command-line interface (default is `On`).
+- `LSFGVK_BUILD_TESTS`: Set to `On` to build the regression test suite and register it with CTest (default is `Off`).
 - `LSFGVK_INSTALL_DEVELOP`: Set to `On` to install development files like headers and libraries (default is `Off`).
 - `LSFGVK_INSTALL_XDG_FILES`: Set to `On` to install XDG desktop files and icons (default is `Off`).
 - `LSFGVK_LAYER_LIBRARY_PATH`: Override the path to the Vulkan layer library (by default, Vulkan will search the systems library path).
@@ -88,6 +89,15 @@ Build the project using Ninja:
 ```bash
 cmake --build build
 ```
+
+If you configured with `-DLSFGVK_BUILD_TESTS=On`, run the regression suite with:
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+The suite covers the Fixed scheduler/output pacer, present-mode selection,
+virtual swapchain state/image specification, and Adaptive/Fixed configuration
+validation.
 
 4. **Install the Project**
 
