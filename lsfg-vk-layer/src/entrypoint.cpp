@@ -500,14 +500,16 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
-        // Fixed pacing needs a queue that is never exposed to the application.
-        // Reserve one only when Fixed is active so Adaptive device creation stays unchanged.
+        // Prepare the offload graphics queue for every active LSFG profile, not
+        // only when the process starts in Fixed mode. This keeps the VkDevice
+        // capable of entering the asynchronous Fixed path after a future mode
+        // switch while leaving worker/swapchain activation gated by fixedMode().
         QueueReservation offloadReservation{};
 
         // create device
         try {
             VkDeviceCreateInfo newInfo = *info;
-            if (layer_info->root.fixedMode()) {
+            if (layer_info->root.active()) {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
                     PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
                         instance_info->handles.front(), "vkGetPhysicalDeviceFeatures2"));
@@ -581,7 +583,19 @@ namespace {
                             .applicationQueueIndex = offloadReservation.applicationQueueIndex,
                             .sharedWithApplication = offloadReservation.shared()
                         });
-                        if (offloadReservation.shared())
+
+                        std::cerr << "lsfg-vk: dual-ready offload queue prepared: "
+                            << (offloadReservation.shared()
+                                ? "shared-internally-synchronized"
+                                : "dedicated")
+                            << " family=" << offloadReservation.familyIndex
+                            << " queue=" << offloadReservation.queueIndex
+                            << " app-index=" << offloadReservation.applicationQueueIndex
+                            << " initial-mode="
+                            << (layer_info->root.fixedMode() ? "Fixed" : "Adaptive")
+                            << "\n";
+
+                        if (offloadReservation.shared() && layer_info->root.fixedMode())
                             std::cerr << "lsfg-vk: Fixed worker sharing internally synchronized graphics queue "
                                 << offloadReservation.familyIndex << ':'
                                 << offloadReservation.applicationQueueIndex << "\n";
@@ -592,6 +606,10 @@ namespace {
             std::cerr << "lsfg-vk: no dedicated or internally synchronized graphics queue "
                 "is available for asynchronous fixed pacing; the current synchronous Fixed "
                 "path will remain in use\n";
+        } else if (layer_info->root.active()) {
+            std::cerr << "lsfg-vk: no dual-ready offload graphics queue is available; "
+                "Adaptive remains unchanged and a future hot switch to asynchronous Fixed "
+                "will require the legacy fallback path\n";
         }
 
         return VK_SUCCESS;
