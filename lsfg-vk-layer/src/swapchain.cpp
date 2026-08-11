@@ -112,6 +112,7 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             ls::GameConf profile, SwapchainInfo info) :
         instance(backend),
         fixedScheduler(profile.target_fps),
+        fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
     // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
     // bypasses LSFG. Fixed mode ignores multiplier and remains active.
@@ -223,13 +224,45 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
         // If the application itself is faster than the requested output target,
         // pace the real-frame path instead of attempting negative interpolation.
-        if (fixedPlan.sourceDelay > FixedFrameScheduler::Duration::zero())
+        if (!workerOffload
+                && fixedPlan.sourceDelay > FixedFrameScheduler::Duration::zero())
             std::this_thread::sleep_for(fixedPlan.sourceDelay);
     }
 
     const size_t generatedFrames = fixedMode
         ? fixedPlan.timestamps.size()
         : this->destinationImages.size();
+
+    // Fixed virtual mode must not rely exclusively on FIFO/vblank to space
+    // generated output. Use a cancellable host-side target cadence; the WSI
+    // present mode is intentionally left unchanged by this pacing step.
+    const auto paceFixedWorkerOutput = [&]() {
+        if (!workerOffload)
+            return;
+
+        constexpr auto MAX_SLEEP_SLICE = std::chrono::milliseconds(2);
+        while (true) {
+            if (stopToken.stop_requested())
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_DATE_KHR,
+                    "fixed output pacing worker stopped");
+
+            const auto delay = this->fixedOutputPacer.delayUntilNext(
+                std::chrono::steady_clock::now());
+            if (delay <= FixedOutputPacer::Duration::zero())
+                return;
+
+            std::this_thread::sleep_for(std::min(
+                delay,
+                std::chrono::duration_cast<FixedOutputPacer::Duration>(
+                    MAX_SLEEP_SLICE)));
+        }
+    };
+
+    const auto markFixedWorkerOutput = [&]() {
+        if (workerOffload)
+            this->fixedOutputPacer.markPresented(
+                std::chrono::steady_clock::now());
+    };
 
     // Schedule frame generation. Adaptive continues through the original API.
     // Fixed uses the dynamic backend, including zero generated frames, so the
@@ -426,6 +459,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             .pSwapchains = &swapchain,
             .pImageIndices = &aqImageIdx,
         };
+        paceFixedWorkerOutput();
         if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
             res = vk.df().QueuePresentKHR(queue, &presentInfo);
@@ -434,6 +468,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+        markFixedWorkerOutput();
 
         this->idx++;
     }
@@ -544,6 +579,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         .pSwapchains = &swapchain,
         .pImageIndices = &realImageIdx,
     };
+    paceFixedWorkerOutput();
     if (workerOffload) {
         const std::scoped_lock queueLock(*queueMutex);
         res = vk.df().QueuePresentKHR(queue, &presentInfo);
@@ -552,6 +588,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+    markFixedWorkerOutput();
 
     // The application may reacquire this virtual image only after the worker
     // completes it. Use bounded waits in worker mode so swapchain destruction

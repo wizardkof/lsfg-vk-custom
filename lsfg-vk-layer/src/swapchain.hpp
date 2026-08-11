@@ -3,6 +3,7 @@
 #pragma once
 
 #include "fixed_frame_scheduler.hpp"
+#include "fixed_output_pacer.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
@@ -98,6 +99,7 @@ namespace lsfgvk::layer {
         size_t fidx{0}; // real frame index
 
         FixedFrameScheduler fixedScheduler;
+        FixedOutputPacer fixedOutputPacer;
         std::optional<std::chrono::steady_clock::time_point> lastSourcePresent;
 
         ls::GameConf profile;
