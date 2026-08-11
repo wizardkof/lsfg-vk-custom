@@ -96,8 +96,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 The suite covers the Fixed scheduler/output pacer, present-mode selection,
-virtual swapchain state/image specification, and Adaptive/Fixed configuration
-validation.
+virtual swapchain state/image specification, Adaptive/Fixed configuration
+validation, CLI help behavior, and documentation/packaging consistency.
 
 4. **Install the Project**
 

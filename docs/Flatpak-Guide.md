@@ -23,15 +23,15 @@ Head over to the [GitHub Releases](https://github.com/PancakeTAS/lsfg-vk/release
 It can be installed with the following commands (you can omit the `--user` in a system installation):
 ```bash
 tar -xf lsfg-vk-2.0.0-flatpaks-x86_64.tar.xz
-flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfg-vk-23.08.flatpak
-flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfg-vk-24.08.flatpak
-flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfg-vk-25.08.flatpak
+flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfgvk_23.08.flatpak
+flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfgvk_24.08.flatpak
+flatpak --user install ./org.freedesktop.Platform.VulkanLayer.lsfgvk_25.08.flatpak
 flatpak --user install ./gay.pancake.lsfg-vk-ui.flatpak
 ```
 
 You can then run the graphical configuration editor with:
 ```bash
-flatpak run gay.pancake.lsfg_vk_ui
+flatpak run gay.pancake.lsfg-vk-ui
 ```
 
 ### Through Custom Build
@@ -57,7 +57,7 @@ Before using lsfg-vk with Flatpak applications, you need to give them access to 
 ```bash
 export appid=  # e.g. io.mpv.Mpv
 mkdir -p ~/.config/lsfg-vk
-flatpak override --user --filesystem=/home/$USER/.config/lsfg-vk:rw $appid
-flatpak override --user --filesystem=/home/$USER/local/share/Steam/steamapps/common:ro $appid
-flatpak override --user --env=LSFGVK_CONFIG=/home/$USER/.config/lsfg-vk/conf.toml $appid
+flatpak override --user --filesystem="$HOME/.config/lsfg-vk:rw" "$appid"
+flatpak override --user --filesystem="$HOME/.local/share/Steam/steamapps/common:ro" "$appid"
+flatpak override --user --env=LSFGVK_CONFIG="$HOME/.config/lsfg-vk/conf.toml" "$appid"
 ```

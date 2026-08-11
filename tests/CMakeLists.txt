@@ -65,3 +65,7 @@ if(LSFGVK_BUILD_CLI)
     add_test(NAME lsfg-vk-test-cli-debug-help
         COMMAND lsfg-vk-cli debug --help)
 endif()
+
+add_test(NAME lsfg-vk-test-documentation-packaging-consistency
+    COMMAND ${CMAKE_COMMAND} -P
+        "${CMAKE_CURRENT_SOURCE_DIR}/documentation_packaging_consistency.cmake")

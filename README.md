@@ -12,7 +12,7 @@
 > Please keep in mind that it is not officially supported and support questions should be directed to the plugin's repository & discord.
 
 1. Before proceeding, please make sure you have [Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/) downloaded on Steam.
-2. Head to the [GitHub Releases](https://github.com/PancakeTAS/lsfg-vk/releases) and download the file named "lsfg-vk-2.0.0-x86_64.tar.xz".
+2. Head to the [GitHub Releases](https://github.com/PancakeTAS/lsfg-vk/releases) and download the file named "lsfg-vk-2.0.0-linux.tar.xz".
 3. Open a terminal in the folder where you downloaded the file and run the following:
 ```bash
 tar -xvf lsfg-vk-2.0.0-linux.tar.xz -C ~/.local
