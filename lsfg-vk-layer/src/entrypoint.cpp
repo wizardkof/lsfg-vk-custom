@@ -600,6 +600,58 @@ namespace {
         return std::min(first, second);
     }
 
+    [[nodiscard]] bool adoptApplicationDualPresentModeDeclaration(
+            const vk::Vulkan& vk,
+            PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getCapabilities2,
+            SwapchainMaintenanceFamily family,
+            VkSwapchainCreateInfoKHR& info,
+            uint32_t minimumImageCountFloor,
+            std::vector<VkPresentModeKHR>& modeStorage) {
+        if (family == SwapchainMaintenanceFamily::None
+                || !hasSwapchainPresentModesCreateInfo(info))
+            return false;
+
+        const auto declared = swapchainCreationAllowedPresentModes(info);
+        const auto fixedMode = selectApplicationDualPresentMode(
+            declared, info.presentMode);
+        if (!fixedMode.has_value())
+            return false;
+
+        const auto adaptiveCaps = querySurfacePresentModeCaps(
+            vk, getCapabilities2, info.surface, VK_PRESENT_MODE_FIFO_KHR);
+        const auto fixedCaps = querySurfacePresentModeCaps(
+            vk, getCapabilities2, info.surface, *fixedMode);
+        if (!adaptiveCaps.has_value() || !fixedCaps.has_value())
+            return false;
+
+        if (!containsPresentMode(adaptiveCaps->compatibleModes, *fixedMode)
+                || !containsPresentMode(
+                    fixedCaps->compatibleModes, VK_PRESENT_MODE_FIFO_KHR))
+            return false;
+
+        const auto requiredUsage = info.imageUsage;
+        if ((adaptiveCaps->supportedUsageFlags & requiredUsage) != requiredUsage
+                || (fixedCaps->supportedUsageFlags & requiredUsage) != requiredUsage)
+            return false;
+
+        const uint32_t commonMin = std::max(
+            std::max(info.minImageCount, minimumImageCountFloor),
+            std::max(adaptiveCaps->minImageCount, fixedCaps->minImageCount));
+        const uint32_t commonMax = commonMaximumImageCount(
+            adaptiveCaps->maxImageCount, fixedCaps->maxImageCount);
+        if (commonMax && commonMin > commonMax)
+            return false;
+
+        info.minImageCount = commonMin;
+        modeStorage = { VK_PRESENT_MODE_FIFO_KHR, *fixedMode };
+
+        std::cerr << "lsfg-vk: adopted application dual present modes: "
+            "Adaptive=FIFO Fixed=" << fixedPresentModeName(*fixedMode)
+            << " family=" << maintenanceFamilyName(family)
+            << " min-images=" << info.minImageCount << "\n";
+        return true;
+    }
+
     [[nodiscard]] bool prepareDualPresentModeDeclaration(
             const vk::Vulkan& vk,
             PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getCapabilities2,
@@ -1218,35 +1270,42 @@ namespace {
                     const auto maintenanceIt =
                         instance_info->swapchainMaintenanceFamilies.find(device);
                     if (maintenanceIt != instance_info->swapchainMaintenanceFamilies.end()) {
-                        if (hasSwapchainPresentModesCreateInfo(*newInfo)) {
-                            std::cerr << "lsfg-vk: application present-mode declaration preserved; "
-                                "LSFG dual declaration not injected\n";
-                        } else {
-                            const auto getCapabilities2 = reinterpret_cast<
-                                PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
-                                    layer_info->GetInstanceProcAddr(
-                                        instance_info->handles.front(),
-                                        "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
-                            try {
-                                const uint32_t stableAdaptiveImageFloor =
-                                    layer_info->root.fixedMode()
-                                        ? 0U
-                                        : applicationMinImageCount
-                                            + static_cast<uint32_t>(
-                                                ls::GameConf::MAX_ADAPTIVE_MULTIPLIER);
-                                if (prepareDualPresentModeDeclaration(
+                        const auto getCapabilities2 = reinterpret_cast<
+                            PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+                                layer_info->GetInstanceProcAddr(
+                                    instance_info->handles.front(),
+                                    "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+                        try {
+                            const uint32_t stableAdaptiveImageFloor =
+                                layer_info->root.fixedMode()
+                                    ? 0U
+                                    : applicationMinImageCount
+                                        + static_cast<uint32_t>(
+                                            ls::GameConf::MAX_ADAPTIVE_MULTIPLIER);
+
+                            if (hasSwapchainPresentModesCreateInfo(*newInfo)) {
+                                if (adoptApplicationDualPresentModeDeclaration(
                                         it->second, getCapabilities2, maintenanceIt->second,
                                         *newInfo, stableAdaptiveImageFloor,
-                                        dualPresentModes, dualPresentModesInfo)) {
+                                        dualPresentModes)) {
                                     dualPresentModeDeclared = true;
                                 } else {
-                                    std::cerr << "lsfg-vk: compatible dual present modes unavailable; "
-                                        "keeping legacy WSI swapchain\n";
+                                    std::cerr << "lsfg-vk: application present-mode declaration "
+                                        "is not usable for LSFG dual mode; keeping legacy WSI "
+                                        "swapchain\n";
                                 }
-                            } catch (const std::exception& e) {
-                                std::cerr << "lsfg-vk: dual present-mode query failed; "
-                                    "keeping legacy WSI swapchain:\n- " << e.what() << '\n';
+                            } else if (prepareDualPresentModeDeclaration(
+                                    it->second, getCapabilities2, maintenanceIt->second,
+                                    *newInfo, stableAdaptiveImageFloor,
+                                    dualPresentModes, dualPresentModesInfo)) {
+                                dualPresentModeDeclared = true;
+                            } else {
+                                std::cerr << "lsfg-vk: compatible dual present modes unavailable; "
+                                    "keeping legacy WSI swapchain\n";
                             }
+                        } catch (const std::exception& e) {
+                            std::cerr << "lsfg-vk: dual present-mode query failed; "
+                                "keeping legacy WSI swapchain:\n- " << e.what() << '\n';
                         }
                     }
 

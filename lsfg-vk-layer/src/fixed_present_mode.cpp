@@ -45,6 +45,21 @@ VkPresentModeKHR lsfgvk::layer::selectFixedPresentMode(
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+std::optional<VkPresentModeKHR> lsfgvk::layer::selectApplicationDualPresentMode(
+        const std::vector<VkPresentModeKHR>& creationAllowed,
+        VkPresentModeKHR originalMode) {
+    if (!contains(creationAllowed, originalMode)
+            || !contains(creationAllowed, VK_PRESENT_MODE_FIFO_KHR))
+        return std::nullopt;
+
+    if (contains(creationAllowed, VK_PRESENT_MODE_MAILBOX_KHR))
+        return VK_PRESENT_MODE_MAILBOX_KHR;
+    if (contains(creationAllowed, VK_PRESENT_MODE_IMMEDIATE_KHR))
+        return VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+    return std::nullopt;
+}
+
 const char* lsfgvk::layer::fixedPresentModeName(VkPresentModeKHR mode) {
     switch (mode) {
         case VK_PRESENT_MODE_IMMEDIATE_KHR:
