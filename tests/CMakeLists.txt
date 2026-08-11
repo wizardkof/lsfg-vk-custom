@@ -54,3 +54,14 @@ target_link_libraries(lsfg-vk-test-config-frame-generation-mode
 add_test(
     NAME lsfg-vk-test-config-frame-generation-mode
     COMMAND lsfg-vk-test-config-frame-generation-mode)
+
+if(LSFGVK_BUILD_CLI)
+    add_test(NAME lsfg-vk-test-cli-help
+        COMMAND lsfg-vk-cli --help)
+    add_test(NAME lsfg-vk-test-cli-validate-help
+        COMMAND lsfg-vk-cli validate --help)
+    add_test(NAME lsfg-vk-test-cli-benchmark-help
+        COMMAND lsfg-vk-cli benchmark --help)
+    add_test(NAME lsfg-vk-test-cli-debug-help
+        COMMAND lsfg-vk-cli debug --help)
+endif()

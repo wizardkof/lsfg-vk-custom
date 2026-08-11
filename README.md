@@ -19,7 +19,7 @@ tar -xvf lsfg-vk-2.0.0-linux.tar.xz -C ~/.local
 ```
 This will extract lsfg-vk to `~/.local`. Please **keep track of the files that were extracted**, in case you want to uninstall lsfg-vk later.
 
-4. The graphical interface requires Qt6 and Qt6 Quick in order to run. If you do not have these installed, install the following packages:
+4. The graphical interface requires Qt6, Qt6 Quick and Qt6 Quick Controls 2 in order to run. If you do not have these installed, install the following packages:
 ```bash
 sudo apt install qt6-qpa-plugins libqt6quick6 qml6-module-qtquick-controls qml6-module-qtquick-layouts qml6-module-qtquick-window qml6-module-qtquick-dialogs qml6-module-qtqml-workerscript qml6-module-qtquick-templates qml6-module-qt-labs-folderlistmodel # On Debian/Ubuntu-based systems
 sudo pacman -S qt6-declarative qt6-base # On Arch-based systems
@@ -60,7 +60,7 @@ You can run a frame generation benchmark using `lsfg-vk-cli`:
 ~/.local/bin/lsfg-vk-cli benchmark
 ```
 
-By default, the benchmark will run for 10 seconds. Add `-h` to see all available benchmarking options.
+By default, the benchmark will run for 10 seconds. Use `--help` to see all available CLI options. The short option `-h` is reserved for `--height` in `benchmark` and `debug`.
 
 ## Support and Troubleshooting
 If you encounter any issues or have questions regarding lsfg-vk, read through the [Troubleshooting](docs/Troubleshooting.md) documentation page or join the [Discord server](https://discord.gg/losslessscaling) for assistance.

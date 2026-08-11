@@ -42,6 +42,13 @@ target_fps = 0
 
 Fixed mode ignores `multiplier` and targets an explicit output rate:
 
+> [!NOTE]
+> The `--multiplier` option of `lsfg-vk-cli benchmark` and `lsfg-vk-cli debug`
+> controls those tools' direct backend interpolation workload. Those commands
+> do not create the Vulkan-layer swapchain/pacer topology, so their multiplier
+> is separate from profile `frame_generation_mode`, Adaptive 1x bypass, and
+> Fixed `target_fps`.
+
 ```toml
 [[profile]]
 name = "Fixed 120 FPS"

@@ -18,23 +18,37 @@
 using namespace lsfgvk::cli;
 
 namespace {
+    constexpr int OPT_HELP = 1000;
+
     /// print usage information
-    void usage(const std::string& prog) {
+    void usage(const std::string& prog, const std::string& command = {}) {
+        std::cerr << "Validate, benchmark, and debug lsfg-vk.\n\n"
+                     "USAGE:\n    " << prog;
+
+        if (command == "validate")
+            std::cerr << " validate [OPTIONS]\n\n";
+        else if (command == "benchmark")
+            std::cerr << " benchmark [OPTIONS]\n\n";
+        else if (command == "debug")
+            std::cerr << " debug [OPTIONS] <folder>\n\n";
+        else
+            std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
+
         std::cerr <<
-R"(Validate, benchmark, and debug lsfg-vk.
-
-USAGE:
-    )" << prog << R"( <COMMAND> [OPTIONS] [ARGS]
-
-COMMANDS:
+R"(COMMANDS:
     validate    Validate a configuration file
     benchmark   Run a benchmark
     debug       Run lsfg-vk on a set of images
+    help        Show this help text
+
+GLOBAL OPTIONS:
+        --help                          Show this help text
 
 SUBCOMMAND OPTIONS:
 
     validate
         -c, --config <PATH>             Optional path to the configuration file
+            --help                      Show this help text
 
     benchmark & debug
         -d, --dll <PATH>                Path to Lossless.dll
@@ -42,9 +56,10 @@ SUBCOMMAND OPTIONS:
         -w, --width <INT>               Width of the input frames
         -h, --height <INT>              Height of the input frames
         -f, --flow <FLOAT>              Flow scale
-        -m, --multiplier <INT>          Multiplier
+        -m, --multiplier <INT>          Backend interpolation multiplier (2+)
         -p, --performance-mode          Use performance mode
         -g, --gpu <STRING>              GPU to use
+            --help                      Show this help text
 
     benchmark
         -t, --duration <SECONDS>        Benchmark duration in seconds
@@ -54,12 +69,13 @@ SUBCOMMAND OPTIONS:
     }
 
     /// parse the validate command options
-    [[noreturn]] void on_validate(int argc, char** argv) {
+    [[noreturn]] void on_validate(int argc, char** argv, const std::string& prog) {
         validate::Options opts{};
 
         const std::array<option, 3> GETOPT {{
             { "config", required_argument, nullptr, 'c' },
-            { nullptr,        no_argument, nullptr,  0  }
+            { "help",          no_argument, nullptr, OPT_HELP },
+            { nullptr,         no_argument, nullptr,  0  }
         }};
 
         int c{0};
@@ -68,15 +84,18 @@ SUBCOMMAND OPTIONS:
                 case 'c':
                     opts.config.emplace(optarg);
                     break;
+                case OPT_HELP:
+                    usage(prog, "validate");
+                    std::exit(EXIT_SUCCESS);
                 case '?':
                 default:
-                    usage(*argv);
+                    usage(prog, "validate");
                     std::exit(EXIT_FAILURE);
             }
         }
 
         if (optind < argc) {
-            usage(*argv);
+            usage(prog, "validate");
             std::exit(EXIT_FAILURE);
         }
 
@@ -84,10 +103,10 @@ SUBCOMMAND OPTIONS:
     }
 
     /// parse the benchmark command options
-    [[noreturn]] void on_benchmark(int argc, char** argv) {
+    [[noreturn]] void on_benchmark(int argc, char** argv, const std::string& prog) {
         benchmark::Options opts{};
 
-        const std::array<option, 10> GETOPT {{
+        const std::array<option, 11> GETOPT {{
             { "dll",              required_argument, nullptr, 'd' },
             { "allow-fp16",       no_argument,       nullptr, 'a' },
             { "width",            required_argument, nullptr, 'w' },
@@ -97,6 +116,7 @@ SUBCOMMAND OPTIONS:
             { "performance-mode",       no_argument, nullptr, 'p' },
             { "gpu",              required_argument, nullptr, 'g' },
             { "duration",         required_argument, nullptr, 't' },
+            { "help",                   no_argument, nullptr, OPT_HELP },
             { nullptr,                  no_argument, nullptr,  0  }
         }};
 
@@ -130,15 +150,18 @@ SUBCOMMAND OPTIONS:
                 case 't':
                     opts.duration = std::stoi(optarg);
                     break;
+                case OPT_HELP:
+                    usage(prog, "benchmark");
+                    std::exit(EXIT_SUCCESS);
                 case '?':
                 default:
-                    usage(*argv);
+                    usage(prog, "benchmark");
                     std::exit(EXIT_FAILURE);
             }
         }
 
         if (optind < argc) {
-            usage(*argv);
+            usage(prog, "benchmark");
             std::exit(EXIT_FAILURE);
         }
 
@@ -146,10 +169,10 @@ SUBCOMMAND OPTIONS:
     }
 
     /// parse the debug command options
-    [[noreturn]] void on_debug(int argc, char** argv) {
+    [[noreturn]] void on_debug(int argc, char** argv, const std::string& prog) {
         debug::Options opts{};
 
-        const std::array<option, 9> GETOPT {{
+        const std::array<option, 10> GETOPT {{
             { "dll",              required_argument, nullptr, 'd' },
             { "allow-fp16",       no_argument,       nullptr, 'a' },
             { "width",            required_argument, nullptr, 'w' },
@@ -158,6 +181,7 @@ SUBCOMMAND OPTIONS:
             { "multiplier",       required_argument, nullptr, 'm' },
             { "performance-mode",       no_argument, nullptr, 'p' },
             { "gpu",              required_argument, nullptr, 'g' },
+            { "help",                   no_argument, nullptr, OPT_HELP },
             { nullptr,                  no_argument, nullptr,  0  }
         }};
 
@@ -188,15 +212,18 @@ SUBCOMMAND OPTIONS:
                 case 'g':
                     opts.gpu.emplace(optarg);
                     break;
+                case OPT_HELP:
+                    usage(prog, "debug");
+                    std::exit(EXIT_SUCCESS);
                 case '?':
                 default:
-                    usage(*argv);
+                    usage(prog, "debug");
                     std::exit(EXIT_FAILURE);
             }
         }
 
         if ((optind + 1) != argc) {
-            usage(*argv);
+            usage(prog, "debug");
             std::exit(EXIT_FAILURE);
         }
 
@@ -207,19 +234,25 @@ SUBCOMMAND OPTIONS:
 }
 
 int main(int argc, char** argv) {
+    const std::string prog{argv[0]};
+
     if (argc < 2) {
-        usage(*argv);
+        usage(prog);
         return EXIT_FAILURE;
     }
 
     const std::string command{argv[1]};
+    if (command == "--help" || command == "help") {
+        usage(prog);
+        return EXIT_SUCCESS;
+    }
     if (command == "validate")
-        on_validate(argc - 1, argv + 1);
+        on_validate(argc - 1, argv + 1, prog);
     else if (command == "benchmark")
-        on_benchmark(argc - 1, argv + 1);
+        on_benchmark(argc - 1, argv + 1, prog);
     else if (command == "debug")
-        on_debug(argc - 1, argv + 1);
+        on_debug(argc - 1, argv + 1, prog);
 
-    usage(*argv);
+    usage(prog);
     return EXIT_FAILURE;
 }
