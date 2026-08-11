@@ -9,10 +9,29 @@ import "widgets"
 ApplicationWindow {
     title: "lsfg-vk Configuration Window"
     width: 900
-    height: 550
+    height: 650
     minimumWidth: 700
-    minimumHeight: 400
+    minimumHeight: 500
     visible: true
+
+    // Keep the editor consistently dark instead of mixing the platform
+    // window palette with dark custom Group/List backgrounds.
+    color: "#151821"
+    palette.window: "#151821"
+    palette.windowText: "#f0f2f5"
+    palette.base: "#10131a"
+    palette.alternateBase: "#202432"
+    palette.toolTipBase: "#202432"
+    palette.toolTipText: "#f0f2f5"
+    palette.text: "#f0f2f5"
+    palette.button: "#272c39"
+    palette.buttonText: "#f0f2f5"
+    palette.brightText: "#ffffff"
+    palette.light: "#3b4252"
+    palette.midlight: "#343a48"
+    palette.mid: "#2c3140"
+    palette.dark: "#0d1016"
+    palette.shadow: "#05070a"
 
     CenteredDialog {
         id: create_dialog
@@ -188,14 +207,44 @@ ApplicationWindow {
                 }
 
                 GroupEntry {
-                    title: "Multiplier"
-                    description: "Control the amount of generated frames"
+                    title: "Frame Generation Mode"
+                    description: "Adaptive follows the multiplier; Fixed targets an explicit output FPS"
+
+                    ComboBox {
+                        Layout.fillWidth: true
+
+                        model: ["Adaptive", "Fixed"]
+                        currentIndex: backend.frame_generation_mode
+                        onActivated: (index) => backend.frame_generation_mode = index
+                    }
+                }
+
+                GroupEntry {
+                    title: "Target FPS"
+                    description: "Output FPS target used by Fixed mode"
+                    visible: backend.frame_generation_mode === 1
 
                     SpinBox {
                         Layout.alignment: Qt.AlignRight
 
-                        from: 2
-                        to: 100
+                        from: 1
+                        to: 2147483647
+
+                        value: backend.target_fps
+                        onValueModified: backend.target_fps = value
+                    }
+                }
+
+                GroupEntry {
+                    title: "Multiplier"
+                    description: "Adaptive only; 1x bypasses frame generation"
+
+                    SpinBox {
+                        Layout.alignment: Qt.AlignRight
+                        enabled: backend.frame_generation_mode === 0
+
+                        from: 1
+                        to: backend.adaptive_multiplier_max
 
                         value: backend.multiplier
                         onValueModified: backend.multiplier = value

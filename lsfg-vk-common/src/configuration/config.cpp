@@ -40,9 +40,9 @@ active_in = [ # see the wiki for more info
     'vkcubepp'
 ]
 # gpu = 'NVIDIA GeForce RTX 5080' # see the wiki for more info
-multiplier = 4
-frame_generation_mode = 'adaptive'
-target_fps = 0
+multiplier = 4 # Adaptive supports 1-5; 1 = bypass / no generated frames
+frame_generation_mode = 'adaptive' # 'adaptive' or 'fixed'
+target_fps = 0 # Fixed mode requires a value greater than 0
 flow_scale = 0.85
 performance_mode = true
 pacing = 'none' # see the wiki for more info
@@ -51,9 +51,9 @@ pacing = 'none' # see the wiki for more info
 name = "2x FG / 100%"
 active_in = 'GenshinImpact.exe'
 gpu = 'NVIDIA GeForce RTX 5080'
-multiplier = 2
-frame_generation_mode = 'adaptive'
-target_fps = 0
+multiplier = 2 # Adaptive supports 1-5; 1 = bypass / no generated frames
+frame_generation_mode = 'adaptive' # 'adaptive' or 'fixed'
+target_fps = 0 # Fixed mode requires a value greater than 0
 )";
         ofs.close();
     } catch (const std::filesystem::filesystem_error& e) {
@@ -147,6 +147,9 @@ namespace {
 
         if (conf.multiplier < 1)
             throw ls::error("multiplier must be at least 1");
+        if (conf.frame_generation_mode == FrameGenerationMode::Adaptive
+                && conf.multiplier > GameConf::MAX_ADAPTIVE_MULTIPLIER)
+            throw ls::error("adaptive multiplier must be between 1 and 5");
         if (conf.frame_generation_mode == FrameGenerationMode::Fixed && conf.target_fps == 0)
             throw ls::error("target_fps must be greater than 0 in fixed mode");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)
@@ -181,9 +184,9 @@ namespace {
             .gpu = std::nullopt,
 
             .multiplier = 2,
-                        .frame_generation_mode = FrameGenerationMode::Adaptive,
+            .frame_generation_mode = FrameGenerationMode::Adaptive,
             .target_fps = 0,
-.flow_scale = 1.0F,
+            .flow_scale = 1.0F,
             .performance_mode = false,
             .pacing = Pacing::None
         };
@@ -207,6 +210,9 @@ namespace {
 
         if (conf.multiplier < 1)
             throw ls::error("multiplier must be at least 1");
+        if (conf.frame_generation_mode == FrameGenerationMode::Adaptive
+                && conf.multiplier > GameConf::MAX_ADAPTIVE_MULTIPLIER)
+            throw ls::error("adaptive multiplier must be between 1 and 5");
         if (conf.frame_generation_mode == FrameGenerationMode::Fixed && conf.target_fps == 0)
             throw ls::error("target_fps must be greater than 0 in fixed mode");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)

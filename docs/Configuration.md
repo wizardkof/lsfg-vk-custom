@@ -16,14 +16,40 @@ Below is a list of all available **global** configuration options:
 Next is a list of all available **profile** configuration options:
 - **Profile Name / `name`**: The name of the profile, displayed in **lsfg-vk-ui**. Additionally, this is used when selecting a profile through the `LSFGVK_PROFILE` environment variable.
 - **Active In / `active_in`**: A list of 1) linux binary names, such as `mpv`, 2) windows executables, such as `GenshinImpact.exe` and 3) process names, such as `GameThread`. It is also possible to specify the last part of a path (e.g. `Ghostrunner2/Binaries/Win64/Ghostrunner2-Win64-Shipping.exe`). When a process matching one of these rules is detected, this profile will be activated.
-- **Multiplier / `multiplier`**: The frame generation multiplier. A value of 3 means that for every frame rendered by the application, lsfg-vk will generate 2 additional frames. (Default: `2`)
+- **Frame Generation Mode / `frame_generation_mode`**: Selects how output frames are scheduled. `adaptive` preserves the normal multiplier-driven behavior. `fixed` targets an explicit output frame rate using `target_fps`. (Default: `adaptive`)
+- **Target FPS / `target_fps`**: Output FPS target used by Fixed mode. It must be greater than `0` when `frame_generation_mode = "fixed"`. The value is ignored by Adaptive mode.
+- **Multiplier / `multiplier`**: The Adaptive frame generation multiplier. Supported Adaptive values in this fork are `1` through `5`. A value of `1` keeps the layer/profile active but bypasses frame generation; a value of `3` generates 2 additional frames for every application frame. Fixed mode ignores the multiplier. (Default: `2`)
 - **Flow Scale / `flow_scale`**: The resolution scale at which the motion vectors are calculated. A lower value means better performance, but worse quality. (Default: `1.0`)
 - **Performance Mode / `performance_mode`**: When enabled, a significantly lighter frame generation model is used. This has a minor quality impact, but greatly improves performance. 
 (Default: `false`)
 - **Pacing Mode / `pacing`**: This option is explained in greater detail below. Supported values are **None / `none`**.
 - **GPU / `gpu`**: The GPU to use for frame generation. This MUST be the **same GPU** as the one being used by the application. **Dual GPU is NOT supported**. You can identify a GPU through its name (e.g. `NVIDIA GeForce RTX 3080`), uppercase-only ID (e.g. `0x10DE:0x2C02`) or PCI bus ID (e.g. `3:0.0`). If not specified, the primary GPU will be used, which may lead to issues.
 
-The "Multiplier", "Flow Scale" and "Performance Mode" options can be **hot-reloaded**, meaning that changes to these options will take effect immediately without needing to restart the application. Options such as "Pacing Mode" or removal of the profile require a swapchain recreation, which usually means resizing or restarting the application. Any other change requires an application restart. 
+The "Multiplier", "Flow Scale", "Performance Mode" and Fixed `target_fps` options can be **hot-reloaded**. `frame_generation_mode` can also switch between Adaptive and Fixed in the same process when the swapchain supports the dual-mode topology. On fallback hardware, Adaptive may use the legacy real/FIFO path and can switch to synchronous Fixed/FIFO; a Fixed virtual swapchain that could not declare compatible dual present modes will conservatively block a switch back to Adaptive until the application recreates its swapchain. Options such as "Pacing Mode" or removal of the profile still require a swapchain recreation.
+
+### Adaptive and Fixed Examples
+
+Adaptive 1x bypass keeps the profile/layer active without generating frames:
+
+```toml
+[[profile]]
+name = "Adaptive bypass"
+active_in = "Game.exe"
+frame_generation_mode = "adaptive"
+multiplier = 1
+target_fps = 0
+```
+
+Fixed mode ignores `multiplier` and targets an explicit output rate:
+
+```toml
+[[profile]]
+name = "Fixed 120 FPS"
+active_in = "Game.exe"
+frame_generation_mode = "fixed"
+target_fps = 120
+multiplier = 1
+```
 
 ### Pacing Modes
 
@@ -47,7 +73,9 @@ The following environment variables affect lsfg-vk:
 If you do not wish to use a configuration file, you can also set configuration options through environment variables. To do this, set `LSFGVK_ENV=1` and then any of the following variables:
 - `LSFGVK_DLL_PATH`: Path to Lossless Scaling DLL.
 - `LSFGVK_NO_FP16`: If set to `1`, half-precision will be disabled.
-- `LSFGVK_MULTIPLIER`: Frame generation multiplier.
+- `LSFGVK_MULTIPLIER`: Adaptive frame generation multiplier (`1` through `5`; `1` is bypass).
+- `LSFGVK_FRAME_GENERATION_MODE`: `adaptive` or `fixed`.
+- `LSFGVK_TARGET_FPS`: Positive output FPS target required by Fixed mode.
 - `LSFGVK_FLOW_SCALE`: Flow scale value.
 - `LSFGVK_PERFORMANCE_MODE`: If set to `1`, performance mode will be enabled.
 - `LSFGVK_PACING`: Pacing mode to use.

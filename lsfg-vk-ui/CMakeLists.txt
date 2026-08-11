@@ -1,4 +1,4 @@
-find_package(Qt6 REQUIRED COMPONENTS Quick)
+find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2)
 
 set(UI_SOURCES
     "src/backend.cpp"
@@ -37,7 +37,8 @@ target_compile_options(lsfg-vk-ui PRIVATE # QT-codegen warnings
 target_link_libraries(lsfg-vk-ui
     PRIVATE lsfg-vk-common
     PRIVATE lsfg-vk-backend
-    PRIVATE Qt6::Quick)
+    PRIVATE Qt6::Quick
+    PRIVATE Qt6::QuickControls2)
 
 install(TARGETS lsfg-vk-ui
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")

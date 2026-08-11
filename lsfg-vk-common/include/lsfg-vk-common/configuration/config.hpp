@@ -34,6 +34,9 @@ namespace ls {
 
     /// game profile configuration
     struct GameConf {
+        /// maximum Adaptive multiplier supported by the stable virtual topology
+        static constexpr size_t MAX_ADAPTIVE_MULTIPLIER = 5;
+
         /// name of the profile
         std::string name{"Profile"};
         /// optional activation string/array

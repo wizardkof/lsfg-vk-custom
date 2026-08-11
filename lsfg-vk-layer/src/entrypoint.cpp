@@ -1228,12 +1228,12 @@ namespace {
                                         instance_info->handles.front(),
                                         "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
                             try {
-                                constexpr uint32_t STABLE_ADAPTIVE_MAX_MULTIPLIER = 5;
                                 const uint32_t stableAdaptiveImageFloor =
                                     layer_info->root.fixedMode()
                                         ? 0U
                                         : applicationMinImageCount
-                                            + STABLE_ADAPTIVE_MAX_MULTIPLIER;
+                                            + static_cast<uint32_t>(
+                                                ls::GameConf::MAX_ADAPTIVE_MULTIPLIER);
                                 if (prepareDualPresentModeDeclaration(
                                         it->second, getCapabilities2, maintenanceIt->second,
                                         *newInfo, stableAdaptiveImageFloor,

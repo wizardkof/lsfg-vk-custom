@@ -29,6 +29,9 @@ namespace lsfgvk::ui {
         Q_PROPERTY(bool available READ isValidProfileIndex NOTIFY refreshUI)
         Q_PROPERTY(QStringListModel* active_in READ calculateActiveInModel NOTIFY refreshUI)
         Q_PROPERTY(int active_in_index READ getActiveInIndex WRITE activeInSelected NOTIFY refreshUI)
+        Q_PROPERTY(int frame_generation_mode READ getFrameGenerationMode WRITE frameGenerationModeUpdated NOTIFY refreshUI)
+        Q_PROPERTY(uint target_fps READ getTargetFPS WRITE targetFPSUpdated NOTIFY refreshUI)
+        Q_PROPERTY(int adaptive_multiplier_max READ getAdaptiveMultiplierMax CONSTANT)
         Q_PROPERTY(size_t multiplier READ getMultiplier WRITE multiplierUpdated NOTIFY refreshUI)
         Q_PROPERTY(float flow_scale READ getFlowScale WRITE flowScaleUpdated NOTIFY refreshUI)
         Q_PROPERTY(bool performance_mode READ getPerformanceMode WRITE performanceModeUpdated NOTIFY refreshUI)
@@ -70,6 +73,21 @@ namespace lsfgvk::ui {
             return static_cast<int>(this->m_active_in_index);
         }
 
+        [[nodiscard]] int getFrameGenerationMode() const {
+            VALIDATE_AND_GET_PROFILE(0)
+            switch (conf.frame_generation_mode) {
+                case ls::FrameGenerationMode::Adaptive: return 0;
+                case ls::FrameGenerationMode::Fixed: return 1;
+            }
+            throw std::runtime_error("Unknown frame generation mode in backend");
+        }
+        [[nodiscard]] unsigned int getTargetFPS() const {
+            VALIDATE_AND_GET_PROFILE(60U)
+            return conf.target_fps;
+        }
+        [[nodiscard]] int getAdaptiveMultiplierMax() const {
+            return static_cast<int>(ls::GameConf::MAX_ADAPTIVE_MULTIPLIER);
+        }
         [[nodiscard]] size_t getMultiplier() const {
             VALIDATE_AND_GET_PROFILE(2)
             return conf.multiplier;
@@ -133,6 +151,27 @@ namespace lsfgvk::ui {
     if (!isValidProfileIndex()) return; \
     auto& conf = this->m_profiles.at(static_cast<size_t>(this->m_profile_index));
 
+        void frameGenerationModeUpdated(int mode) {
+            VALIDATE_AND_GET_PROFILE()
+            switch (mode) {
+                case 0:
+                    conf.frame_generation_mode = ls::FrameGenerationMode::Adaptive;
+                    break;
+                case 1:
+                    conf.frame_generation_mode = ls::FrameGenerationMode::Fixed;
+                    if (conf.target_fps == 0)
+                        conf.target_fps = 60;
+                    break;
+                default:
+                    throw std::runtime_error("Unknown frame generation mode in backend");
+            }
+            MARK_DIRTY()
+        }
+        void targetFPSUpdated(unsigned int target_fps) {
+            VALIDATE_AND_GET_PROFILE()
+            conf.target_fps = target_fps == 0 ? 1U : target_fps;
+            MARK_DIRTY()
+        }
         void multiplierUpdated(size_t multiplier) {
             VALIDATE_AND_GET_PROFILE()
             conf.multiplier = multiplier;
