@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -46,6 +47,23 @@ namespace {
             current = current->pNext;
         }
         return false;
+    }
+
+    [[nodiscard]] VkFence applicationPresentFence(const void* nextChain) {
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(nextChain);
+        while (current) {
+            if (current->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR) {
+                const auto* info =
+                    reinterpret_cast<const VkSwapchainPresentFenceInfoKHR*>(current);
+                // Swapchain::present() handles one real WSI swapchain. Do not
+                // guess the mapping of a batched application's fence array.
+                if (info->swapchainCount == 1 && info->pFences)
+                    return info->pFences[0];
+                return VK_NULL_HANDLE;
+            }
+            current = current->pNext;
+        }
+        return VK_NULL_HANDLE;
     }
 
     [[nodiscard]] size_t generatedFrameCapacity(const ls::GameConf& profile) {
@@ -256,6 +274,39 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         return &dynamicPresentModeInfo;
     };
 
+    const auto compensateAbortedLogicalPresentFence =
+        [&](const char* stage) -> VkResult {
+            const auto fence = applicationPresentFence(next_chain);
+            if (fence == VK_NULL_HANDLE)
+                return VK_SUCCESS;
+
+            // The application-facing vkQueuePresentKHR is about to return
+            // OUT_OF_DATE before the logical present carrying this fence could
+            // reach WSI. Complete the consumed logical present fence after all
+            // earlier hidden queue work so the application can safely retire
+            // its present resources and recreate the swapchain.
+            const VkSubmitInfo submitInfo{
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO
+            };
+
+            VkResult signalResult{};
+            if (workerOffload) {
+                const std::scoped_lock queueLock(*queueMutex);
+                signalResult = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
+            } else {
+                signalResult = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
+            }
+
+            if (signalResult == VK_SUCCESS) {
+                std::cerr << "lsfg-vk: compensated aborted logical present fence after "
+                    << stage << " OUT_OF_DATE\n";
+            } else {
+                std::cerr << "lsfg-vk: failed to compensate aborted logical present fence after "
+                    << stage << " OUT_OF_DATE: " << signalResult << '\n';
+            }
+            return signalResult;
+        };
+
     // 3C5E: Adaptive 1x over the stable virtual topology. The runtime has
     // already consumed the application's present waits and supplies one ready
     // semaphore. No LSFG generation images or backend context exist here.
@@ -277,6 +328,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto res = acquireRealSwapchainImage(vk, swapchain,
             this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
             stopToken);
+        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+            const auto fenceResult =
+                compensateAbortedLogicalPresentFence("hidden Adaptive 1x acquire");
+            if (fenceResult != VK_SUCCESS)
+                throw ls::vulkan_error(fenceResult,
+                    "failed to compensate aborted logical present fence");
+        }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
@@ -529,6 +587,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto res = acquireRealSwapchainImage(vk, swapchain,
             pass.acquireSemaphore.handle(), &aqImageIdx,
             workerOffload ? stopToken : std::stop_token{});
+        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+            const auto fenceResult =
+                compensateAbortedLogicalPresentFence("hidden generated-frame acquire");
+            if (fenceResult != VK_SUCCESS)
+                throw ls::vulkan_error(fenceResult,
+                    "failed to compensate aborted logical present fence");
+        }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
@@ -616,6 +681,18 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         } else {
             res = vk.df().QueuePresentKHR(queue, &presentInfo);
         }
+        // In the virtual topology generated-frame presents never carry the
+        // application's pNext chain. If one goes OUT_OF_DATE, the later logical
+        // present will not run and its present fence would otherwise remain
+        // unsignaled. Legacy non-virtual generated presents may already have
+        // forwarded the application's pNext, so never compensate those here.
+        if (this->info.virtualized && res == VK_ERROR_OUT_OF_DATE_KHR) {
+            const auto fenceResult =
+                compensateAbortedLogicalPresentFence("hidden generated-frame present");
+            if (fenceResult != VK_SUCCESS)
+                throw ls::vulkan_error(fenceResult,
+                    "failed to compensate aborted logical present fence");
+        }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
         markFixedWorkerOutput();
@@ -655,6 +732,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     auto res = acquireRealSwapchainImage(vk, swapchain,
         this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
         workerOffload ? stopToken : std::stop_token{});
+    if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+        const auto fenceResult =
+            compensateAbortedLogicalPresentFence("hidden final acquire");
+        if (fenceResult != VK_SUCCESS)
+            throw ls::vulkan_error(fenceResult,
+                "failed to compensate aborted logical present fence");
+    }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
 
