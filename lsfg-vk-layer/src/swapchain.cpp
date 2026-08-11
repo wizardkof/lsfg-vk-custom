@@ -114,6 +114,15 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         fixedScheduler(profile.target_fps),
         fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
+    // A virtual Adaptive 1x swapchain still needs the final virtual->real copy
+    // resources even though it must not create an LSFG generation context.
+    if (this->info.virtualized) {
+        this->virtualFinalCommandBuffer.emplace(vk);
+        this->virtualFinalAcquireSemaphore.emplace(vk);
+        this->virtualFinalPresentSemaphore.emplace(vk);
+        this->renderFence.emplace(vk);
+    }
+
     // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
     // bypasses LSFG. Fixed mode ignores multiplier and remains active.
     if (isAdaptiveBypass(this->profile))
@@ -160,12 +169,8 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     }
 
     this->renderCommandBuffer.emplace(vk);
-    this->renderFence.emplace(vk);
-    if (this->info.virtualized) {
-        this->virtualFinalCommandBuffer.emplace(vk);
-        this->virtualFinalAcquireSemaphore.emplace(vk);
-        this->virtualFinalPresentSemaphore.emplace(vk);
-    }
+    if (!this->renderFence.has_value())
+        this->renderFence.emplace(vk);
     for (size_t i = 0; i < this->destinationImages.size(); i++) {
         this->passes.emplace_back(RenderPass {
             .commandBuffer = vk::CommandBuffer(vk),
@@ -189,9 +194,11 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         const std::vector<VkSemaphore>& semaphores,
         std::stop_token stopToken,
         std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
-    // Adaptive 1x = OFF: pass the original application frame straight through.
-    // Fixed mode intentionally ignores multiplier.
-    if (isAdaptiveBypass(this->profile)) {
+    const bool adaptiveBypass = isAdaptiveBypass(this->profile);
+
+    // Legacy Adaptive 1x = OFF: when the application still owns real WSI
+    // images, preserve the original direct-present path exactly.
+    if (adaptiveBypass && !this->info.virtualized) {
         const VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .pNext = next_chain,
@@ -208,10 +215,134 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     const auto& outputImages = this->info.virtualized
         ? this->info.realImages
         : this->info.images;
-    const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
 
     const bool fixedMode = isFixedMode(this->profile);
-    const bool workerOffload = this->info.virtualized && fixedMode && queueMutex;
+    // Every virtual topology presents from the prepared offload queue. Fixed
+    // pacing itself remains separately gated by fixedMode.
+    const bool workerOffload = this->info.virtualized && queueMutex;
+
+    // 3C5E: Adaptive 1x over the stable virtual topology. The runtime has
+    // already consumed the application's present waits and supplies one ready
+    // semaphore. No LSFG generation images or backend context exist here.
+    if (adaptiveBypass) {
+        if (semaphores.size() != 1 || !queueMutex
+                || !this->virtualFinalCommandBuffer.has_value()
+                || !this->virtualFinalAcquireSemaphore.has_value()
+                || !this->virtualFinalPresentSemaphore.has_value()
+                || !this->renderFence.has_value()) {
+            throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
+                "virtual Adaptive 1x bridge is not initialized");
+        }
+
+        // Adaptive virtual presentation uses the FIFO mode with which this
+        // topology was created. Preserve the existing pacing=None behavior by
+        // rewriting any per-present mode request to FIFO before passing the
+        // application's pNext chain to the real WSI present.
+        if (this->profile.pacing == ls::Pacing::None) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+            auto* modeInfo = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(next_chain);
+            while (modeInfo) {
+                if (modeInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) {
+                    for (size_t i = 0; i < modeInfo->swapchainCount; ++i)
+                        const_cast<VkPresentModeKHR*>(modeInfo->pPresentModes)[i] =
+                            VK_PRESENT_MODE_FIFO_KHR;
+                }
+                modeInfo = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(
+                    const_cast<void*>(modeInfo->pNext));
+            }
+#pragma clang diagnostic pop
+        }
+
+        if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
+            throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+        this->renderFence->reset(vk);
+
+        uint32_t realImageIdx{};
+        auto res = acquireRealSwapchainImage(vk, swapchain,
+            this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
+            stopToken);
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
+
+        const auto& realImage = outputImages.at(realImageIdx);
+        const auto& finalCmdbuf = *this->virtualFinalCommandBuffer;
+        finalCmdbuf.begin(vk);
+        finalCmdbuf.blitImage(vk,
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_NONE,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                ),
+                barrierHelper(realImage,
+                    VK_ACCESS_NONE,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                ),
+            },
+            { swapchainImage, realImage },
+            this->info.extent,
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                ),
+                barrierHelper(realImage,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                ),
+            }
+        );
+        finalCmdbuf.end(vk);
+
+        {
+            const std::scoped_lock queueLock(*queueMutex);
+            finalCmdbuf.submit(vk, queue,
+                {
+                    semaphores.front(),
+                    this->virtualFinalAcquireSemaphore->handle()
+                },
+                VK_NULL_HANDLE, 0,
+                { this->virtualFinalPresentSemaphore->handle() },
+                VK_NULL_HANDLE, 0,
+                this->renderFence->handle()
+            );
+
+            const VkPresentInfoKHR presentInfo{
+                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                .pNext = next_chain,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
+                .swapchainCount = 1,
+                .pSwapchains = &swapchain,
+                .pImageIndices = &realImageIdx,
+            };
+            res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        }
+
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+
+        constexpr uint64_t WORKER_FENCE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
+        while (!this->renderFence->wait(vk, WORKER_FENCE_SLICE_NS)) {
+            if (stopToken.stop_requested())
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_DATE_KHR,
+                    "virtual Adaptive 1x presentation worker stopped");
+        }
+
+        this->fidx++;
+        return res;
+    }
+
+    const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
     FixedFrameScheduler::Plan fixedPlan{};
     if (fixedMode) {
         const auto now = sourcePresentTime.value_or(std::chrono::steady_clock::now());
@@ -237,7 +368,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     // generated output. Use a cancellable host-side target cadence; the WSI
     // present mode is intentionally left unchanged by this pacing step.
     const auto paceFixedWorkerOutput = [&]() {
-        if (!workerOffload)
+        if (!workerOffload || !fixedMode)
             return;
 
         constexpr auto MAX_SLEEP_SLICE = std::chrono::milliseconds(2);
@@ -259,7 +390,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     };
 
     const auto markFixedWorkerOutput = [&]() {
-        if (workerOffload)
+        if (workerOffload && fixedMode)
             this->fixedOutputPacer.markPresented(
                 std::chrono::steady_clock::now());
     };
@@ -500,7 +631,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
 
     // Virtual swapchain path: the application's image cannot be passed to WSI.
-    // The Fixed worker acquires a real image, copies the logical source frame
+    // The virtual presentation worker acquires a real image, copies the logical source frame
     // into it and presents on the dedicated queue. The virtual image is not
     // recycled until the GPU has finished reading it.
     uint32_t realImageIdx{};

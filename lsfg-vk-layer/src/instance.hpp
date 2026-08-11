@@ -39,6 +39,14 @@ namespace lsfgvk::layer {
                 && this->active_profile->frame_generation_mode == ls::FrameGenerationMode::Fixed;
         }
 
+        /// check if the active profile is the Adaptive 1x bypass
+        /// @return true when Adaptive multiplier=1 is active
+        [[nodiscard]] bool adaptiveBypass() const {
+            return this->active_profile.has_value()
+                && this->active_profile->frame_generation_mode != ls::FrameGenerationMode::Fixed
+                && this->active_profile->multiplier == 1;
+        }
+
         /// ensure the layer is up-to-date
         /// @return true if the configuration was updated
         bool update();

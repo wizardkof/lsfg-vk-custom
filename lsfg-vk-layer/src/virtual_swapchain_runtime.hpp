@@ -51,7 +51,7 @@ namespace lsfgvk::layer {
         [[nodiscard]] VkResult acquire(uint64_t timeout,
             VkSemaphore semaphore, VkFence fence, uint32_t* imageIndex) noexcept;
 
-        /// Start the single consumer that owns Fixed-mode presentation work.
+        /// Start the single consumer that owns virtual presentation work.
         void startWorker(Presenter presenter);
 
         /// Consume the application's present wait semaphores on the source

@@ -605,6 +605,7 @@ namespace {
             PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR getCapabilities2,
             SwapchainMaintenanceFamily family,
             VkSwapchainCreateInfoKHR& info,
+            uint32_t minimumImageCountFloor,
             std::vector<VkPresentModeKHR>& modeStorage,
             VkSwapchainPresentModesCreateInfoKHR& createInfoStorage) {
         if (family == SwapchainMaintenanceFamily::None
@@ -642,7 +643,7 @@ namespace {
                 continue;
 
             const uint32_t commonMin = std::max(
-                info.minImageCount,
+                std::max(info.minImageCount, minimumImageCountFloor),
                 std::max(initialCaps->minImageCount, alternativeCaps->minImageCount));
             const uint32_t commonMax = commonMaximumImageCount(
                 initialCaps->maxImageCount, alternativeCaps->maxImageCount);
@@ -1168,7 +1169,7 @@ namespace {
                     if (idle != VK_SUCCESS)
                         throw ls::vulkan_error(idle,
                             "vkDeviceWaitIdle() failed while retiring old swapchain");
-                    std::cerr << "lsfg-vk: retired old Fixed presentation worker before swapchain recreation\n";
+                    std::cerr << "lsfg-vk: retired old virtual presentation worker before swapchain recreation\n";
                 }
             }
 
@@ -1177,7 +1178,9 @@ namespace {
             // create underlying real swapchain
             VkSwapchainCreateInfoKHR newInfo = *info;
             const VkPresentModeKHR applicationPresentMode = newInfo.presentMode;
+            const uint32_t applicationMinImageCount = newInfo.minImageCount;
             bool fixedAsyncPresentModeEligible{};
+            bool dualPresentModeDeclared{};
             std::vector<VkPresentModeKHR> dualPresentModes;
             VkSwapchainPresentModesCreateInfoKHR dualPresentModesInfo{
                 .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR
@@ -1225,9 +1228,18 @@ namespace {
                                         instance_info->handles.front(),
                                         "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
                             try {
-                                if (!prepareDualPresentModeDeclaration(
+                                constexpr uint32_t STABLE_ADAPTIVE_MAX_MULTIPLIER = 5;
+                                const uint32_t stableAdaptiveImageFloor =
+                                    layer_info->root.fixedMode()
+                                        ? 0U
+                                        : applicationMinImageCount
+                                            + STABLE_ADAPTIVE_MAX_MULTIPLIER;
+                                if (prepareDualPresentModeDeclaration(
                                         it->second, getCapabilities2, maintenanceIt->second,
-                                        *newInfo, dualPresentModes, dualPresentModesInfo)) {
+                                        *newInfo, stableAdaptiveImageFloor,
+                                        dualPresentModes, dualPresentModesInfo)) {
+                                    dualPresentModeDeclared = true;
+                                } else {
                                     std::cerr << "lsfg-vk: compatible dual present modes unavailable; "
                                         "keeping legacy WSI swapchain\n";
                                 }
@@ -1260,35 +1272,49 @@ namespace {
             std::unique_ptr<VirtualSwapchainRuntime> virtualRuntime;
             std::vector<VkImage> applicationImages = realImages;
             bool virtualized{};
+            bool adaptiveVirtualized{};
 
-            if (layer_info->root.fixedMode()) {
-                const auto queueIt = instance_info->offloadQueues.find(device);
-                const auto spec = makeVirtualSwapchainImageSpec(newInfo);
+            const bool fixedMode = layer_info->root.fixedMode();
+            const bool adaptiveMode = !fixedMode;
+            const auto queueIt = instance_info->offloadQueues.find(device);
+            const auto spec = makeVirtualSwapchainImageSpec(newInfo);
+            const bool queueAvailable =
+                queueIt != instance_info->offloadQueues.end();
+            const bool queuePresentSupported = queueAvailable
+                && offloadQueueSupportsSurface(
+                    it->second, queueIt->second, newInfo.surface);
+            const bool topologyEligible = fixedMode
+                ? fixedAsyncPresentModeEligible
+                : dualPresentModeDeclared;
 
-                if (fixedAsyncPresentModeEligible
-                        && queueIt != instance_info->offloadQueues.end()
-                        && spec.supported()) {
-                    try {
-                        virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
-                            it->second,
-                            queueIt->second.queue,
-                            queueIt->second.mutex,
-                            realImages.size(),
-                            spec);
-                        applicationImages = virtualRuntime->imageHandles();
-                        virtualized = true;
-                    } catch (const std::exception& e) {
-                        std::cerr << "lsfg-vk: virtual swapchain setup failed after "
-                            "Fixed WSI mode selection; falling back to synchronous 3B path:\n";
-                        std::cerr << "- " << e.what() << '\n';
-                    }
-                } else if (!spec.supported()) {
-                    std::cerr << "lsfg-vk: swapchain flags are not supported by the "
-                        "virtual bridge; falling back to synchronous 3B path\n";
-                } else if (!fixedAsyncPresentModeEligible) {
-                    std::cerr << "lsfg-vk: asynchronous Fixed WSI prerequisites unavailable; "
-                        "keeping FIFO synchronous 3B path\n";
+            if (topologyEligible
+                    && queueAvailable
+                    && queuePresentSupported
+                    && spec.supported()) {
+                try {
+                    virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
+                        it->second,
+                        queueIt->second.queue,
+                        queueIt->second.mutex,
+                        realImages.size(),
+                        spec);
+                    applicationImages = virtualRuntime->imageHandles();
+                    virtualized = true;
+                    adaptiveVirtualized = adaptiveMode;
+                } catch (const std::exception& e) {
+                    std::cerr << "lsfg-vk: virtual swapchain setup failed; "
+                        "keeping the legacy presentation path:\n";
+                    std::cerr << "- " << e.what() << '\n';
                 }
+            } else if (!spec.supported()) {
+                std::cerr << "lsfg-vk: swapchain flags are not supported by the "
+                    "virtual bridge; keeping the legacy presentation path\n";
+            } else if (adaptiveMode) {
+                std::cerr << "lsfg-vk: Adaptive virtual topology prerequisites "
+                    "unavailable; keeping the legacy Adaptive path\n";
+            } else if (!fixedAsyncPresentModeEligible) {
+                std::cerr << "lsfg-vk: asynchronous Fixed WSI prerequisites unavailable; "
+                    "keeping FIFO synchronous 3B path\n";
             }
 
             auto [infoIt, inserted] = instance_info->swapchainInfos.emplace(
@@ -1300,7 +1326,8 @@ namespace {
                     .colorSpace = newInfo.imageColorSpace,
                     .extent = newInfo.imageExtent,
                     .presentMode = newInfo.presentMode,
-                    .virtualized = virtualized
+                    .virtualized = virtualized,
+                    .adaptiveVirtualized = adaptiveVirtualized
                 });
             if (!inserted)
                 throw ls::error("swapchain info already exists");
@@ -1340,17 +1367,22 @@ namespace {
                                     sourcePresentTime);
                             } catch (const ls::vulkan_error& e) {
                                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
-                                    std::cerr << "lsfg-vk: asynchronous fixed presentation failed:\n";
+                                    std::cerr << "lsfg-vk: asynchronous virtual presentation failed:\n";
                                     std::cerr << "- " << e.what() << '\n';
                                 }
                                 return e.error();
                             } catch (const std::exception& e) {
-                                std::cerr << "lsfg-vk: asynchronous fixed presentation failed:\n";
+                                std::cerr << "lsfg-vk: asynchronous virtual presentation failed:\n";
                                 std::cerr << "- " << e.what() << '\n';
                                 return VK_ERROR_UNKNOWN;
                             }
                         });
-                    std::cerr << "lsfg-vk: asynchronous Fixed presentation worker enabled\n";
+                    if (swapchainInfo.adaptiveVirtualized) {
+                        std::cerr << "lsfg-vk: Adaptive virtual presentation worker enabled "
+                            "(FIFO; 1x bypass or 2x-5x frame generation)\n";
+                    } else {
+                        std::cerr << "lsfg-vk: asynchronous Fixed presentation worker enabled\n";
+                    }
                 }
             } catch (...) {
                 layer_info->root.removeSwapchainContext(*swapchain);
@@ -1452,18 +1484,33 @@ namespace {
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
                     auto& swapchainInfo = instance_info->swapchainInfos.at(swapchain);
 
-                    // A virtual swapchain's VkImage handles were already returned
-                    // to the application. Fixed -> Adaptive therefore requires a
-                    // real swapchain recreation instead of destroying/replacing
-                    // those images during hot reload.
-                    if (swapchainInfo.virtualized && !layer_info->root.fixedMode()) {
-                        std::cerr << "lsfg-vk: frame_generation_mode change from Fixed "
-                            "requires swapchain recreation; keeping current Fixed context\n";
-                        continue;
+                    // Virtual VkImage handles were already returned to the
+                    // application. Adaptive 1x-5x now share the same virtual
+                    // topology, so multiplier-only reloads can replace just the
+                    // Root-owned Swapchain context. Adaptive <-> Fixed still
+                    // requires dynamic present-mode selection and remains gated.
+                    if (swapchainInfo.virtualized) {
+                        if (swapchainInfo.adaptiveVirtualized) {
+                            if (layer_info->root.fixedMode()) {
+                                std::cerr << "lsfg-vk: frame_generation_mode change from Adaptive "
+                                    "requires dynamic present-mode switching; "
+                                    "keeping current Adaptive context\n";
+                                continue;
+                            }
+                        } else if (!layer_info->root.fixedMode()) {
+                            std::cerr << "lsfg-vk: frame_generation_mode change from Fixed "
+                                "requires dynamic present-mode switching; "
+                                "keeping current Fixed context\n";
+                            continue;
+                        }
                     }
 
                     layer_info->root.recreateSwapchainContext(
                         vk, swapchain, swapchainInfo);
+                    if (swapchainInfo.virtualized
+                            && swapchainInfo.adaptiveVirtualized) {
+                        std::cerr << "lsfg-vk: Adaptive virtual context hot-reloaded\n";
+                    }
                 }
 
                 std::cerr << "lsfg-vk: updated lsfg-vk configuration\n";
@@ -1473,8 +1520,8 @@ namespace {
             }
         }
 
-        // Present each swapchain. A single virtual Fixed swapchain with no
-        // pNext chain is the fast asynchronous path. pNext-bearing or batched
+        // Present each swapchain. A single virtual swapchain with no pNext
+        // chain is the fast asynchronous path. pNext-bearing or batched
         // presents remain synchronous through the worker so caller-owned data
         // stays alive and legacy multi-swapchain behavior is preserved.
         bool allVirtual = info->swapchainCount > 0;

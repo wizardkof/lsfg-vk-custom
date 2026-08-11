@@ -39,6 +39,10 @@ namespace lsfgvk::layer {
         VkExtent2D extent;
         VkPresentModeKHR presentMode;
         bool virtualized{};
+        // True when this persistent virtual topology was created for Adaptive
+        // mode. Adaptive 1x-5x may hot-reload by replacing only the internal
+        // Swapchain context; Adaptive <-> Fixed switching remains a later stage.
+        bool adaptiveVirtualized{};
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
