@@ -1272,10 +1272,25 @@ namespace {
             std::unique_ptr<VirtualSwapchainRuntime> virtualRuntime;
             std::vector<VkImage> applicationImages = realImages;
             bool virtualized{};
-            bool adaptiveVirtualized{};
+            bool dynamicPresentModeEligible{};
 
             const bool fixedMode = layer_info->root.fixedMode();
             const bool adaptiveMode = !fixedMode;
+
+            VkPresentModeKHR adaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
+            VkPresentModeKHR fixedPresentMode = newInfo.presentMode;
+            if (dualPresentModeDeclared
+                    && containsPresentMode(dualPresentModes, VK_PRESENT_MODE_FIFO_KHR)) {
+                if (containsPresentMode(dualPresentModes, VK_PRESENT_MODE_MAILBOX_KHR)) {
+                    fixedPresentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                    dynamicPresentModeEligible = true;
+                } else if (containsPresentMode(
+                        dualPresentModes, VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+                    fixedPresentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+                    dynamicPresentModeEligible = true;
+                }
+            }
+
             const auto queueIt = instance_info->offloadQueues.find(device);
             const auto spec = makeVirtualSwapchainImageSpec(newInfo);
             const bool queueAvailable =
@@ -1300,7 +1315,7 @@ namespace {
                         spec);
                     applicationImages = virtualRuntime->imageHandles();
                     virtualized = true;
-                    adaptiveVirtualized = adaptiveMode;
+                    // The same runtime is valid for Adaptive and Fixed.
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk: virtual swapchain setup failed; "
                         "keeping the legacy presentation path:\n";
@@ -1326,8 +1341,12 @@ namespace {
                     .colorSpace = newInfo.imageColorSpace,
                     .extent = newInfo.imageExtent,
                     .presentMode = newInfo.presentMode,
+                    .adaptivePresentMode = adaptivePresentMode,
+                    .fixedPresentMode = fixedPresentMode,
                     .virtualized = virtualized,
-                    .adaptiveVirtualized = adaptiveVirtualized
+                    .dynamicPresentModeEligible =
+                        virtualized && dynamicPresentModeEligible,
+                    .fixedContext = fixedMode
                 });
             if (!inserted)
                 throw ls::error("swapchain info already exists");
@@ -1377,11 +1396,16 @@ namespace {
                                 return VK_ERROR_UNKNOWN;
                             }
                         });
-                    if (swapchainInfo.adaptiveVirtualized) {
+                    if (swapchainInfo.dynamicPresentModeEligible) {
+                        std::cerr << "lsfg-vk: dual-mode virtual presentation worker enabled "
+                            "(Adaptive=FIFO, Fixed="
+                            << fixedPresentModeName(swapchainInfo.fixedPresentMode)
+                            << ", initial=" << (fixedMode ? "Fixed" : "Adaptive") << ")\n";
+                    } else if (fixedMode) {
+                        std::cerr << "lsfg-vk: asynchronous Fixed presentation worker enabled\n";
+                    } else {
                         std::cerr << "lsfg-vk: Adaptive virtual presentation worker enabled "
                             "(FIFO; 1x bypass or 2x-5x frame generation)\n";
-                    } else {
-                        std::cerr << "lsfg-vk: asynchronous Fixed presentation worker enabled\n";
                     }
                 }
             } catch (...) {
@@ -1484,33 +1508,49 @@ namespace {
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
                     auto& swapchainInfo = instance_info->swapchainInfos.at(swapchain);
 
-                    // Virtual VkImage handles were already returned to the
-                    // application. Adaptive 1x-5x now share the same virtual
-                    // topology, so multiplier-only reloads can replace just the
-                    // Root-owned Swapchain context. Adaptive <-> Fixed still
-                    // requires dynamic present-mode selection and remains gated.
-                    if (swapchainInfo.virtualized) {
-                        if (swapchainInfo.adaptiveVirtualized) {
-                            if (layer_info->root.fixedMode()) {
-                                std::cerr << "lsfg-vk: frame_generation_mode change from Adaptive "
-                                    "requires dynamic present-mode switching; "
-                                    "keeping current Adaptive context\n";
-                                continue;
-                            }
-                        } else if (!layer_info->root.fixedMode()) {
-                            std::cerr << "lsfg-vk: frame_generation_mode change from Fixed "
-                                "requires dynamic present-mode switching; "
-                                "keeping current Fixed context\n";
-                            continue;
-                        }
+                    // Virtual VkImage handles are stable for the life of the
+                    // application's swapchain. If LSFG declared compatible
+                    // FIFO + MAILBOX/IMMEDIATE modes at creation, a mode reload
+                    // can select the new WSI mode per present and replace only
+                    // the Root-owned Swapchain context.
+                    const bool requestedFixed = layer_info->root.fixedMode();
+                    const bool modeChanged =
+                        swapchainInfo.fixedContext != requestedFixed;
+
+                    if (swapchainInfo.virtualized && modeChanged
+                            && !swapchainInfo.dynamicPresentModeEligible) {
+                        std::cerr << "lsfg-vk: frame_generation_mode change requires "
+                            "a dual-mode virtual swapchain; keeping current "
+                            << (swapchainInfo.fixedContext ? "Fixed" : "Adaptive")
+                            << " context\n";
+                        continue;
+                    }
+
+                    if (swapchainInfo.dynamicPresentModeEligible) {
+                        swapchainInfo.presentMode = requestedFixed
+                            ? swapchainInfo.fixedPresentMode
+                            : swapchainInfo.adaptivePresentMode;
                     }
 
                     layer_info->root.recreateSwapchainContext(
                         vk, swapchain, swapchainInfo);
-                    if (swapchainInfo.virtualized
-                            && swapchainInfo.adaptiveVirtualized) {
-                        std::cerr << "lsfg-vk: Adaptive virtual context hot-reloaded\n";
+
+                    if (swapchainInfo.virtualized) {
+                        if (modeChanged && swapchainInfo.dynamicPresentModeEligible) {
+                            std::cerr << "lsfg-vk: dual-mode hot switch "
+                                << (swapchainInfo.fixedContext ? "Fixed" : "Adaptive")
+                                << " -> " << (requestedFixed ? "Fixed" : "Adaptive")
+                                << " present="
+                                << fixedPresentModeName(swapchainInfo.presentMode)
+                                << "\n";
+                        } else if (!requestedFixed) {
+                            std::cerr << "lsfg-vk: Adaptive virtual context hot-reloaded\n";
+                        } else {
+                            std::cerr << "lsfg-vk: Fixed virtual context hot-reloaded\n";
+                        }
                     }
+
+                    swapchainInfo.fixedContext = requestedFixed;
                 }
 
                 std::cerr << "lsfg-vk: updated lsfg-vk configuration\n";

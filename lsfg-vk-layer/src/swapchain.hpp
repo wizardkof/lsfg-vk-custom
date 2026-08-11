@@ -37,12 +37,20 @@ namespace lsfgvk::layer {
         VkFormat format;
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
+        // Present mode currently selected by the internal context.
         VkPresentModeKHR presentMode;
+        // Stable modes declared for the hidden real WSI swapchain. These are
+        // used only when dynamicPresentModeEligible is true.
+        VkPresentModeKHR adaptivePresentMode{VK_PRESENT_MODE_FIFO_KHR};
+        VkPresentModeKHR fixedPresentMode{VK_PRESENT_MODE_FIFO_KHR};
         bool virtualized{};
-        // True when this persistent virtual topology was created for Adaptive
-        // mode. Adaptive 1x-5x may hot-reload by replacing only the internal
-        // Swapchain context; Adaptive <-> Fixed switching remains a later stage.
-        bool adaptiveVirtualized{};
+        // True when LSFG injected a compatible FIFO + MAILBOX/IMMEDIATE
+        // declaration and can select between them per present without
+        // recreating the application-visible virtual topology.
+        bool dynamicPresentModeEligible{};
+        // Tracks the mode of the Root-owned Swapchain context. The virtual
+        // VkImage handles and VirtualSwapchainRuntime remain stable.
+        bool fixedContext{};
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation

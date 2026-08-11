@@ -38,6 +38,16 @@ namespace {
         return !isFixedMode(profile) && profile.multiplier == 1;
     }
 
+    [[nodiscard]] bool hasPresentModeInfo(const void* nextChain) {
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(nextChain);
+        while (current) {
+            if (current->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR)
+                return true;
+            current = current->pNext;
+        }
+        return false;
+    }
+
     [[nodiscard]] size_t generatedFrameCapacity(const ls::GameConf& profile) {
         if (isFixedMode(profile))
             return FixedFrameScheduler::DEFAULT_MAX_GENERATED_FRAMES;
@@ -221,6 +231,31 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     // pacing itself remains separately gated by fixedMode.
     const bool workerOffload = this->info.virtualized && queueMutex;
 
+    // Stage 3C5G: select the hidden real WSI present mode per presentation.
+    // These modes were declared at swapchain creation, so hot reload changes
+    // only the internal context and never the VkImages known to the app.
+    const VkPresentModeKHR selectedPresentMode = fixedMode
+        ? this->info.fixedPresentMode
+        : this->info.adaptivePresentMode;
+    VkSwapchainPresentModeInfoKHR dynamicPresentModeInfo{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR,
+        .swapchainCount = 1,
+        .pPresentModes = &selectedPresentMode
+    };
+    const auto presentNextChain = [&](void* logicalNext) -> const void* {
+        if (!this->info.dynamicPresentModeEligible)
+            return logicalNext;
+
+        // Avoid duplicating the structure when the application already owns
+        // one. Existing pacing=None behavior below rewrites that structure to
+        // the mode selected by the current LSFG context.
+        if (hasPresentModeInfo(logicalNext))
+            return logicalNext;
+
+        dynamicPresentModeInfo.pNext = logicalNext;
+        return &dynamicPresentModeInfo;
+    };
+
     // 3C5E: Adaptive 1x over the stable virtual topology. The runtime has
     // already consumed the application's present waits and supplies one ready
     // semaphore. No LSFG generation images or backend context exist here.
@@ -232,27 +267,6 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 || !this->renderFence.has_value()) {
             throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
                 "virtual Adaptive 1x bridge is not initialized");
-        }
-
-        // Adaptive virtual presentation uses the FIFO mode with which this
-        // topology was created. Preserve the existing pacing=None behavior by
-        // rewriting any per-present mode request to FIFO before passing the
-        // application's pNext chain to the real WSI present.
-        if (this->profile.pacing == ls::Pacing::None) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunknown-warning-option"
-#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
-            auto* modeInfo = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(next_chain);
-            while (modeInfo) {
-                if (modeInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) {
-                    for (size_t i = 0; i < modeInfo->swapchainCount; ++i)
-                        const_cast<VkPresentModeKHR*>(modeInfo->pPresentModes)[i] =
-                            VK_PRESENT_MODE_FIFO_KHR;
-                }
-                modeInfo = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(
-                    const_cast<void*>(modeInfo->pNext));
-            }
-#pragma clang diagnostic pop
         }
 
         if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
@@ -318,7 +332,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                .pNext = next_chain,
+                .pNext = presentNextChain(next_chain),
                 .waitSemaphoreCount = 1,
                 .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
                 .swapchainCount = 1,
@@ -407,22 +421,23 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         throw ls::error("failed to schedule frames", e);
     }
 
-    // update present mode when not using pacing
+    // Preserve existing behavior for an application-provided per-present mode
+    // structure. LSFG's own single-swapchain structure is injected separately
+    // by presentNextChain() when the dual-mode topology is active.
     if (this->profile.pacing == ls::Pacing::None) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-warning-option"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
-        auto* info = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(next_chain);
+        auto* info = reinterpret_cast<VkSwapchainPresentModeInfoKHR*>(next_chain);
         while (info) {
-            if (info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) {
+            if (info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR) {
                 for (size_t i = 0; i < info->swapchainCount; i++)
                     const_cast<VkPresentModeKHR*>(info->pPresentModes)[i] =
-                        (workerOffload && fixedMode)
-                            ? this->info.presentMode
-                            : VK_PRESENT_MODE_FIFO_KHR;
+                        selectedPresentMode;
             }
 
-            info = reinterpret_cast<VkSwapchainPresentModeInfoEXT*>(const_cast<void*>(info->pNext));
+            info = reinterpret_cast<VkSwapchainPresentModeInfoKHR*>(
+                const_cast<void*>(info->pNext));
         }
 #pragma clang diagnostic pop
     }
@@ -585,7 +600,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         // metadata belongs to the final real application frame.
         const VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = (!this->info.virtualized && !i) ? next_chain : nullptr,
+            .pNext = this->info.virtualized
+                ? presentNextChain(nullptr)
+                : ((!i) ? next_chain : nullptr),
             .waitSemaphoreCount = 1,
             .pWaitSemaphores = &pcs.first.handle(),
             .swapchainCount = 1,
@@ -705,7 +722,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = next_chain,
+        .pNext = presentNextChain(next_chain),
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
         .swapchainCount = 1,
