@@ -2,7 +2,7 @@ name: (CI) lsfg-vk
 
 on:
   push:
-    branches: ["release", "develop", "fixed-target-ptbr"]
+    branches: ["release", "develop", "fixed-target"]
   pull_request:
     branches: ["release", "develop"]
 
