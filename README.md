@@ -54,6 +54,29 @@ You can validate the configuration using `lsfg-vk-cli`:
 ~/.local/bin/lsfg-vk-cli validate
 ```
 
+### Frame Generation Modes
+
+Adaptive mode uses `multiplier` to select frame generation from 2x through 5x.
+Adaptive 1x keeps the profile and layer active but bypasses frame generation:
+
+```toml
+frame_generation_mode = "adaptive"
+multiplier = 1
+```
+
+Fixed mode instead targets an explicit output cadence. It ignores `multiplier`,
+so `multiplier = 1` does not bypass Fixed mode:
+
+```toml
+frame_generation_mode = "fixed"
+target_fps = 60
+multiplier = 1
+```
+
+`target_fps` controls Fixed output cadence; it does not directly cap the
+application's source FPS. See [Configuration](docs/Configuration.md) for the
+complete semantics and hot-reload limitations.
+
 ### Benchmarking Mode
 You can run a frame generation benchmark using `lsfg-vk-cli`:
 ```bash

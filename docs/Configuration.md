@@ -17,8 +17,8 @@ Next is a list of all available **profile** configuration options:
 - **Profile Name / `name`**: The name of the profile, displayed in **lsfg-vk-ui**. Additionally, this is used when selecting a profile through the `LSFGVK_PROFILE` environment variable.
 - **Active In / `active_in`**: A list of 1) linux binary names, such as `mpv`, 2) windows executables, such as `GenshinImpact.exe` and 3) process names, such as `GameThread`. It is also possible to specify the last part of a path (e.g. `Ghostrunner2/Binaries/Win64/Ghostrunner2-Win64-Shipping.exe`). When a process matching one of these rules is detected, this profile will be activated.
 - **Frame Generation Mode / `frame_generation_mode`**: Selects how output frames are scheduled. `adaptive` preserves the normal multiplier-driven behavior. `fixed` targets an explicit output frame rate using `target_fps`. (Default: `adaptive`)
-- **Target FPS / `target_fps`**: Output FPS target used by Fixed mode. It must be greater than `0` when `frame_generation_mode = "fixed"`. The value is ignored by Adaptive mode.
-- **Multiplier / `multiplier`**: The Adaptive frame generation multiplier. Supported Adaptive values in this fork are `1` through `5`. A value of `1` keeps the layer/profile active but bypasses frame generation; a value of `3` generates 2 additional frames for every application frame. Fixed mode ignores the multiplier. (Default: `2`)
+- **Target FPS / `target_fps`**: Output cadence target used by Fixed mode. It must be greater than `0` when `frame_generation_mode = "fixed"`. It does not directly cap the application's source FPS and is ignored by Adaptive mode.
+- **Multiplier / `multiplier`**: The Adaptive frame generation multiplier. Supported Adaptive values in this fork are `1` through `5`. In Adaptive, a value of `1` keeps the layer/profile active but bypasses frame generation, while a value of `3` generates 2 additional frames for every application frame. Fixed mode ignores the multiplier; in particular, `multiplier = 1` does not bypass Fixed. (Default: `2`)
 - **Flow Scale / `flow_scale`**: The resolution scale at which the motion vectors are calculated. A lower value means better performance, but worse quality. (Default: `1.0`)
 - **Performance Mode / `performance_mode`**: When enabled, a significantly lighter frame generation model is used. This has a minor quality impact, but greatly improves performance. 
 (Default: `false`)
@@ -40,7 +40,8 @@ multiplier = 1
 target_fps = 0
 ```
 
-Fixed mode ignores `multiplier` and targets an explicit output rate:
+Fixed mode ignores `multiplier` and targets an explicit output cadence. The
+example remains active Fixed frame generation even with `multiplier = 1`:
 
 > [!IMPORTANT]
 > In the asynchronous virtual path, Fixed mode controls the output cadence and

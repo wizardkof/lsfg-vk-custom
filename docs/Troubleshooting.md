@@ -18,11 +18,11 @@ If lsfg-vk does not seem to be doing *anything*:
 - If there are no errors/warnings and you have gone through all above steps, then move onto the next section.
 
 If lsfg-vk is loaded, but frame generation is not working:
-- (When using `pacing_mode = none`): Disable VRR.
-- (When using `pacing_mode = none`): Explicitly enable V-Sync in your game settings.
-- (When using `pacing_mode = none` on Gamescope/SteamDeck): Set `ENABLE_GAMESCOPE_WSI=0`.
-- (When using `pacing_mode = none` on Wayland): Disable tearing control & direct passthrough in your compositor
-- (When using `pacing_mode = none` on Wayland): Try running in windowed mode.
+- (When using `pacing = "none"`): Disable VRR.
+- (When using `pacing = "none"`): Explicitly enable V-Sync in your game settings.
+- (When using `pacing = "none"` on Gamescope/SteamDeck): Set `ENABLE_GAMESCOPE_WSI=0`.
+- (When using `pacing = "none"` on Wayland): Disable tearing control & direct passthrough in your compositor
+- (When using `pacing = "none"` on Wayland): Try running in windowed mode.
 - Disable in-game upscaling options (e.g. DLSS, FSR, etc).
 - Disable other Vulkan layers (e.g. VkBasalt, MangoHud)
 

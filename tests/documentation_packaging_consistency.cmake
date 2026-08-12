@@ -18,6 +18,20 @@ endfunction()
 
 assert_contains("README.md" "lsfg-vk-2.0.0-linux.tar.xz")
 assert_not_contains("README.md" "lsfg-vk-2.0.0-x86_64.tar.xz")
+assert_contains("README.md" "frame_generation_mode = \"adaptive\"")
+assert_contains("README.md" "frame_generation_mode = \"fixed\"")
+assert_contains("README.md" "target_fps = 60")
+assert_contains("README.md" "does not directly cap the")
+
+assert_contains(
+    "docs/Configuration.md"
+    [=[`multiplier = 1` does not bypass Fixed]=])
+assert_contains(
+    "docs/Configuration.md"
+    "It does not directly cap the application's source FPS")
+
+assert_contains("docs/Troubleshooting.md" [=[`pacing = "none"`]=])
+assert_not_contains("docs/Troubleshooting.md" "pacing_mode")
 
 assert_contains(
     ".github/workflows/flatpak.yml"
