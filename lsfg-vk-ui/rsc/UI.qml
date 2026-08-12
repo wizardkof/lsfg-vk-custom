@@ -7,13 +7,12 @@ import "panes"
 import "widgets"
 
 ApplicationWindow {
-    title: "lsfg-vk Configuration Window"
+    title: qsTr("lsfg-vk Configuration Window")
     width: 900
     height: 650
     minimumWidth: 700
     minimumHeight: 500
     visible: true
-
     // Keep the editor consistently dark instead of mixing the platform
     // window palette with dark custom Group/List backgrounds.
     color: "#151821"
@@ -35,54 +34,63 @@ ApplicationWindow {
 
     CenteredDialog {
         id: create_dialog
-        name: "Create New Profile"
+
+        name: qsTr("Create New Profile")
         onConfirm: backend.createProfile(create_name.text)
 
         TextField {
-            Layout.fillWidth: true
             id: create_name
-            placeholderText: "Choose a profile name"
+
+            Layout.fillWidth: true
+            placeholderText: qsTr("Choose a profile name")
             focus: true
         }
+
     }
 
     CenteredDialog {
         id: rename_dialog
-        name: "Rename Profile"
+
+        name: qsTr("Rename Profile")
         onConfirm: backend.renameProfile(rename_name.text)
 
         TextField {
-            Layout.fillWidth: true
             id: rename_name
-            placeholderText: "Choose a profile name"
+
+            Layout.fillWidth: true
+            placeholderText: qsTr("Choose a profile name")
             focus: true
         }
+
     }
 
     CenteredDialog {
         id: delete_dialog
-        name: "Confirm Deletion"
+
+        name: qsTr("Confirm Deletion")
         onConfirm: backend.deleteProfile()
 
         Label {
             Layout.fillWidth: true
-            text: "Are you sure you want to delete the selected profile?"
+            text: qsTr("Are you sure you want to delete the selected profile?")
             horizontalAlignment: Text.AlignHCenter
         }
+
     }
 
     LargeDialog {
         id: active_in_dialog
+
+        name: qsTr("Active In")
         onConfirm: backend.createProfile(create_name.text)
 
         List {
             Layout.fillWidth: true
             Layout.fillHeight: true
-
             model: backend.active_in
             selected: backend.active_in_index
             onSelect: (index) => {
-                backend.active_in_index = index
+                backend.active_in_index = index;
                 var idx = backend.active_in.index(index, 0);
                 active_in_name.text = backend.active_in.data(idx);
             }
@@ -92,20 +100,25 @@ ApplicationWindow {
             spacing: 8
 
             TextField {
-                Layout.fillWidth: true
                 id: active_in_name
-                placeholderText: "Specify linux binary / exe file / process name"
+
+                Layout.fillWidth: true
+                placeholderText: qsTr("Specify linux binary / exe file / process name")
                 focus: true
             }
+
             Button {
                 icon.name: "list-add"
                 onClicked: backend.addActiveIn(active_in_name.text)
             }
+
             Button {
                 icon.name: "list-remove"
                 onClicked: backend.removeActiveIn()
             }
+
         }
+
     }
 
     SplitView {
@@ -118,7 +131,7 @@ ApplicationWindow {
             SplitView.maximumWidth: 300
 
             Label {
-                text: "Profiles"
+                text: qsTr("Profiles")
                 Layout.fillWidth: true
                 font.bold: true
                 horizontalAlignment: Text.AlignHCenter
@@ -127,187 +140,246 @@ ApplicationWindow {
             List {
                 model: backend.profiles
                 selected: backend.profile_index
-                onSelect: (index) => backend.profile_index = index
+                onSelect: (index) => {
+                    return backend.profile_index = index;
+                }
             }
 
             Button {
                 Layout.fillWidth: true
-                text: "Create New Profile"
+                text: qsTr("Create New Profile")
                 onClicked: {
-                    create_name.text = ""
-                    create_dialog.open()
+                    create_name.text = "";
+                    create_dialog.open();
                 }
             }
+
             Button {
                 Layout.fillWidth: true
-                text: "Rename Profile"
+                text: qsTr("Rename Profile")
                 onClicked: {
                     var idx = backend.profiles.index(backend.profile_index, 0);
                     rename_name.text = backend.profiles.data(idx);
-                    rename_dialog.open()
+                    rename_dialog.open();
                 }
             }
+
             Button {
                 Layout.fillWidth: true
-                text: "Delete Profile"
+                text: qsTr("Delete Profile")
                 onClicked: {
-                    delete_dialog.open()
+                    delete_dialog.open();
                 }
             }
+
         }
 
-        Pane {
+        ScrollView {
+            id: settings_scroll
+
             SplitView.fillWidth: true
+            clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
-            Group {
-                name: "Global Settings"
+            ColumnLayout {
+                width: settings_scroll.availableWidth
+                spacing: 4
 
-                GroupEntry {
-                    title: "Path to Lossless Scaling"
-                    description: "Change the location of Lossless.dll"
+                Group {
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    Layout.topMargin: 12
+                    name: qsTr("Global Settings")
 
-                    FileEdit {
-                        Layout.fillWidth: true
+                    GroupEntry {
+                        title: qsTr("Path to Lossless Scaling")
+                        description: qsTr("Change the location of Lossless.dll")
 
-                        title: "Select Lossless.dll"
-                        filter: "Dynamic Link Library Files (*.dll)"
+                        FileEdit {
+                            Layout.fillWidth: true
+                            title: qsTr("Select Lossless.dll")
+                            filter: qsTr("Dynamic Link Library Files (*.dll)")
+                            text: backend.dll
+                            onUpdate: (text) => {
+                                return backend.dll = text;
+                            }
+                        }
 
-                        text: backend.dll
-                        onUpdate: (text) => backend.dll = text
                     }
+
+                    GroupEntry {
+                        title: qsTr("Allow half-precision")
+                        description: qsTr("Allow acceleration through half-precision")
+
+                        CheckBox {
+                            Layout.alignment: Qt.AlignRight
+                            checked: backend.allow_fp16
+                            onToggled: backend.allow_fp16 = checked
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Language")
+                        description: qsTr("Change the interface language")
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: [qsTr("System Default"), qsTr("English"), qsTr("Português (Brasil)"), qsTr("Español")]
+                            currentIndex: languageManager.current_language
+                            onActivated: (index) => {
+                                return languageManager.current_language = index;
+                            }
+                        }
+
+                    }
+
                 }
 
-                GroupEntry {
-                    title: "Allow half-precision"
-                    description: "Allow acceleration through half-precision"
+                Group {
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    name: qsTr("Profile Settings")
+                    enabled: backend.available
 
-                    CheckBox {
-                        Layout.alignment: Qt.AlignRight
+                    GroupEntry {
+                        title: qsTr("Active In")
+                        description: qsTr("Specify which applications this profile is active in")
 
-                        checked: backend.allow_fp16
-                        onToggled: backend.allow_fp16 = checked
+                        Button {
+                            Layout.alignment: Qt.AlignRight
+                            text: qsTr("Edit...")
+                            onClicked: active_in_dialog.open()
+                        }
+
                     }
+
+                    GroupEntry {
+                        title: qsTr("Frame Generation Mode")
+                        description: qsTr("Adaptive follows the multiplier; Fixed targets an explicit output FPS")
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: [qsTr("Adaptive"), qsTr("Fixed")]
+                            currentIndex: backend.frame_generation_mode
+                            onActivated: (index) => {
+                                return backend.frame_generation_mode = index;
+                            }
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Target FPS")
+                        description: qsTr("Output FPS target used by Fixed mode")
+                        visible: backend.frame_generation_mode === 1
+
+                        SpinBox {
+                            Layout.alignment: Qt.AlignRight
+                            from: 1
+                            to: 2147483647
+                            value: backend.target_fps
+                            onValueModified: backend.target_fps = value
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Multiplier")
+                        description: qsTr("Adaptive only; 1x bypasses frame generation")
+
+                        SpinBox {
+                            Layout.alignment: Qt.AlignRight
+                            enabled: backend.frame_generation_mode === 0
+                            from: 1
+                            to: backend.adaptive_multiplier_max
+                            value: backend.multiplier
+                            onValueModified: backend.multiplier = value
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Flow Scale")
+                        description: qsTr("Lower the internal motion estimation resolution")
+
+                        FlowSlider {
+                            Layout.fillWidth: true
+                            from: 0.25
+                            to: 1
+                            value: backend.flow_scale
+                            onUpdate: (value) => {
+                                return backend.flow_scale = value;
+                            }
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Performance Mode")
+                        description: qsTr("Use a significantly lighter frame generation model")
+
+                        CheckBox {
+                            Layout.alignment: Qt.AlignRight
+                            checked: backend.performance_mode
+                            onToggled: backend.performance_mode = checked
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("Pacing Mode")
+                        description: qsTr("Change how frames are presented to the display")
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: [qsTr("None")]
+                            currentIndex: backend.pacing_mode
+                            onActivated: (index) => {
+                                return backend.pacing_mode = index;
+                            }
+                        }
+
+                    }
+
+                    GroupEntry {
+                        title: qsTr("GPU")
+                        description: qsTr("Select which GPU to use for frame generation")
+
+                        ComboBox {
+                            id: gpu_combo_box
+
+                            Layout.fillWidth: true
+                            model: backend.gpus
+                            displayText: currentIndex === 0 ? qsTr("Default") : currentText
+                            currentIndex: backend.gpu
+                            onActivated: (index) => {
+                                return backend.gpu = index;
+                            }
+
+                            delegate: ItemDelegate {
+                                width: ListView.view ? ListView.view.width : implicitWidth
+                                text: index === 0 ? qsTr("Default") : modelData
+                                highlighted: gpu_combo_box.highlightedIndex === index
+                            }
+
+                        }
+
+                    }
+
                 }
+
+                Item {
+                    Layout.fillHeight: true
+                    Layout.minimumHeight: 12
+                }
+
             }
 
-            Group {
-                name: "Profile Settings"
-                enabled: backend.available
-
-                GroupEntry {
-                    title: "Active In"
-                    description: "Specify which applications this profile is active in"
-
-                    Button {
-                        Layout.alignment: Qt.AlignRight
-
-                        text: "Edit..."
-                        onClicked: active_in_dialog.open()
-                    }
-                }
-
-                GroupEntry {
-                    title: "Frame Generation Mode"
-                    description: "Adaptive follows the multiplier; Fixed targets an explicit output FPS"
-
-                    ComboBox {
-                        Layout.fillWidth: true
-
-                        model: ["Adaptive", "Fixed"]
-                        currentIndex: backend.frame_generation_mode
-                        onActivated: (index) => backend.frame_generation_mode = index
-                    }
-                }
-
-                GroupEntry {
-                    title: "Target FPS"
-                    description: "Output FPS target used by Fixed mode"
-                    visible: backend.frame_generation_mode === 1
-
-                    SpinBox {
-                        Layout.alignment: Qt.AlignRight
-
-                        from: 1
-                        to: 2147483647
-
-                        value: backend.target_fps
-                        onValueModified: backend.target_fps = value
-                    }
-                }
-
-                GroupEntry {
-                    title: "Multiplier"
-                    description: "Adaptive only; 1x bypasses frame generation"
-
-                    SpinBox {
-                        Layout.alignment: Qt.AlignRight
-                        enabled: backend.frame_generation_mode === 0
-
-                        from: 1
-                        to: backend.adaptive_multiplier_max
-
-                        value: backend.multiplier
-                        onValueModified: backend.multiplier = value
-                    }
-                }
-
-                GroupEntry {
-                    title: "Flow Scale"
-                    description: "Lower the internal motion estimation resolution"
-
-                    FlowSlider {
-                        Layout.fillWidth: true
-
-                        from: 0.25
-                        to: 1.00
-
-                        value: backend.flow_scale
-                        onUpdate: (value) => backend.flow_scale = value
-                    }
-                }
-
-                GroupEntry {
-                    title: "Performance Mode"
-                    description: "Use a significantly lighter frame generation model"
-
-                    CheckBox {
-                        Layout.alignment: Qt.AlignRight
-
-                        checked: backend.performance_mode
-                        onToggled: backend.performance_mode = checked
-                    }
-                }
-
-                GroupEntry {
-                    title: "Pacing Mode"
-                    description: "Change how frames are presented to the display"
-
-                    ComboBox {
-                        Layout.fillWidth: true
-
-                        model: ["None"]
-                        currentIndex: backend.pacing_mode
-                        onActivated: (index) => backend.pacing_mode = index
-                    }
-                }
-
-                GroupEntry {
-                    title: "GPU"
-                    description: "Select which GPU to use for frame generation"
-
-                    ComboBox {
-                        Layout.fillWidth: true
-
-                        model: backend.gpus
-                        currentIndex: backend.gpu
-                        onActivated: (index) => backend.gpu = index
-                    }
-                }
-            }
-
-            Item {
-                Layout.fillHeight: true
-            }
         }
+
     }
+
 }

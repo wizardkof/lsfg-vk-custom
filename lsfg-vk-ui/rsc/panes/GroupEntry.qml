@@ -11,6 +11,8 @@ RowLayout {
     spacing: 12
 
     ColumnLayout {
+        Layout.fillWidth: true
+        Layout.minimumWidth: 0
         clip: true
 
         ColumnLayout {
@@ -19,12 +21,15 @@ RowLayout {
             spacing: 0
 
             Label {
+                Layout.fillWidth: true
                 text: root.title
                 font.bold: true
             }
 
             Label {
+                Layout.fillWidth: true
                 text: root.description
+                wrapMode: Text.WordWrap
                 color: Qt.rgba(
                     palette.text.r,
                     palette.text.g,
@@ -36,6 +41,9 @@ RowLayout {
     }
 
     RowLayout {
+        Layout.minimumWidth: 220
+        Layout.preferredWidth: 260
+
         Item {
             Layout.fillWidth: true
         }

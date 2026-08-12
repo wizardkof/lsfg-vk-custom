@@ -1,7 +1,8 @@
-find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2)
+find_package(Qt6 REQUIRED COMPONENTS LinguistTools Quick QuickControls2)
 
 set(UI_SOURCES
     "src/backend.cpp"
+    "src/language_manager.cpp"
     "src/main.cpp"
     "src/utils.cpp")
 
@@ -17,11 +18,37 @@ set(UI_RESOURCES
     "rsc/gay.pancake.lsfg-vk-ui.png"
     "rsc/UI.qml")
 
+set(UI_TRANSLATION_SOURCES
+    ${UI_SOURCES}
+    "src/backend.hpp"
+    "src/language_manager.hpp"
+    "src/utils.hpp"
+    "rsc/dialogs/CenteredDialog.qml"
+    "rsc/dialogs/LargeDialog.qml"
+    "rsc/panes/Group.qml"
+    "rsc/panes/GroupEntry.qml"
+    "rsc/panes/Pane.qml"
+    "rsc/widgets/FileEdit.qml"
+    "rsc/widgets/FlowSlider.qml"
+    "rsc/widgets/List.qml"
+    "rsc/UI.qml")
+
+set(UI_TRANSLATIONS
+    "translations/lsfg-vk-ui_pt_BR.ts"
+    "translations/lsfg-vk-ui_es.ts")
+
 qt_add_executable(lsfg-vk-ui ${UI_SOURCES})
 
 qt_add_resources(lsfg-vk-ui RESOURCES
     PREFIX "/"
     FILES ${UI_RESOURCES})
+
+# Qt 6.5-compatible translation integration. The generated catalogs are
+# embedded so the UI remains self-contained after installation.
+qt_add_translations(lsfg-vk-ui
+    TS_FILES ${UI_TRANSLATIONS}
+    SOURCES ${UI_TRANSLATION_SOURCES}
+    RESOURCE_PREFIX "/i18n")
 
 set_target_properties(lsfg-vk-ui PROPERTIES
     AUTOMOC ON

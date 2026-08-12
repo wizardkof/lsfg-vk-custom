@@ -19,7 +19,7 @@ You will need the following dependencies:
 - CMake (version 3.10 or higher)
 - Ninja build system (other build systems may work, but Ninja is recommended)
 - Vulkan SDK
-- Qt6, Qt6 Quick and Qt6 Quick Controls 2 (only needed when building lsfg-vk-ui)
+- Qt6, Qt6 Quick, Qt6 Quick Controls 2 and Qt6 LinguistTools (only needed when building lsfg-vk-ui)
 
 The list of required packages may vary depending on your operating system. Below are the installation commands for some common Linux distributions.
 ```bash
@@ -40,7 +40,7 @@ sudo pacman -S --needed \
     llvm clang \
     cmake ninja \
     vulkan-headers vulkan-icd-loader \
-    qt6-base qt6-declarative
+    qt6-base qt6-declarative qt6-tools
 ```
 
 ### Building & Installing lsfg-vk

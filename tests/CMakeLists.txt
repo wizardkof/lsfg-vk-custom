@@ -86,3 +86,37 @@ endif()
 add_test(NAME lsfg-vk-test-documentation-packaging-consistency
     COMMAND ${CMAKE_COMMAND} -P
         "${CMAKE_CURRENT_SOURCE_DIR}/documentation_packaging_consistency.cmake")
+
+if(LSFGVK_BUILD_UI)
+    find_package(Qt6 REQUIRED COMPONENTS Core Qml)
+
+    add_executable(lsfg-vk-test-ui-language-manager
+        ui_language_manager_test.cpp
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-ui/src/language_manager.cpp")
+
+    set_target_properties(lsfg-vk-test-ui-language-manager PROPERTIES
+        AUTOMOC ON)
+
+    target_compile_options(lsfg-vk-test-ui-language-manager PRIVATE
+        -UNDEBUG
+        -Wno-unknown-warning-option)
+
+    target_include_directories(lsfg-vk-test-ui-language-manager PRIVATE
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-ui/src")
+
+    target_link_libraries(lsfg-vk-test-ui-language-manager
+        PRIVATE Qt6::Core
+        PRIVATE Qt6::Qml)
+
+    add_test(
+        NAME lsfg-vk-test-ui-language-manager
+        COMMAND lsfg-vk-test-ui-language-manager
+            "$<TARGET_FILE_DIR:lsfg-vk-ui>")
+
+    add_test(
+        NAME lsfg-vk-test-ui-translation-consistency
+        COMMAND ${CMAKE_COMMAND}
+            -DROOT=${PROJECT_SOURCE_DIR}
+            -DUI_BINARY_DIR=$<TARGET_FILE_DIR:lsfg-vk-ui>
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/ui_translation_consistency.cmake")
+endif()

@@ -27,7 +27,7 @@ RowLayout {
     FileDialog {
         id: picker
         title: root.title
-        nameFilters: [root.filter, "All Files (*)"]
+        nameFilters: [root.filter, qsTr("All Files (*)")]
         onAccepted: root.update(selectedFile.toString().replace("file://", ""))
     }
 }

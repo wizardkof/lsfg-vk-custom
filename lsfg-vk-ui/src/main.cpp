@@ -8,6 +8,7 @@
 #include <QUrl>
 
 #include "backend.hpp"
+#include "language_manager.hpp"
 
 using namespace lsfgvk::ui;
 
@@ -26,8 +27,10 @@ int main(int argc, char* argv[]) {
     // null context object, producing "Cannot read property ... of null".
     Backend backend;
     QQmlApplicationEngine engine;
+    LanguageManager languageManager(engine);
 
     engine.rootContext()->setContextProperty("backend", &backend);
+    engine.rootContext()->setContextProperty("languageManager", &languageManager);
     engine.load("qrc:/rsc/UI.qml");
 
     return QGuiApplication::exec();
