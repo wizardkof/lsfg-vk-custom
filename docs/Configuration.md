@@ -25,7 +25,7 @@ Next is a list of all available **profile** configuration options:
 - **Pacing Mode / `pacing`**: This option is explained in greater detail below. Supported values are **None / `none`**.
 - **GPU / `gpu`**: The GPU to use for frame generation. This MUST be the **same GPU** as the one being used by the application. **Dual GPU is NOT supported**. You can identify a GPU through its name (e.g. `NVIDIA GeForce RTX 3080`), uppercase-only ID (e.g. `0x10DE:0x2C02`) or PCI bus ID (e.g. `3:0.0`). If not specified, the primary GPU will be used, which may lead to issues.
 
-The "Multiplier", "Flow Scale", "Performance Mode" and Fixed `target_fps` options can be **hot-reloaded**. `frame_generation_mode` can also switch between Adaptive and Fixed in the same process when the swapchain supports the dual-mode topology. On fallback hardware, Adaptive may use the legacy real/FIFO path and can switch to synchronous Fixed/FIFO; a Fixed virtual swapchain that could not declare compatible dual present modes will conservatively block a switch back to Adaptive until the application recreates its swapchain. Options such as "Pacing Mode" or removal of the profile still require a swapchain recreation.
+The "Multiplier", "Flow Scale", "Performance Mode" and Fixed `target_fps` options can be **hot-reloaded**. `frame_generation_mode` can also switch between Adaptive and Fixed in the same process when the swapchain supports the dual-mode topology. On fallback hardware, Adaptive may use the legacy real/FIFO path and can switch to synchronous Fixed/FIFO; a Fixed virtual swapchain that could not declare compatible dual present modes will conservatively block a switch back to Adaptive until the application recreates its swapchain. Options such as "Pacing Mode" still require a swapchain recreation. Removing the active profile is not a supported hot-disable operation: the layer retains the last active profile and its global settings until the process restarts, preserving the existing virtual swapchain images.
 
 ### Adaptive and Fixed Examples
 
@@ -41,6 +41,15 @@ target_fps = 0
 ```
 
 Fixed mode ignores `multiplier` and targets an explicit output rate:
+
+> [!IMPORTANT]
+> In the asynchronous virtual path, Fixed mode controls the output cadence and
+> does not directly impose a lower source frame-rate cap on the application. If
+> the application already renders at `target_fps`, no intermediate frames are
+> needed. Synchronous/fallback Fixed paths may pace the source directly. To
+> trade source rendering load for generated frames in the asynchronous path,
+> cap the application's source FPS below `target_fps` using the game or an
+> external limiter.
 
 > [!NOTE]
 > The `--multiplier` option of `lsfg-vk-cli benchmark` and `lsfg-vk-cli debug`

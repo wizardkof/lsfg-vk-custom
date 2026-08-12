@@ -11,6 +11,9 @@ function(lsfgvk_add_layer_unit_test target test_source implementation_source)
         "${implementation_source}")
 
     target_compile_options(${target} PRIVATE
+        # CMake defines NDEBUG for Release builds. These regression tests use
+        # assert(), so explicitly keep their checks enabled in CI as well.
+        -UNDEBUG
         -Wno-unknown-warning-option)
 
     add_test(NAME ${target} COMMAND ${target})
@@ -54,6 +57,20 @@ target_link_libraries(lsfg-vk-test-config-frame-generation-mode
 add_test(
     NAME lsfg-vk-test-config-frame-generation-mode
     COMMAND lsfg-vk-test-config-frame-generation-mode)
+
+add_executable(lsfg-vk-test-config-snapshot
+    config_snapshot_test.cpp)
+
+target_compile_options(lsfg-vk-test-config-snapshot PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-config-snapshot
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-config-snapshot
+    COMMAND lsfg-vk-test-config-snapshot)
 
 if(LSFGVK_BUILD_CLI)
     add_test(NAME lsfg-vk-test-cli-help

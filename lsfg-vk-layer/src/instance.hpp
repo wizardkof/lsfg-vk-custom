@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "config_snapshot.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -30,50 +31,55 @@ namespace lsfgvk::layer {
 
         /// check if the layer is active
         /// @return true if active
-        [[nodiscard]] bool active() const { return this->active_profile.has_value(); }
+        [[nodiscard]] bool active() const { return this->snapshot().active(); }
 
         /// check if the active profile uses fixed-target frame generation
         /// @return true when fixed mode is active
-        [[nodiscard]] bool fixedMode() const {
-            return this->active_profile.has_value()
-                && this->active_profile->frame_generation_mode == ls::FrameGenerationMode::Fixed;
-        }
+        [[nodiscard]] bool fixedMode() const { return this->snapshot().fixedMode(); }
 
         /// check if the active profile is the Adaptive 1x bypass
         /// @return true when Adaptive multiplier=1 is active
-        [[nodiscard]] bool adaptiveBypass() const {
-            return this->active_profile.has_value()
-                && this->active_profile->frame_generation_mode != ls::FrameGenerationMode::Fixed
-                && this->active_profile->multiplier == 1;
-        }
+        [[nodiscard]] bool adaptiveBypass() const { return this->snapshot().adaptiveBypass(); }
+
+        /// capture one immutable configuration view for a complete operation
+        /// @return current effective configuration and its revision
+        [[nodiscard]] ConfigSnapshot snapshot() const;
 
         /// ensure the layer is up-to-date
-        /// @return true if the configuration was updated
-        bool update();
+        /// @return new effective snapshot, or empty when nothing applicable changed
+        std::optional<ConfigSnapshot> update();
 
         /// modify instance create info
+        /// @param snapshot immutable configuration for this operation
         /// @param createInfo original create info
         /// @param finish function to call after modification
-        void modifyInstanceCreateInfo(VkInstanceCreateInfo& createInfo,
-            const std::function<void(void)>& finish) const;
+        static void modifyInstanceCreateInfo(const ConfigSnapshot& snapshot,
+            VkInstanceCreateInfo& createInfo,
+            const std::function<void(void)>& finish);
         /// modify device create info
+        /// @param snapshot immutable configuration for this operation
         /// @param createInfo original create info
         /// @param finish function to call after modification
-        void modifyDeviceCreateInfo(VkDeviceCreateInfo& createInfo,
-            const std::function<void(void)>& finish) const;
+        static void modifyDeviceCreateInfo(const ConfigSnapshot& snapshot,
+            VkDeviceCreateInfo& createInfo,
+            const std::function<void(void)>& finish);
 
         /// modify swapchain create info
+        /// @param snapshot immutable configuration for this operation
         /// @param vk vulkan instance
         /// @param createInfo original create info
         /// @param finish function to call after modification
-        void modifySwapchainCreateInfo(const vk::Vulkan& vk, VkSwapchainCreateInfoKHR& createInfo,
-            const std::function<void(void)>& finish) const;
+        static void modifySwapchainCreateInfo(const ConfigSnapshot& snapshot,
+            const vk::Vulkan& vk, VkSwapchainCreateInfoKHR& createInfo,
+            const std::function<void(void)>& finish);
         /// create swapchain context
+        /// @param snapshot immutable configuration for this operation
         /// @param vk vulkan instance
         /// @param swapchain swapchain handle
         /// @param info swapchain info
         /// @throws ls::error on failure
-        void createSwapchainContext(const vk::Vulkan& vk, VkSwapchainKHR swapchain,
+        void createSwapchainContext(const ConfigSnapshot& snapshot,
+            const vk::Vulkan& vk, VkSwapchainKHR swapchain,
             const SwapchainInfo& info);
         /// get swapchain context
         /// @param swapchain swapchain handle
@@ -94,14 +100,17 @@ namespace lsfgvk::layer {
             std::stop_token stopToken = {},
             std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt);
         /// atomically replace a swapchain context after a configuration reload
-        void recreateSwapchainContext(const vk::Vulkan& vk, VkSwapchainKHR swapchain,
+        /// @param snapshot immutable configuration for this reload
+        void recreateSwapchainContext(const ConfigSnapshot& snapshot,
+            const vk::Vulkan& vk, VkSwapchainKHR swapchain,
             const SwapchainInfo& info);
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
     private:
+        mutable std::mutex configMutex;
         ls::WatchedConfig config;
-        std::optional<ls::GameConf> active_profile;
+        ConfigSnapshotState configState;
 
         ls::lazy<backend::Instance> backend;
         std::mutex swapchainMutex;

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "instance.hpp"
+#include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/paths.hpp"
 #include "swapchain.hpp"
 #include "lsfg-vk-common/configuration/detection.hpp"
@@ -8,12 +9,16 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,12 +52,17 @@ namespace {
 Root::Root() {
     // find active profile
     const auto& profile = findProfile(this->config.get(), ls::identify());
-    if (!profile.has_value())
+    const auto selection = this->configState.select(
+        profile.has_value() ? std::optional<ls::GameConf>(profile->second) : std::nullopt,
+        this->config.get().global());
+    if (selection != ConfigSnapshotState::Selection::Applied
+            || !profile.has_value())
         return;
 
-    this->active_profile = profile->second;
+    const auto selected = this->configState.snapshot();
 
-    std::cerr << "lsfg-vk: using profile with name '" << this->active_profile->name << "' ";
+    std::cerr << "lsfg-vk: using profile with name '"
+        << selected.activeProfile().name << "' ";
     switch (profile->first) {
         case ls::IdentType::OVERRIDE:
             std::cerr << "(identified via override)\n";
@@ -69,23 +79,38 @@ Root::Root() {
     }
 }
 
-bool Root::update() {
-    if (!this->config.update())
-        return false;
-
-    const auto& profile = findProfile(this->config.get(), ls::identify());
-    if (profile.has_value())
-        this->active_profile = profile->second;
-    else
-        this->active_profile = std::nullopt;
-
-    return true;
+ConfigSnapshot Root::snapshot() const {
+    const std::scoped_lock<std::mutex> lock(this->configMutex);
+    return this->configState.snapshot();
 }
 
-void Root::modifyInstanceCreateInfo(VkInstanceCreateInfo& createInfo,
-        const std::function<void(void)>& finish) const {
-    if (!this->active_profile.has_value())
+std::optional<ConfigSnapshot> Root::update() {
+    const std::scoped_lock<std::mutex> lock(this->configMutex);
+    if (!this->config.update())
+        return std::nullopt;
+
+    const auto& profile = findProfile(this->config.get(), ls::identify());
+    const auto selection = this->configState.select(
+        profile.has_value() ? std::optional<ls::GameConf>(profile->second) : std::nullopt,
+        this->config.get().global());
+    if (selection == ConfigSnapshotState::Selection::RetainedActiveProfile) {
+        std::cerr << "lsfg-vk: active profile was removed from the configuration; "
+            "keeping the last active profile until the process restarts\n";
+        return std::nullopt;
+    }
+    if (selection == ConfigSnapshotState::Selection::Inactive)
+        return std::nullopt;
+
+    return this->configState.snapshot();
+}
+
+void Root::modifyInstanceCreateInfo(const ConfigSnapshot& snapshot,
+        VkInstanceCreateInfo& createInfo,
+        const std::function<void(void)>& finish) {
+    if (!snapshot.active()) {
+        finish();
         return;
+    }
 
     auto extensions = add_extensions(
         createInfo.ppEnabledExtensionNames,
@@ -102,10 +127,13 @@ void Root::modifyInstanceCreateInfo(VkInstanceCreateInfo& createInfo,
     finish();
 }
 
-void Root::modifyDeviceCreateInfo(VkDeviceCreateInfo& createInfo,
-        const std::function<void(void)>& finish) const {
-    if (!this->active_profile.has_value())
+void Root::modifyDeviceCreateInfo(const ConfigSnapshot& snapshot,
+        VkDeviceCreateInfo& createInfo,
+        const std::function<void(void)>& finish) {
+    if (!snapshot.active()) {
+        finish();
         return;
+    }
 
     auto extensions = add_extensions(
         createInfo.ppEnabledExtensionNames,
@@ -148,10 +176,13 @@ void Root::modifyDeviceCreateInfo(VkDeviceCreateInfo& createInfo,
     finish();
 }
 
-void Root::modifySwapchainCreateInfo(const vk::Vulkan& vk, VkSwapchainCreateInfoKHR& createInfo,
-        const std::function<void(void)>& finish) const {
-    if (!this->active_profile.has_value())
+void Root::modifySwapchainCreateInfo(const ConfigSnapshot& snapshot,
+        const vk::Vulkan& vk, VkSwapchainCreateInfoKHR& createInfo,
+        const std::function<void(void)>& finish) {
+    if (!snapshot.active()) {
+        finish();
         return;
+    }
 
     VkSurfaceCapabilitiesKHR caps{}; // NOLINT (enum value 0)
     auto res = vk.fi().GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -159,21 +190,23 @@ void Root::modifySwapchainCreateInfo(const vk::Vulkan& vk, VkSwapchainCreateInfo
     if (res != VK_SUCCESS)
         throw ls::vulkan_error(res, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR() failed");
 
-    context_ModifySwapchainCreateInfo(*this->active_profile, caps.maxImageCount, createInfo);
+    context_ModifySwapchainCreateInfo(
+        snapshot.activeProfile(), caps.maxImageCount, createInfo);
 
     finish();
 }
 
-void Root::createSwapchainContext(const vk::Vulkan& vk,
+void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
+        const vk::Vulkan& vk,
         VkSwapchainKHR swapchain, const SwapchainInfo& info) {
-    const std::scoped_lock lock(this->swapchainMutex);
-    if (!this->active_profile.has_value())
+    if (!snapshot.active())
         throw ls::error("attempted to create swapchain context while layer is inactive");
-    const auto& profile = *this->active_profile;
+    const auto& profile = snapshot.activeProfile();
+    const auto& global = snapshot.global;
+
+    const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
 
     if (!this->backend.has_value()) { // emplace backend late, due to loader bug
-        const auto& global = this->config.get().global();
-
         setenv("DISABLE_LSFGVK", "1", 1);
 
         try {
@@ -216,29 +249,31 @@ VkResult Root::presentSwapchain(const vk::Vulkan& vk,
         const std::vector<VkSemaphore>& semaphores,
         std::stop_token stopToken,
         std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
-    const std::scoped_lock lock(this->swapchainMutex);
+    const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     const auto it = this->swapchains.find(swapchain);
     if (it == this->swapchains.end())
         throw ls::error("swapchain context not found");
 
     return it->second.present(vk, queue, std::move(queueMutex), swapchain,
-        nextChain, imageIndex, semaphores, stopToken, sourcePresentTime);
+        nextChain, imageIndex, semaphores, std::move(stopToken), sourcePresentTime);
 }
 
-void Root::recreateSwapchainContext(const vk::Vulkan& vk,
+void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
+        const vk::Vulkan& vk,
         VkSwapchainKHR swapchain, const SwapchainInfo& info) {
-    const std::scoped_lock lock(this->swapchainMutex);
-    if (!this->active_profile.has_value())
+    if (!snapshot.active())
         throw ls::error("attempted to recreate swapchain context while layer is inactive");
+
+    const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     if (!this->backend.has_value())
         throw ls::error("attempted to recreate swapchain context without backend");
 
     this->swapchains.erase(swapchain);
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), *this->active_profile, info));
+        Swapchain(vk, this->backend.mut(), snapshot.activeProfile(), info));
 }
 
 void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {
-    const std::scoped_lock lock(this->swapchainMutex);
+    const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     this->swapchains.erase(swapchain);
 }

@@ -2,6 +2,7 @@
 
 #include "instance.hpp"
 #include "fixed_present_mode.hpp"
+#include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -214,8 +215,9 @@ namespace {
 
     [[nodiscard]] SwapchainMaintenanceFamily selectSurfaceMaintenanceFamily(
             PFN_vkGetInstanceProcAddr getInstanceProcAddr,
-            const VkInstanceCreateInfo& info) {
-        if (!layer_info->root.active()
+            const VkInstanceCreateInfo& info,
+            bool layerActive) {
+        if (!layerActive
                 || !extensionEnabled(info.ppEnabledExtensionNames,
                     info.enabledExtensionCount, SURFACE_KHR)
                 || !hasInstanceExtension(getInstanceProcAddr,
@@ -784,9 +786,10 @@ namespace {
         }
 
         try {
+            const auto configSnapshot = layer_info->root.snapshot();
             VkInstanceCreateInfo newInfo = *info;
             const auto maintenanceFamily = selectSurfaceMaintenanceFamily(
-                layer_info->GetInstanceProcAddr, newInfo);
+                layer_info->GetInstanceProcAddr, newInfo, configSnapshot.active());
             std::vector<const char*> maintenanceExtensions;
             if (maintenanceFamily != SwapchainMaintenanceFamily::None) {
                 if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
@@ -802,7 +805,7 @@ namespace {
                 newInfo.ppEnabledExtensionNames = maintenanceExtensions.data();
             }
 
-            layer_info->root.modifyInstanceCreateInfo(newInfo,
+            layer_info->root.modifyInstanceCreateInfo(configSnapshot, newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = vkCreateInstance(newInfo, alloc, instance);
                     if (res != VK_SUCCESS)
@@ -823,7 +826,7 @@ namespace {
             if (maintenanceFamily != SwapchainMaintenanceFamily::None)
                 std::cerr << "lsfg-vk: dual-ready surface maintenance enabled: "
                     << maintenanceFamilyName(maintenanceFamily) << "\n";
-            else if (layer_info->root.active())
+            else if (configSnapshot.active())
                 std::cerr << "lsfg-vk: surface maintenance unavailable; "
                     "dual present-mode declaration will use legacy fallback\n";
 
@@ -899,11 +902,12 @@ namespace {
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenanceFeatures{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR
         };
+        const auto configSnapshot = layer_info->root.snapshot();
 
         // create device
         try {
             VkDeviceCreateInfo newInfo = *info;
-            if (layer_info->root.active()) {
+            if (configSnapshot.active()) {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
                     PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
                         instance_info->handles.front(), "vkGetPhysicalDeviceFeatures2"));
@@ -930,7 +934,7 @@ namespace {
                 }
             }
 
-            layer_info->root.modifyDeviceCreateInfo(newInfo,
+            layer_info->root.modifyDeviceCreateInfo(configSnapshot, newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = instance_info->funcs.CreateDevice(physdev, newInfo, alloc, device);
                     if (res != VK_SUCCESS)
@@ -966,7 +970,7 @@ namespace {
                 *device, deviceMaintenanceFamily);
             std::cerr << "lsfg-vk: dual-ready swapchain maintenance enabled: "
                 << maintenanceFamilyName(deviceMaintenanceFamily) << "\n";
-        } else if (layer_info->root.active()) {
+        } else if (configSnapshot.active()) {
             std::cerr << "lsfg-vk: swapchain maintenance feature unavailable; "
                 "dual present-mode declaration will use legacy fallback\n";
         }
@@ -1015,21 +1019,21 @@ namespace {
                             << " queue=" << offloadReservation.queueIndex
                             << " app-index=" << offloadReservation.applicationQueueIndex
                             << " initial-mode="
-                            << (layer_info->root.fixedMode() ? "Fixed" : "Adaptive")
+                            << (configSnapshot.fixedMode() ? "Fixed" : "Adaptive")
                             << "\n";
 
-                        if (offloadReservation.shared() && layer_info->root.fixedMode())
+                        if (offloadReservation.shared() && configSnapshot.fixedMode())
                             std::cerr << "lsfg-vk: Fixed worker sharing internally synchronized graphics queue "
                                 << offloadReservation.familyIndex << ':'
                                 << offloadReservation.applicationQueueIndex << "\n";
                     }
                 }
             }
-        } else if (layer_info->root.fixedMode()) {
+        } else if (configSnapshot.fixedMode()) {
             std::cerr << "lsfg-vk: no dedicated or internally synchronized graphics queue "
                 "is available for asynchronous fixed pacing; the current synchronous Fixed "
                 "path will remain in use\n";
-        } else if (layer_info->root.active()) {
+        } else if (configSnapshot.active()) {
             std::cerr << "lsfg-vk: no dual-ready offload graphics queue is available; "
                 "Adaptive remains unchanged and a future hot switch to asynchronous Fixed "
                 "will require the legacy fallback path\n";
@@ -1225,7 +1229,13 @@ namespace {
                 }
             }
 
-            layer_info->root.update(); // ensure config is up to date
+            // Capture one immutable configuration revision for the complete
+            // create transaction. No later mode/profile queries may observe a
+            // different hot-reload revision while this swapchain is built.
+            const auto updatedSnapshot = layer_info->root.update();
+            const auto configSnapshot = updatedSnapshot.has_value()
+                ? *updatedSnapshot
+                : layer_info->root.snapshot();
 
             // create underlying real swapchain
             VkSwapchainCreateInfoKHR newInfo = *info;
@@ -1237,14 +1247,14 @@ namespace {
             VkSwapchainPresentModesCreateInfoKHR dualPresentModesInfo{
                 .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR
             };
-            layer_info->root.modifySwapchainCreateInfo(it->second, newInfo,
+            layer_info->root.modifySwapchainCreateInfo(configSnapshot, it->second, newInfo,
                 [&, newInfo = &newInfo]() {
                     // Only the asynchronous Fixed path changes WSI mode. The
                     // Adaptive and synchronous 3B paths retain their existing
                     // FIFO behavior. Eligibility is checked before creation so
                     // an unavailable dedicated presentation queue cannot alter
                     // legacy swapchain semantics.
-                    if (layer_info->root.fixedMode()) {
+                    if (configSnapshot.fixedMode()) {
                         const auto queueIt = instance_info->offloadQueues.find(device);
                         const auto spec = makeVirtualSwapchainImageSpec(*newInfo);
                         if (queueIt != instance_info->offloadQueues.end()
@@ -1277,7 +1287,7 @@ namespace {
                                     "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
                         try {
                             const uint32_t stableAdaptiveImageFloor =
-                                layer_info->root.fixedMode()
+                                configSnapshot.fixedMode()
                                     ? 0U
                                     : applicationMinImageCount
                                         + static_cast<uint32_t>(
@@ -1333,7 +1343,7 @@ namespace {
             bool virtualized{};
             bool dynamicPresentModeEligible{};
 
-            const bool fixedMode = layer_info->root.fixedMode();
+            const bool fixedMode = configSnapshot.fixedMode();
             const bool adaptiveMode = !fixedMode;
 
             VkPresentModeKHR adaptivePresentMode = VK_PRESENT_MODE_FIFO_KHR;
@@ -1414,7 +1424,7 @@ namespace {
 
             try {
                 layer_info->root.createSwapchainContext(
-                    it->second, *swapchain, swapchainInfo);
+                    configSnapshot, it->second, *swapchain, swapchainInfo);
 
                 if (virtualRuntime) {
                     const auto& offload = instance_info->offloadQueues.at(device);
@@ -1555,15 +1565,16 @@ namespace {
         VkResult result = VK_SUCCESS;
 
         // ensure layer config is up to date
-        bool reload{};
+        std::optional<ConfigSnapshot> reload;
         try {
             reload = layer_info->root.update();
         } catch (const std::exception&) {
-            reload = false; // ignore parse errors
+            reload = std::nullopt; // ignore parse errors
         }
 
-        if (reload) {
+        if (reload.has_value()) {
             try {
+                const auto& configSnapshot = *reload;
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
                     auto& swapchainInfo = instance_info->swapchainInfos.at(swapchain);
 
@@ -1572,7 +1583,7 @@ namespace {
                     // FIFO + MAILBOX/IMMEDIATE modes at creation, a mode reload
                     // can select the new WSI mode per present and replace only
                     // the Root-owned Swapchain context.
-                    const bool requestedFixed = layer_info->root.fixedMode();
+                    const bool requestedFixed = configSnapshot.fixedMode();
                     const bool modeChanged =
                         swapchainInfo.fixedContext != requestedFixed;
 
@@ -1592,7 +1603,7 @@ namespace {
                     }
 
                     layer_info->root.recreateSwapchainContext(
-                        vk, swapchain, swapchainInfo);
+                        configSnapshot, vk, swapchain, swapchainInfo);
 
                     if (swapchainInfo.virtualized) {
                         if (modeChanged && swapchainInfo.dynamicPresentModeEligible) {
