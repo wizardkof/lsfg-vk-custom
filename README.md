@@ -3,6 +3,11 @@
 
 **lsfg-vk** is a Vulkan layer that hooks into Vulkan applications and generates additional frames using Lossless Scaling's frame generation algorithm.
 
+> [!NOTE]
+> Fork version: **2.0.0-fixed-target**
+>
+> Based on upstream lsfg-vk **2.0.0-dev28**.
+
 >[!CAUTION]
 > You are reading the README for the upcoming version 2.0 of lsfg-vk. For the stable version 1.x, [please read here](https://github.com/PancakeTAS/lsfg-vk/tree/ff1a0f72a7d6d08b84d58b7b4dc5f05c9f904f98)
 
