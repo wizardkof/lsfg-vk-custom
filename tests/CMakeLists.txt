@@ -100,6 +100,20 @@ add_test(
     NAME lsfg-vk-test-physical-device-diagnostics
     COMMAND lsfg-vk-test-physical-device-diagnostics)
 
+add_executable(lsfg-vk-test-external-capabilities
+    external_capabilities_test.cpp)
+
+target_compile_options(lsfg-vk-test-external-capabilities PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-external-capabilities
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-external-capabilities
+    COMMAND lsfg-vk-test-external-capabilities)
+
 if(LSFGVK_BUILD_CLI)
     add_executable(lsfg-vk-test-cli-devices
         cli_devices_test.cpp

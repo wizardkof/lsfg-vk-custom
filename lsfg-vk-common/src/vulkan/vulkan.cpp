@@ -147,7 +147,13 @@ namespace {
                 ipa<PFN_vkEnumerateDeviceExtensionProperties>(mpa, instance,
                     "vkEnumerateDeviceExtensionProperties"),
             .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, instance,
-                "vkGetPhysicalDeviceProperties2")
+                "vkGetPhysicalDeviceProperties2"),
+            .GetPhysicalDeviceImageFormatProperties2 =
+                ipa<PFN_vkGetPhysicalDeviceImageFormatProperties2>(mpa, instance,
+                    "vkGetPhysicalDeviceImageFormatProperties2"),
+            .GetPhysicalDeviceExternalSemaphoreProperties =
+                ipa<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, instance,
+                    "vkGetPhysicalDeviceExternalSemaphoreProperties")
         };
     }
 

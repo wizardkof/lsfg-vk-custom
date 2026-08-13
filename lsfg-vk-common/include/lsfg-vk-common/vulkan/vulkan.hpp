@@ -23,6 +23,9 @@ namespace vk {
         PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
         PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
         PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
+            GetPhysicalDeviceExternalSemaphoreProperties;
     };
 
     /// vulkan instance function pointers
