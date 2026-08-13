@@ -12,6 +12,7 @@
 #include <fstream>
 #include <ios>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -62,7 +63,8 @@ namespace {
     /// create a vulkan instance
     ls::owned_ptr<VkInstance> createInstance(
             const std::string& appName, version appVersion,
-            const std::string& engineName, version engineVersion) {
+            const std::string& engineName, version engineVersion,
+            uint32_t apiVersion) {
         VkInstance handle{};
 
         auto vkCreateInstance =
@@ -76,7 +78,7 @@ namespace {
             .applicationVersion = appVersion.into(),
             .pEngineName = engineName.c_str(),
             .engineVersion = engineVersion.into(),
-            .apiVersion = VK_API_VERSION_1_2 // seems 1.2 is supported on all Vulkan-capable GPUs
+            .apiVersion = apiVersion
         };
         const VkInstanceCreateInfo instanceInfo{
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -96,6 +98,57 @@ namespace {
                 defunc(instance, VK_NULL_HANDLE);
             }
         );
+    }
+
+    /// Return the Vulkan instance version reported by the loader.
+    uint32_t getInstanceVersion() {
+        const auto enumerateInstanceVersion =
+            reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
+                get_mpa()(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+        if (!enumerateInstanceVersion)
+            return VK_API_VERSION_1_0;
+
+        uint32_t apiVersion{};
+        const auto res = enumerateInstanceVersion(&apiVersion);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkEnumerateInstanceVersion() failed");
+        return apiVersion;
+    }
+
+    std::string formatApiVersion(uint32_t apiVersion) {
+        std::ostringstream stream;
+        stream << VK_API_VERSION_MAJOR(apiVersion) << "."
+            << VK_API_VERSION_MINOR(apiVersion) << "."
+            << VK_API_VERSION_PATCH(apiVersion);
+        return stream.str();
+    }
+
+    ls::owned_ptr<VkInstance> createInventoryInstance(
+            const std::string& appName, version appVersion,
+            const std::string& engineName, version engineVersion) {
+        const uint32_t loaderVersion = getInstanceVersion();
+        if (loaderVersion < VK_API_VERSION_1_1)
+            throw ls::vulkan_error(
+                "Vulkan device inventory requires Vulkan 1.1; loader reports Vulkan "
+                + formatApiVersion(loaderVersion));
+
+        return createInstance(appName, appVersion,
+            engineName, engineVersion, VK_API_VERSION_1_1);
+    }
+
+    VulkanInstanceInventoryFuncs initVulkanInstanceInventoryFuncs(
+            VkInstance instance, PFN_vkGetInstanceProcAddr mpa) {
+        return {
+            .DestroyInstance = ipa<PFN_vkDestroyInstance>(mpa, instance,
+                "vkDestroyInstance"),
+            .EnumeratePhysicalDevices = ipa<PFN_vkEnumeratePhysicalDevices>(mpa, instance,
+                "vkEnumeratePhysicalDevices"),
+            .EnumerateDeviceExtensionProperties =
+                ipa<PFN_vkEnumerateDeviceExtensionProperties>(mpa, instance,
+                    "vkEnumerateDeviceExtensionProperties"),
+            .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, instance,
+                "vkGetPhysicalDeviceProperties2")
+        };
     }
 
     /// filter for a physical device
@@ -401,6 +454,16 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
     };
 }
 
+VulkanInventoryInstance::VulkanInventoryInstance(
+        const std::string& appName, version appVersion,
+        const std::string& engineName, version engineVersion) :
+    instance(createInventoryInstance(
+        appName, appVersion,
+        engineName, engineVersion
+    )),
+    instance_funcs(initVulkanInstanceInventoryFuncs(*this->instance, get_mpa())) {
+}
+
 Vulkan::Vulkan(const std::string& appName, version appVersion,
         const std::string& engineName, version engineVersion,
         PhysicalDeviceSelector selectPhysicalDevice,
@@ -409,7 +472,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         const std::optional<std::filesystem::path>& cachefile) :
     instance(createInstance(
         appName, appVersion,
-        engineName, engineVersion
+        engineName, engineVersion,
+        VK_API_VERSION_1_2
     )),
     instance_funcs(initVulkanInstanceFuncs(*this->instance, get_mpa(), false)),
     phys_dev(findPhysicalDevice(this->instance_funcs,

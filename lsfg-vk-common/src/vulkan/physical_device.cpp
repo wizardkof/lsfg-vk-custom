@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <ios>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -20,14 +21,21 @@
 using namespace vk;
 
 namespace {
+    template<typename Funcs>
+    [[nodiscard]] std::vector<std::string> enumerateDeviceExtensionNamesImpl(
+        const Funcs& funcs,
+        VkPhysicalDevice device
+    );
+
     [[nodiscard]] bool hasDeviceExtension(
             const std::vector<std::string>& extensions,
             const char* extensionName) {
         return std::ranges::binary_search(extensions, std::string(extensionName));
     }
 
+    template<typename Funcs>
     [[nodiscard]] PhysicalDeviceIdentity queryPhysicalDeviceIdentity(
-            const VulkanInstanceFuncs& funcs,
+            const Funcs& funcs,
             VkPhysicalDevice device,
             const std::vector<std::string>& extensions) {
         const bool hasPciBusInfo = hasDeviceExtension(
@@ -66,8 +74,9 @@ namespace {
         return identity;
     }
 
+    template<typename Funcs>
     [[nodiscard]] std::vector<VkPhysicalDevice> enumeratePhysicalDeviceHandles(
-            const VulkanInstanceFuncs& funcs,
+            const Funcs& funcs,
             VkInstance instance) {
         uint32_t count{};
         auto res = funcs.EnumeratePhysicalDevices(instance, &count, nullptr);
@@ -102,6 +111,72 @@ namespace {
         stream << "0x" << std::uppercase << std::hex
             << std::setw(4) << std::setfill('0') << id;
         return stream.str();
+    }
+
+    template<typename Funcs>
+    [[nodiscard]] std::vector<std::string> enumerateDeviceExtensionNamesImpl(
+            const Funcs& funcs,
+            VkPhysicalDevice device) {
+        uint32_t count{};
+        auto res = funcs.EnumerateDeviceExtensionProperties(
+            device, nullptr, &count, nullptr);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res,
+                "vkEnumerateDeviceExtensionProperties() failed");
+        if (count == 0)
+            return {};
+
+        std::vector<VkExtensionProperties> properties;
+        while (true) {
+            properties.resize(count);
+            res = funcs.EnumerateDeviceExtensionProperties(
+                device, nullptr, &count, properties.data());
+            if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+                throw ls::vulkan_error(res,
+                    "vkEnumerateDeviceExtensionProperties() failed");
+            if (res == VK_SUCCESS)
+                break;
+
+            res = funcs.EnumerateDeviceExtensionProperties(
+                device, nullptr, &count, nullptr);
+            if (res != VK_SUCCESS)
+                throw ls::vulkan_error(res,
+                    "vkEnumerateDeviceExtensionProperties() failed");
+        }
+        properties.resize(count);
+
+        std::vector<std::string> extensions;
+        extensions.reserve(properties.size());
+        for (const auto& property : properties)
+            extensions.emplace_back(std::to_array(property.extensionName).data());
+        std::ranges::sort(extensions);
+        const auto duplicates = std::ranges::unique(extensions);
+        extensions.erase(duplicates.begin(), duplicates.end());
+        return extensions;
+    }
+
+    template<typename Funcs>
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> snapshotPhysicalDevicesImpl(
+            const Funcs& funcs,
+            const std::vector<VkPhysicalDevice>& devices) {
+        std::vector<PhysicalDeviceSnapshot> snapshots;
+        snapshots.reserve(devices.size());
+        for (const auto& device : devices) {
+            auto extensions = enumerateDeviceExtensionNamesImpl(funcs, device);
+            snapshots.push_back({
+                .identity = queryPhysicalDeviceIdentity(funcs, device, extensions),
+                .advertisedDeviceExtensions = std::move(extensions)
+            });
+        }
+        return snapshots;
+    }
+
+    template<typename Funcs>
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> enumeratePhysicalDeviceSnapshotsImpl(
+            const Funcs& funcs,
+            VkInstance instance) {
+        return snapshotPhysicalDevicesImpl(funcs,
+            enumeratePhysicalDeviceHandles(funcs, instance));
     }
 }
 
@@ -156,70 +231,51 @@ std::string vk::formatUuid(const DeviceUuid& uuid) {
 PhysicalDeviceIdentity vk::getPhysicalDeviceIdentity(
         const VulkanInstanceFuncs& funcs,
         VkPhysicalDevice device) {
-    const auto extensions = enumerateDeviceExtensionNames(funcs, device);
+    const auto extensions = enumerateDeviceExtensionNamesImpl(funcs, device);
+    return queryPhysicalDeviceIdentity(funcs, device, extensions);
+}
+
+PhysicalDeviceIdentity vk::getPhysicalDeviceIdentity(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkPhysicalDevice device) {
+    const auto extensions = enumerateDeviceExtensionNamesImpl(funcs, device);
     return queryPhysicalDeviceIdentity(funcs, device, extensions);
 }
 
 std::vector<std::string> vk::enumerateDeviceExtensionNames(
         const VulkanInstanceFuncs& funcs,
         VkPhysicalDevice device) {
-    uint32_t count{};
-    auto res = funcs.EnumerateDeviceExtensionProperties(
-        device, nullptr, &count, nullptr);
-    if (res != VK_SUCCESS)
-        throw ls::vulkan_error(res,
-            "vkEnumerateDeviceExtensionProperties() failed");
-    if (count == 0)
-        return {};
+    return enumerateDeviceExtensionNamesImpl(funcs, device);
+}
 
-    std::vector<VkExtensionProperties> properties;
-    while (true) {
-        properties.resize(count);
-        res = funcs.EnumerateDeviceExtensionProperties(
-            device, nullptr, &count, properties.data());
-        if (res != VK_SUCCESS && res != VK_INCOMPLETE)
-            throw ls::vulkan_error(res,
-                "vkEnumerateDeviceExtensionProperties() failed");
-        if (res == VK_SUCCESS)
-            break;
-
-        res = funcs.EnumerateDeviceExtensionProperties(
-            device, nullptr, &count, nullptr);
-        if (res != VK_SUCCESS)
-            throw ls::vulkan_error(res,
-                "vkEnumerateDeviceExtensionProperties() failed");
-    }
-    properties.resize(count);
-
-    std::vector<std::string> extensions;
-    extensions.reserve(properties.size());
-    for (const auto& property : properties)
-        extensions.emplace_back(std::to_array(property.extensionName).data());
-    std::ranges::sort(extensions);
-    extensions.erase(std::unique(extensions.begin(), extensions.end()), extensions.end());
-    return extensions;
+std::vector<std::string> vk::enumerateDeviceExtensionNames(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkPhysicalDevice device) {
+    return enumerateDeviceExtensionNamesImpl(funcs, device);
 }
 
 std::vector<PhysicalDeviceSnapshot> vk::snapshotPhysicalDevices(
         const VulkanInstanceFuncs& funcs,
         const std::vector<VkPhysicalDevice>& devices) {
-    std::vector<PhysicalDeviceSnapshot> snapshots;
-    snapshots.reserve(devices.size());
-    for (const auto& device : devices) {
-        auto extensions = enumerateDeviceExtensionNames(funcs, device);
-        snapshots.push_back({
-            .identity = queryPhysicalDeviceIdentity(funcs, device, extensions),
-            .advertisedDeviceExtensions = std::move(extensions)
-        });
-    }
-    return snapshots;
+    return snapshotPhysicalDevicesImpl(funcs, devices);
+}
+
+std::vector<PhysicalDeviceSnapshot> vk::snapshotPhysicalDevices(
+        const VulkanInstanceInventoryFuncs& funcs,
+        const std::vector<VkPhysicalDevice>& devices) {
+    return snapshotPhysicalDevicesImpl(funcs, devices);
 }
 
 std::vector<PhysicalDeviceSnapshot> vk::enumeratePhysicalDeviceSnapshots(
         const VulkanInstanceFuncs& funcs,
         VkInstance instance) {
-    return snapshotPhysicalDevices(funcs,
-        enumeratePhysicalDeviceHandles(funcs, instance));
+    return enumeratePhysicalDeviceSnapshotsImpl(funcs, instance);
+}
+
+std::vector<PhysicalDeviceSnapshot> vk::enumeratePhysicalDeviceSnapshots(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkInstance instance) {
+    return enumeratePhysicalDeviceSnapshotsImpl(funcs, instance);
 }
 
 DeviceSelectionResult vk::resolveDeviceSelection(

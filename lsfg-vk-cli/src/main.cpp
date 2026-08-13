@@ -2,6 +2,7 @@
 
 #include "tools/benchmark.hpp"
 #include "tools/debug.hpp"
+#include "tools/devices.hpp"
 #include "tools/validate.hpp"
 
 #include <array>
@@ -22,7 +23,7 @@ namespace {
 
     /// print usage information
     void usage(const std::string& prog, const std::string& command = {}) {
-        std::cerr << "Validate, benchmark, and debug lsfg-vk.\n\n"
+        std::cerr << "Inspect, validate, benchmark, and debug lsfg-vk.\n\n"
                      "USAGE:\n    " << prog;
 
         if (command == "validate")
@@ -31,6 +32,8 @@ namespace {
             std::cerr << " benchmark [OPTIONS]\n\n";
         else if (command == "debug")
             std::cerr << " debug [OPTIONS] <folder>\n\n";
+        else if (command == "devices")
+            std::cerr << " devices [--help]\n\n";
         else
             std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
 
@@ -39,6 +42,7 @@ R"(COMMANDS:
     validate    Validate a configuration file
     benchmark   Run a benchmark
     debug       Run lsfg-vk on a set of images
+    devices     List Vulkan devices visible to this process
     help        Show this help text
 
 GLOBAL OPTIONS:
@@ -48,6 +52,9 @@ SUBCOMMAND OPTIONS:
 
     validate
         -c, --config <PATH>             Optional path to the configuration file
+            --help                      Show this help text
+
+    devices
             --help                      Show this help text
 
     benchmark & debug
@@ -100,6 +107,20 @@ SUBCOMMAND OPTIONS:
         }
 
         std::exit(validate::run(opts));
+    }
+
+    /// parse the devices command options
+    [[noreturn]] void on_devices(int argc, char** argv, const std::string& prog) {
+        if (argc == 2 && std::string(argv[1]) == "--help") {
+            usage(prog, "devices");
+            std::exit(EXIT_SUCCESS);
+        }
+        if (argc != 1) {
+            usage(prog, "devices");
+            std::exit(EXIT_FAILURE);
+        }
+
+        std::exit(devices::run());
     }
 
     /// parse the benchmark command options
@@ -248,6 +269,8 @@ int main(int argc, char** argv) {
     }
     if (command == "validate")
         on_validate(argc - 1, argv + 1, prog);
+    else if (command == "devices")
+        on_devices(argc - 1, argv + 1, prog);
     else if (command == "benchmark")
         on_benchmark(argc - 1, argv + 1, prog);
     else if (command == "debug")

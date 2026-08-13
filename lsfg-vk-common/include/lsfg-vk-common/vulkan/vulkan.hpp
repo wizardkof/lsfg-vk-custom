@@ -17,6 +17,14 @@
 
 namespace vk {
 
+    /// Vulkan instance functions required for physical-device inventory.
+    struct VulkanInstanceInventoryFuncs {
+        PFN_vkDestroyInstance DestroyInstance;
+        PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
+        PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
+        PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+    };
+
     /// vulkan instance function pointers
     struct VulkanInstanceFuncs {
         PFN_vkDestroyInstance DestroyInstance;
@@ -143,6 +151,24 @@ namespace vk {
         uint8_t major{};
         uint8_t minor{};
         uint8_t patch{};
+    };
+
+    /// Standalone Vulkan instance for physical-device inventory only.
+    class VulkanInventoryInstance {
+    public:
+        /// Create a Vulkan 1.1 instance without enabling instance extensions.
+        /// @throws ls::vulkan_error when the loader is unavailable, Vulkan 1.1
+        /// is unsupported, instance creation fails, or a required function is unavailable.
+        VulkanInventoryInstance(const std::string& appName, version appVersion,
+            const std::string& engineName, version engineVersion);
+
+        /// Get the Vulkan instance.
+        [[nodiscard]] const auto& inst() const { return this->instance.get(); }
+        /// Get the complete inventory-only instance function table.
+        [[nodiscard]] const auto& fi() const { return this->instance_funcs; }
+    private:
+        ls::owned_ptr<VkInstance> instance;
+        VulkanInstanceInventoryFuncs instance_funcs;
     };
 
     /// vulkan instance

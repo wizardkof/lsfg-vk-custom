@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
@@ -23,6 +24,7 @@ namespace {
     std::vector<FakeDevice> devices;
     bool returnIncompleteOnce{};
     size_t physicalDeviceCountQueries{};
+    VkResult physicalDeviceEnumerationResult{VK_SUCCESS};
 
     vk::DeviceUuid uuid(uint8_t suffix) {
         vk::DeviceUuid value{};
@@ -61,6 +63,9 @@ namespace {
             VkInstance,
             uint32_t* count,
             VkPhysicalDevice* properties) {
+        if (physicalDeviceEnumerationResult != VK_SUCCESS)
+            return physicalDeviceEnumerationResult;
+
         if (!properties) {
             ++physicalDeviceCountQueries;
             *count = returnIncompleteOnce && physicalDeviceCountQueries == 1
@@ -134,6 +139,20 @@ namespace {
         };
     }
 
+    VKAPI_ATTR void VKAPI_CALL destroyInstance(
+            VkInstance,
+            const VkAllocationCallbacks*) {
+    }
+
+    vk::VulkanInstanceInventoryFuncs fakeInventoryFunctions() {
+        return {
+            .DestroyInstance = destroyInstance,
+            .EnumeratePhysicalDevices = enumeratePhysicalDevices,
+            .EnumerateDeviceExtensionProperties = enumerateDeviceExtensions,
+            .GetPhysicalDeviceProperties2 = getPhysicalDeviceProperties2
+        };
+    }
+
     vk::PhysicalDeviceSnapshot snapshot(const vk::PhysicalDeviceIdentity& value) {
         return {.identity = value};
     }
@@ -145,6 +164,22 @@ int main() {
     const auto handleA = reinterpret_cast<VkPhysicalDevice>(uintptr_t{1});
     const auto handleB = reinterpret_cast<VkPhysicalDevice>(uintptr_t{2});
 
+    devices.clear();
+    physicalDeviceCountQueries = 0;
+    auto enumerated = vk::enumeratePhysicalDeviceSnapshots(
+        fakeInventoryFunctions(), reinterpret_cast<VkInstance>(uintptr_t{1}));
+    assert(enumerated.empty());
+
+    physicalDeviceEnumerationResult = VK_ERROR_INITIALIZATION_FAILED;
+    try {
+        static_cast<void>(vk::enumeratePhysicalDeviceSnapshots(
+            fakeInventoryFunctions(), reinterpret_cast<VkInstance>(uintptr_t{1})));
+        assert(false && "enumeration failure should throw");
+    } catch (const ls::vulkan_error& error) {
+        assert(error.error() == VK_ERROR_INITIALIZATION_FAILED);
+    }
+    physicalDeviceEnumerationResult = VK_SUCCESS;
+
     devices = {{
         .handle = handleA,
         .identity = gpuA,
@@ -155,7 +190,7 @@ int main() {
         }
     }};
     physicalDeviceCountQueries = 0;
-    auto enumerated = vk::enumeratePhysicalDeviceSnapshots(
+    enumerated = vk::enumeratePhysicalDeviceSnapshots(
         fakeFunctions(), reinterpret_cast<VkInstance>(uintptr_t{1}));
     assert(enumerated.size() == 1);
     assert(enumerated.front().identity.samePhysicalDevice(gpuA));

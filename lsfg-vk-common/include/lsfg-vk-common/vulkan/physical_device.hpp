@@ -14,6 +14,7 @@
 namespace vk {
 
     struct VulkanInstanceFuncs;
+    struct VulkanInstanceInventoryFuncs;
 
     using DeviceUuid = std::array<uint8_t, VK_UUID_SIZE>;
 
@@ -87,10 +88,18 @@ namespace vk {
         const VulkanInstanceFuncs& funcs,
         VkPhysicalDevice device
     );
+    [[nodiscard]] PhysicalDeviceIdentity getPhysicalDeviceIdentity(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkPhysicalDevice device
+    );
 
     /// Enumerate and sort all device extension names advertised by a physical device.
     [[nodiscard]] std::vector<std::string> enumerateDeviceExtensionNames(
         const VulkanInstanceFuncs& funcs,
+        VkPhysicalDevice device
+    );
+    [[nodiscard]] std::vector<std::string> enumerateDeviceExtensionNames(
+        const VulkanInstanceInventoryFuncs& funcs,
         VkPhysicalDevice device
     );
 
@@ -99,10 +108,18 @@ namespace vk {
         const VulkanInstanceFuncs& funcs,
         const std::vector<VkPhysicalDevice>& devices
     );
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> snapshotPhysicalDevices(
+        const VulkanInstanceInventoryFuncs& funcs,
+        const std::vector<VkPhysicalDevice>& devices
+    );
 
     /// Enumerate all physical devices visible to an instance and snapshot each one.
     [[nodiscard]] std::vector<PhysicalDeviceSnapshot> enumeratePhysicalDeviceSnapshots(
         const VulkanInstanceFuncs& funcs,
+        VkInstance instance
+    );
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> enumeratePhysicalDeviceSnapshots(
+        const VulkanInstanceInventoryFuncs& funcs,
         VkInstance instance
     );
 

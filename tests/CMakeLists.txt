@@ -101,8 +101,30 @@ add_test(
     COMMAND lsfg-vk-test-physical-device-diagnostics)
 
 if(LSFGVK_BUILD_CLI)
+    add_executable(lsfg-vk-test-cli-devices
+        cli_devices_test.cpp
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/devices.cpp")
+
+    target_compile_options(lsfg-vk-test-cli-devices PRIVATE
+        -UNDEBUG
+        -Wno-unknown-warning-option)
+
+    target_include_directories(lsfg-vk-test-cli-devices PRIVATE
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src")
+
+    target_link_libraries(lsfg-vk-test-cli-devices
+        PRIVATE lsfg-vk-common)
+
+    add_test(NAME lsfg-vk-test-cli-devices
+        COMMAND lsfg-vk-test-cli-devices)
     add_test(NAME lsfg-vk-test-cli-help
         COMMAND lsfg-vk-cli --help)
+    add_test(NAME lsfg-vk-test-cli-devices-help
+        COMMAND lsfg-vk-cli devices --help)
+    add_test(NAME lsfg-vk-test-cli-devices-invalid-argument
+        COMMAND lsfg-vk-cli devices invalid)
+    set_tests_properties(lsfg-vk-test-cli-devices-invalid-argument
+        PROPERTIES WILL_FAIL TRUE)
     add_test(NAME lsfg-vk-test-cli-validate-help
         COMMAND lsfg-vk-cli validate --help)
     add_test(NAME lsfg-vk-test-cli-benchmark-help
