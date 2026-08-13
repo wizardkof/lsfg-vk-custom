@@ -6,6 +6,7 @@
 #include "swapchain.hpp"
 #include "lsfg-vk-common/configuration/detection.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
@@ -203,6 +204,8 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
         throw ls::error("attempted to create swapchain context while layer is inactive");
     const auto& profile = snapshot.activeProfile();
     const auto& global = snapshot.global;
+    const auto applicationIdentity = vk::getPhysicalDeviceIdentity(
+        vk.fi(), vk.physdev());
 
     const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
 
@@ -217,20 +220,31 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
                 dll = ls::findShaderDll();
 
             this->backend.emplace(
-                [gpu = profile.gpu](
-                    const std::string& deviceName,
-                    std::pair<const std::string&, const std::string&> ids,
-                    const std::optional<std::string>& pci
-                ) {
+                [gpu = profile.gpu, applicationIdentity](
+                    const vk::PhysicalDeviceIdentity& candidate) {
                     if (!gpu)
-                        return true;
+                        return candidate.samePhysicalDevice(applicationIdentity);
 
-                    return (deviceName == *gpu)
-                        || (ids.first + ":" + ids.second == *gpu)
-                        || (pci && *pci == *gpu);
+                    return candidate.matchesSelector(*gpu);
                 },
                 dll, global.allow_fp16
             );
+
+            const auto& generationIdentity = this->backend->deviceIdentity();
+            std::cerr << "lsfg-vk: application GPU: "
+                << applicationIdentity.name
+                << " (deviceUUID=" << vk::formatUuid(applicationIdentity.deviceUuid)
+                << ", driverUUID=" << vk::formatUuid(applicationIdentity.driverUuid);
+            if (applicationIdentity.pci.has_value())
+                std::cerr << ", pci=" << applicationIdentity.pci->identifier();
+            std::cerr << ")\n";
+            std::cerr << "lsfg-vk: frame generation GPU: "
+                << generationIdentity.name
+                << " (deviceUUID=" << vk::formatUuid(generationIdentity.deviceUuid)
+                << ", driverUUID=" << vk::formatUuid(generationIdentity.driverUuid);
+            if (generationIdentity.pci.has_value())
+                std::cerr << ", pci=" << generationIdentity.pci->identifier();
+            std::cerr << ")\n";
         } catch (const std::exception& e) {
             unsetenv("DISABLE_LSFGVK");
             throw ls::error("failed to create backend instance", e);
@@ -238,6 +252,10 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
 
         unsetenv("DISABLE_LSFGVK");
     }
+
+    if (!profile.gpu
+            && !this->backend->deviceIdentity().samePhysicalDevice(applicationIdentity))
+        throw ls::error("default frame generation GPU does not match the application GPU");
 
     this->swapchains.emplace(swapchain,
         Swapchain(vk, this->backend.mut(), profile, info));

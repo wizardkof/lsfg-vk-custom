@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
+
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -45,12 +47,8 @@ namespace lsfgvk::backend {
         ~error() override;
     };
 
-    /// Function type for picking a device based on its name and IDs
-    using DevicePicker = std::function<bool(
-        const std::string& deviceName,
-        std::pair<const std::string&, const std::string&> ids, // (vendor ID, device ID) 0xXXXX format
-        const std::optional<std::string>& pci // (bus:slot.func) if available, no padded zeros
-    )>;
+    /// Function type for picking a device based on its stable identity.
+    using DevicePicker = std::function<bool(const vk::PhysicalDeviceIdentity& identity)>;
 
     ///
     /// Main entry point of the library
@@ -71,6 +69,9 @@ namespace lsfgvk::backend {
             const std::filesystem::path& shaderDllPath,
             bool allowLowPrecision
         );
+
+        /// Identity of the physical device selected for frame generation.
+        [[nodiscard]] const vk::PhysicalDeviceIdentity& deviceIdentity() const;
 
         ///
         /// Open a frame generation context.

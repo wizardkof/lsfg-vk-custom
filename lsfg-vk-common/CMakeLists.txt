@@ -9,6 +9,7 @@ set(COMMON_SOURCES
     "src/vulkan/descriptor_set.cpp"
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
+    "src/vulkan/physical_device.cpp"
     "src/vulkan/sampler.cpp"
     "src/vulkan/semaphore.cpp"
     "src/vulkan/shader.cpp"

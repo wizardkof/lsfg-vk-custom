@@ -6,6 +6,7 @@
 
 #include "utils.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -24,11 +25,12 @@ QStringList ui::getAvailableGPUs() {
     // create a backend to query all GPUs
     try {
         const backend::DevicePicker picker{[&gpus](
-            const std::string& deviceName,
-            std::pair<const std::string&, const std::string&>,
-            const std::optional<std::string>& pci
+            const vk::PhysicalDeviceIdentity& identity
         ) {
-            gpus.emplace_back(deviceName, pci);
+            gpus.emplace_back(identity.name,
+                identity.pci.has_value()
+                    ? std::optional<std::string>{identity.pci->legacyIdentifier()}
+                    : std::nullopt);
             return false; // always fail
         }};
 

@@ -5,10 +5,10 @@
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/paths.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -65,22 +65,16 @@ int benchmark::run(const Options& opts) {
                     return devices.front();
 
                 for (const VkPhysicalDevice& device : devices) {
-                    VkPhysicalDeviceProperties2 props{
-                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
-                    };
-                    fi.GetPhysicalDeviceProperties2(device, &props);
-
-                    auto& properties = props.properties;
-                    std::array<char, 256> devname = std::to_array(properties.deviceName);
-                    devname.at(255) = '\0'; // ensure null-termination
-
-                    if (std::string(devname.data()) == *opts.gpu)
+                    if (vk::getPhysicalDeviceIdentity(fi, device)
+                            .matchesSelector(*opts.gpu))
                         return device;
                 }
 
                 throw ls::error("failed to find specified GPU: " + *opts.gpu);
             }
         };
+        const auto applicationIdentity = vk::getPhysicalDeviceIdentity(
+            vk.fi(), vk.physdev());
 
         std::pair<int, int> srcfds{};
         const vk::Image frame_0{vk,
@@ -116,12 +110,10 @@ int benchmark::run(const Options& opts) {
             dll = ls::findShaderDll();
 
         lsfgvk::backend::Instance lsfgvk{
-            [opts](
-                const std::string& gpu_name,
-                std::pair<const std::string&, const std::string&>,
-                const std::optional<std::string>&
-            ) {
-                return opts.gpu.value_or(gpu_name) == gpu_name;
+            [opts, applicationIdentity](const vk::PhysicalDeviceIdentity& candidate) {
+                if (!opts.gpu.has_value())
+                    return candidate.samePhysicalDevice(applicationIdentity);
+                return candidate.matchesSelector(*opts.gpu);
             },
             dll, opts.allow_fp16
         };

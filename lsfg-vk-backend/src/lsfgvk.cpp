@@ -11,6 +11,7 @@
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "shaderchains/alpha0.hpp"
@@ -70,6 +71,8 @@ namespace lsfgvk::backend {
         /// get the Vulkan instance
         /// @return the Vulkan instance
         [[nodiscard]] const auto& getVulkan() const { return this->vk; }
+        /// get the selected physical device identity
+        [[nodiscard]] const auto& getDeviceIdentity() const { return this->deviceIdentity; }
         /// get the shader registry
         /// @return the shader registry
         [[nodiscard]] const auto& getShaderRegistry() const { return this->shaders; }
@@ -86,6 +89,7 @@ namespace lsfgvk::backend {
         ~InstanceImpl();
     private:
         vk::Vulkan vk;
+        vk::PhysicalDeviceIdentity deviceIdentity;
         ShaderRegistry shaders;
 
 #ifdef LSFGVK_TESTING_RENDERDOC
@@ -146,42 +150,7 @@ Instance::Instance(
     const auto selectFunc = [&devicePicker](const vk::VulkanInstanceFuncs funcs,
             const std::vector<VkPhysicalDevice>& devices) {
         for (const auto& device : devices) {
-            // check if the physical device supports VK_EXT_pci_bus_info
-            uint32_t ext_count{};
-            funcs.EnumerateDeviceExtensionProperties(device, nullptr, &ext_count, VK_NULL_HANDLE);
-
-            std::vector<VkExtensionProperties> extensions(ext_count);
-            funcs.EnumerateDeviceExtensionProperties(device, nullptr, &ext_count, extensions.data());
-
-            const bool has_pci_ext = std::ranges::find_if(extensions,
-                [](const VkExtensionProperties& ext) {
-                    return std::string(std::to_array(ext.extensionName).data())
-                        == VK_EXT_PCI_BUS_INFO_EXTENSION_NAME;
-                }) != extensions.end();
-
-            // then fetch all available properties
-            VkPhysicalDevicePCIBusInfoPropertiesEXT pciInfo{
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT
-            };
-            VkPhysicalDeviceProperties2 props{
-                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-                .pNext = has_pci_ext ? &pciInfo : nullptr
-            };
-            funcs.GetPhysicalDeviceProperties2(device, &props);
-
-            std::array<char, 256> devname = std::to_array(props.properties.deviceName);
-            devname.at(255) = '\0'; // ensure null-termination
-
-            if (devicePicker(
-                std::string(devname.data()),
-                { backend::to_hex_id(props.properties.vendorID),
-                  backend::to_hex_id(props.properties.deviceID) },
-                has_pci_ext ? std::optional<std::string>{
-                    std::to_string(pciInfo.pciBus) + ":" +
-                    std::to_string(pciInfo.pciDevice) + "." +
-                    std::to_string(pciInfo.pciFunction)
-                } : std::nullopt
-            ))
+            if (devicePicker(vk::getPhysicalDeviceIdentity(funcs, device)))
                 return device;
         }
 
@@ -267,12 +236,18 @@ InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
             const std::filesystem::path& shaderDllPath,
             bool allowLowPrecision)
         : vk(createVulkanInstance(selectPhysicalDevice)),
+        deviceIdentity(vk::getPhysicalDeviceIdentity(
+            this->vk.fi(), this->vk.physdev())),
         shaders(createShaderRegistry(this->vk, shaderDllPath,
             allowLowPrecision && vk.supportsFP16())) {
 #ifdef LSFGVK_TESTING_RENDERDOC
     this->renderdoc = loadRenderDocIntegration();
 #endif
     vk.persistPipelineCache(); // will silently fail
+}
+
+const vk::PhysicalDeviceIdentity& Instance::deviceIdentity() const {
+    return this->m_impl->getDeviceIdentity();
 }
 
 Context& Instance::openContext(std::pair<int, int> sourceFds, const std::vector<int>& destFds,
