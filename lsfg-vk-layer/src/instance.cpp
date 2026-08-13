@@ -10,6 +10,7 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -47,6 +48,137 @@ namespace {
         }
 
         return extensions;
+    }
+
+    [[nodiscard]] const char* yesNo(bool value) {
+        return value ? "YES" : "NO";
+    }
+
+    [[nodiscard]] const char* selectionResolutionName(
+            vk::DeviceSelectionResolution resolution) {
+        switch (resolution) {
+            case vk::DeviceSelectionResolution::Selected:
+                return "Selected";
+            case vk::DeviceSelectionResolution::ApplicationDeviceNotVisibleToBackend:
+                return "ApplicationDeviceNotVisibleToBackend";
+            case vk::DeviceSelectionResolution::SelectorNotFoundInBackend:
+                return "SelectorNotFoundInBackend";
+            case vk::DeviceSelectionResolution::SelectorAmbiguous:
+                return "SelectorAmbiguous";
+        }
+        return "Unknown";
+    }
+
+    [[nodiscard]] const char* driverRelationshipName(
+            vk::DriverUuidRelationship relationship) {
+        switch (relationship) {
+            case vk::DriverUuidRelationship::Same:
+                return "YES";
+            case vk::DriverUuidRelationship::Different:
+                return "NO";
+            case vk::DriverUuidRelationship::Unknown:
+                return "UNKNOWN";
+        }
+        return "UNKNOWN";
+    }
+
+    void logPhysicalDeviceIdentity(const vk::PhysicalDeviceIdentity& identity) {
+        std::cerr << "  Name: " << identity.name << "\n"
+            << "  Device UUID: " << vk::formatUuid(identity.deviceUuid) << "\n"
+            << "  Driver UUID: " << vk::formatUuid(identity.driverUuid) << "\n"
+            << "  PCI: " << (identity.pci.has_value()
+                ? identity.pci->identifier() : "<unavailable>") << "\n";
+    }
+
+    [[nodiscard]] bool extensionAdvertised(
+            const vk::PhysicalDeviceSnapshot& snapshot,
+            const char* extensionName) {
+        return std::ranges::binary_search(
+            snapshot.advertisedDeviceExtensions, std::string(extensionName));
+    }
+
+    void logVulkanEnvironment() {
+        constexpr std::array<const char*, 8> VARIABLES{
+            "DRI_PRIME",
+            "MESA_VK_DEVICE_SELECT",
+            "MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE",
+            "VK_DRIVER_FILES",
+            "VK_ICD_FILENAMES",
+            "VK_ADD_DRIVER_FILES",
+            "VK_LOADER_DRIVERS_SELECT",
+            "VK_LOADER_DRIVERS_DISABLE"
+        };
+
+        std::cerr << "[DG2A] Vulkan environment\n";
+        for (const auto* variable : VARIABLES) {
+            const char* value = std::getenv(variable);
+            std::cerr << "  " << variable << ": "
+                << (value && *value != '\0' ? value : "<unset>") << "\n";
+        }
+    }
+
+    void logDeviceSelectionDiagnostic(
+            const vk::PhysicalDeviceIdentity& applicationIdentity,
+            const std::vector<vk::PhysicalDeviceSnapshot>& backendDevices,
+            bool backendEnumerationObserved,
+            const std::optional<std::string>& selector,
+            const std::optional<vk::PhysicalDeviceIdentity>& generationIdentity) {
+        std::cerr << "[DG2A] Application GPU\n";
+        logPhysicalDeviceIdentity(applicationIdentity);
+
+        if (!backendEnumerationObserved) {
+            std::cerr << "[DG2A] Backend-visible devices: <enumeration unavailable>\n"
+                << "[DG2A] Selection\n"
+                << "  Requested: " << (selector.has_value() ? *selector : "Default") << "\n"
+                << "  Resolution: <unavailable>\n"
+                << "  Same physical device: UNKNOWN\n"
+                << "  Same driver UUID: UNKNOWN\n"
+                << "  Cross-GPU required: UNKNOWN\n";
+            logVulkanEnvironment();
+            return;
+        }
+
+        std::cerr << "[DG2A] Backend-visible devices: " << backendDevices.size() << "\n";
+        for (size_t i = 0; i < backendDevices.size(); ++i) {
+            const auto& snapshot = backendDevices.at(i);
+            std::cerr << "[" << i << "]\n";
+            logPhysicalDeviceIdentity(snapshot.identity);
+            constexpr std::array<const char*, 7> RELEVANT_EXTENSIONS{
+                VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+                VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+                VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+                VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+                VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME
+            };
+            for (const auto* extension : RELEVANT_EXTENSIONS)
+                std::cerr << "  " << extension << " advertised: "
+                    << yesNo(extensionAdvertised(snapshot, extension)) << "\n";
+        }
+
+        const auto selection = vk::resolveDeviceSelection(
+            backendDevices, applicationIdentity, selector);
+        std::cerr << "[DG2A] Selection\n"
+            << "  Requested: " << (selector.has_value() ? *selector : "Default") << "\n"
+            << "  Resolution: " << selectionResolutionName(selection.resolution) << "\n";
+        if (selection.resolution == vk::DeviceSelectionResolution::SelectorAmbiguous)
+            std::cerr << "  Matching backend devices: " << selection.matchCount
+                << " (existing first-match behavior preserved)\n";
+
+        if (generationIdentity.has_value()) {
+            const bool samePhysicalDevice = applicationIdentity.samePhysicalDevice(
+                *generationIdentity);
+            std::cerr << "  Same physical device: " << yesNo(samePhysicalDevice) << "\n"
+                << "  Same driver UUID: " << driverRelationshipName(
+                    vk::compareDriverUuids(applicationIdentity, *generationIdentity)) << "\n"
+                << "  Cross-GPU required: " << yesNo(!samePhysicalDevice) << "\n";
+        } else {
+            std::cerr << "  Same physical device: UNKNOWN\n"
+                << "  Same driver UUID: UNKNOWN\n"
+                << "  Cross-GPU required: UNKNOWN\n";
+        }
+        logVulkanEnvironment();
     }
 }
 
@@ -212,6 +344,10 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
     if (!this->backend.has_value()) { // emplace backend late, due to loader bug
         setenv("DISABLE_LSFGVK", "1", 1);
 
+        std::vector<vk::PhysicalDeviceSnapshot> backendDevices;
+        bool backendEnumerationObserved{false};
+        bool diagnosticLogged{false};
+        std::optional<vk::PhysicalDeviceIdentity> selectedIdentity;
         try {
             std::string dll{};
             if (global.dll.has_value())
@@ -219,33 +355,40 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
             else
                 dll = ls::findShaderDll();
 
-            this->backend.emplace(
-                [gpu = profile.gpu, applicationIdentity](
+            const backend::DevicePicker picker{
+                [gpu = profile.gpu, applicationIdentity, &selectedIdentity](
                     const vk::PhysicalDeviceIdentity& candidate) {
-                    if (!gpu)
-                        return candidate.samePhysicalDevice(applicationIdentity);
-
-                    return candidate.matchesSelector(*gpu);
-                },
-                dll, global.allow_fp16
+                    const bool selected = !gpu
+                        ? candidate.samePhysicalDevice(applicationIdentity)
+                        : candidate.matchesSelector(*gpu);
+                    if (selected && !selectedIdentity.has_value())
+                        selectedIdentity = candidate;
+                    return selected;
+                }
+            };
+            const backend::DeviceEnumerationObserver observer{
+                [&backendDevices, &backendEnumerationObserved](
+                        const std::vector<vk::PhysicalDeviceSnapshot>& devices) {
+                    backendDevices = devices;
+                    backendEnumerationObserved = true;
+                }
+            };
+            this->backend.emplace(
+                picker,
+                dll, global.allow_fp16,
+                observer
             );
 
             const auto& generationIdentity = this->backend->deviceIdentity();
-            std::cerr << "lsfg-vk: application GPU: "
-                << applicationIdentity.name
-                << " (deviceUUID=" << vk::formatUuid(applicationIdentity.deviceUuid)
-                << ", driverUUID=" << vk::formatUuid(applicationIdentity.driverUuid);
-            if (applicationIdentity.pci.has_value())
-                std::cerr << ", pci=" << applicationIdentity.pci->identifier();
-            std::cerr << ")\n";
-            std::cerr << "lsfg-vk: frame generation GPU: "
-                << generationIdentity.name
-                << " (deviceUUID=" << vk::formatUuid(generationIdentity.deviceUuid)
-                << ", driverUUID=" << vk::formatUuid(generationIdentity.driverUuid);
-            if (generationIdentity.pci.has_value())
-                std::cerr << ", pci=" << generationIdentity.pci->identifier();
-            std::cerr << ")\n";
+            logDeviceSelectionDiagnostic(applicationIdentity,
+                backendDevices, backendEnumerationObserved,
+                profile.gpu, generationIdentity);
+            diagnosticLogged = true;
         } catch (const std::exception& e) {
+            if (!diagnosticLogged)
+                logDeviceSelectionDiagnostic(applicationIdentity,
+                    backendDevices, backendEnumerationObserved,
+                    profile.gpu, selectedIdentity);
             unsetenv("DISABLE_LSFGVK");
             throw ls::error("failed to create backend instance", e);
         }

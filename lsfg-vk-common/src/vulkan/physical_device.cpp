@@ -12,6 +12,7 @@
 #include <ios>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <vulkan/vulkan_core.h>
@@ -20,42 +21,80 @@ using namespace vk;
 
 namespace {
     [[nodiscard]] bool hasDeviceExtension(
+            const std::vector<std::string>& extensions,
+            const char* extensionName) {
+        return std::ranges::binary_search(extensions, std::string(extensionName));
+    }
+
+    [[nodiscard]] PhysicalDeviceIdentity queryPhysicalDeviceIdentity(
             const VulkanInstanceFuncs& funcs,
             VkPhysicalDevice device,
-            const char* extensionName) {
+            const std::vector<std::string>& extensions) {
+        const bool hasPciBusInfo = hasDeviceExtension(
+            extensions, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
+
+        VkPhysicalDevicePCIBusInfoPropertiesEXT pciProperties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT
+        };
+        VkPhysicalDeviceIDProperties idProperties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+            .pNext = hasPciBusInfo ? &pciProperties : nullptr
+        };
+        VkPhysicalDeviceProperties2 properties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &idProperties
+        };
+        funcs.GetPhysicalDeviceProperties2(device, &properties);
+
+        const auto deviceName = std::to_array(properties.properties.deviceName);
+        PhysicalDeviceIdentity identity{
+            .name = deviceName.data(),
+            .vendorId = properties.properties.vendorID,
+            .deviceId = properties.properties.deviceID,
+            .deviceUuid = std::to_array(idProperties.deviceUUID),
+            .driverUuid = std::to_array(idProperties.driverUUID)
+        };
+        if (hasPciBusInfo) {
+            identity.pci = PciBusInfo{
+                .domain = pciProperties.pciDomain,
+                .bus = pciProperties.pciBus,
+                .device = pciProperties.pciDevice,
+                .function = pciProperties.pciFunction
+            };
+        }
+
+        return identity;
+    }
+
+    [[nodiscard]] std::vector<VkPhysicalDevice> enumeratePhysicalDeviceHandles(
+            const VulkanInstanceFuncs& funcs,
+            VkInstance instance) {
         uint32_t count{};
-        auto res = funcs.EnumerateDeviceExtensionProperties(
-            device, nullptr, &count, nullptr);
+        auto res = funcs.EnumeratePhysicalDevices(instance, &count, nullptr);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res,
-                "vkEnumerateDeviceExtensionProperties() failed");
+                "vkEnumeratePhysicalDevices() failed");
         if (count == 0)
-            return false;
+            return {};
 
-        std::vector<VkExtensionProperties> extensions;
+        std::vector<VkPhysicalDevice> devices;
         while (true) {
-            extensions.resize(count);
-            res = funcs.EnumerateDeviceExtensionProperties(
-                device, nullptr, &count, extensions.data());
+            devices.resize(count);
+            res = funcs.EnumeratePhysicalDevices(
+                instance, &count, devices.data());
             if (res != VK_SUCCESS && res != VK_INCOMPLETE)
                 throw ls::vulkan_error(res,
-                    "vkEnumerateDeviceExtensionProperties() failed");
+                    "vkEnumeratePhysicalDevices() failed");
             if (res == VK_SUCCESS)
                 break;
 
-            res = funcs.EnumerateDeviceExtensionProperties(
-                device, nullptr, &count, nullptr);
+            res = funcs.EnumeratePhysicalDevices(instance, &count, nullptr);
             if (res != VK_SUCCESS)
                 throw ls::vulkan_error(res,
-                    "vkEnumerateDeviceExtensionProperties() failed");
+                    "vkEnumeratePhysicalDevices() failed");
         }
-        extensions.resize(count);
-
-        return std::ranges::any_of(extensions,
-            [extensionName](const VkExtensionProperties& extension) {
-                const auto name = std::to_array(extension.extensionName);
-                return std::string(name.data()) == extensionName;
-            });
+        devices.resize(count);
+        return devices;
     }
 
     [[nodiscard]] std::string hexId(uint32_t id) {
@@ -117,38 +156,115 @@ std::string vk::formatUuid(const DeviceUuid& uuid) {
 PhysicalDeviceIdentity vk::getPhysicalDeviceIdentity(
         const VulkanInstanceFuncs& funcs,
         VkPhysicalDevice device) {
-    const bool hasPciBusInfo = hasDeviceExtension(
-        funcs, device, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
+    const auto extensions = enumerateDeviceExtensionNames(funcs, device);
+    return queryPhysicalDeviceIdentity(funcs, device, extensions);
+}
 
-    VkPhysicalDevicePCIBusInfoPropertiesEXT pciProperties{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT
-    };
-    VkPhysicalDeviceIDProperties idProperties{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
-        .pNext = hasPciBusInfo ? &pciProperties : nullptr
-    };
-    VkPhysicalDeviceProperties2 properties{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-        .pNext = &idProperties
-    };
-    funcs.GetPhysicalDeviceProperties2(device, &properties);
+std::vector<std::string> vk::enumerateDeviceExtensionNames(
+        const VulkanInstanceFuncs& funcs,
+        VkPhysicalDevice device) {
+    uint32_t count{};
+    auto res = funcs.EnumerateDeviceExtensionProperties(
+        device, nullptr, &count, nullptr);
+    if (res != VK_SUCCESS)
+        throw ls::vulkan_error(res,
+            "vkEnumerateDeviceExtensionProperties() failed");
+    if (count == 0)
+        return {};
 
-    const auto deviceName = std::to_array(properties.properties.deviceName);
-    PhysicalDeviceIdentity identity{
-        .name = deviceName.data(),
-        .vendorId = properties.properties.vendorID,
-        .deviceId = properties.properties.deviceID,
-        .deviceUuid = std::to_array(idProperties.deviceUUID),
-        .driverUuid = std::to_array(idProperties.driverUUID)
+    std::vector<VkExtensionProperties> properties;
+    while (true) {
+        properties.resize(count);
+        res = funcs.EnumerateDeviceExtensionProperties(
+            device, nullptr, &count, properties.data());
+        if (res != VK_SUCCESS && res != VK_INCOMPLETE)
+            throw ls::vulkan_error(res,
+                "vkEnumerateDeviceExtensionProperties() failed");
+        if (res == VK_SUCCESS)
+            break;
+
+        res = funcs.EnumerateDeviceExtensionProperties(
+            device, nullptr, &count, nullptr);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res,
+                "vkEnumerateDeviceExtensionProperties() failed");
+    }
+    properties.resize(count);
+
+    std::vector<std::string> extensions;
+    extensions.reserve(properties.size());
+    for (const auto& property : properties)
+        extensions.emplace_back(std::to_array(property.extensionName).data());
+    std::ranges::sort(extensions);
+    extensions.erase(std::unique(extensions.begin(), extensions.end()), extensions.end());
+    return extensions;
+}
+
+std::vector<PhysicalDeviceSnapshot> vk::snapshotPhysicalDevices(
+        const VulkanInstanceFuncs& funcs,
+        const std::vector<VkPhysicalDevice>& devices) {
+    std::vector<PhysicalDeviceSnapshot> snapshots;
+    snapshots.reserve(devices.size());
+    for (const auto& device : devices) {
+        auto extensions = enumerateDeviceExtensionNames(funcs, device);
+        snapshots.push_back({
+            .identity = queryPhysicalDeviceIdentity(funcs, device, extensions),
+            .advertisedDeviceExtensions = std::move(extensions)
+        });
+    }
+    return snapshots;
+}
+
+std::vector<PhysicalDeviceSnapshot> vk::enumeratePhysicalDeviceSnapshots(
+        const VulkanInstanceFuncs& funcs,
+        VkInstance instance) {
+    return snapshotPhysicalDevices(funcs,
+        enumeratePhysicalDeviceHandles(funcs, instance));
+}
+
+DeviceSelectionResult vk::resolveDeviceSelection(
+        const std::vector<PhysicalDeviceSnapshot>& backendDevices,
+        const PhysicalDeviceIdentity& applicationIdentity,
+        const std::optional<std::string>& selector) {
+    DeviceSelectionResult result{
+        .resolution = selector.has_value()
+            ? DeviceSelectionResolution::SelectorNotFoundInBackend
+            : DeviceSelectionResolution::ApplicationDeviceNotVisibleToBackend
     };
-    if (hasPciBusInfo) {
-        identity.pci = PciBusInfo{
-            .domain = pciProperties.pciDomain,
-            .bus = pciProperties.pciBus,
-            .device = pciProperties.pciDevice,
-            .function = pciProperties.pciFunction
-        };
+
+    for (size_t i = 0; i < backendDevices.size(); ++i) {
+        const auto& identity = backendDevices.at(i).identity;
+        const bool matches = selector.has_value()
+            ? identity.matchesSelector(*selector)
+            : identity.samePhysicalDevice(applicationIdentity);
+        if (!matches)
+            continue;
+
+        if (!result.selectedIndex.has_value())
+            result.selectedIndex = i;
+        ++result.matchCount;
     }
 
-    return identity;
+    if (result.matchCount == 0)
+        return result;
+
+    result.resolution = selector.has_value() && result.matchCount > 1
+        ? DeviceSelectionResolution::SelectorAmbiguous
+        : DeviceSelectionResolution::Selected;
+    return result;
+}
+
+DriverUuidRelationship vk::compareDriverUuids(
+        const PhysicalDeviceIdentity& first,
+        const PhysicalDeviceIdentity& second) {
+    const auto valid = [](const DeviceUuid& uuid) {
+        return std::ranges::any_of(uuid,
+            [](uint8_t value) { return value != 0; });
+    };
+    if (!valid(first.driverUuid) || !valid(second.driverUuid))
+        return DriverUuidRelationship::Unknown;
+
+    return first.driverUuid == second.driverUuid
+        ? DriverUuidRelationship::Same
+        : DriverUuidRelationship::Different;
 }

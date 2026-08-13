@@ -49,6 +49,9 @@ namespace lsfgvk::backend {
 
     /// Function type for picking a device based on its stable identity.
     using DevicePicker = std::function<bool(const vk::PhysicalDeviceIdentity& identity)>;
+    /// One-shot observer for the complete backend-visible device inventory.
+    using DeviceEnumerationObserver = std::function<void(
+        const std::vector<vk::PhysicalDeviceSnapshot>& devices)>;
 
     ///
     /// Main entry point of the library
@@ -67,11 +70,14 @@ namespace lsfgvk::backend {
         Instance(
             const DevicePicker& devicePicker,
             const std::filesystem::path& shaderDllPath,
-            bool allowLowPrecision
+            bool allowLowPrecision,
+            const DeviceEnumerationObserver& deviceObserver = {}
         );
 
         /// Identity of the physical device selected for frame generation.
         [[nodiscard]] const vk::PhysicalDeviceIdentity& deviceIdentity() const;
+        /// Complete physical-device inventory seen by the backend VkInstance.
+        [[nodiscard]] const std::vector<vk::PhysicalDeviceSnapshot>& visibleDevices() const;
 
         ///
         /// Open a frame generation context.

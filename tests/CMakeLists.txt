@@ -86,6 +86,20 @@ add_test(
     NAME lsfg-vk-test-physical-device-identity
     COMMAND lsfg-vk-test-physical-device-identity)
 
+add_executable(lsfg-vk-test-physical-device-diagnostics
+    physical_device_diagnostics_test.cpp)
+
+target_compile_options(lsfg-vk-test-physical-device-diagnostics PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-physical-device-diagnostics
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-physical-device-diagnostics
+    COMMAND lsfg-vk-test-physical-device-diagnostics)
+
 if(LSFGVK_BUILD_CLI)
     add_test(NAME lsfg-vk-test-cli-help
         COMMAND lsfg-vk-cli --help)

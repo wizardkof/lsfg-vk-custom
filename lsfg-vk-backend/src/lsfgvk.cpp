@@ -65,6 +65,7 @@ namespace lsfgvk::backend {
         /// create an instance
         /// (see lsfg-vk documentation)
         InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
+            std::shared_ptr<std::vector<vk::PhysicalDeviceSnapshot>> observedDevices,
             const std::filesystem::path& shaderDllPath,
             bool allowLowPrecision);
 
@@ -73,6 +74,8 @@ namespace lsfgvk::backend {
         [[nodiscard]] const auto& getVulkan() const { return this->vk; }
         /// get the selected physical device identity
         [[nodiscard]] const auto& getDeviceIdentity() const { return this->deviceIdentity; }
+        /// get all physical devices visible to the backend instance
+        [[nodiscard]] const auto& getVisibleDevices() const { return this->visibleDevices; }
         /// get the shader registry
         /// @return the shader registry
         [[nodiscard]] const auto& getShaderRegistry() const { return this->shaders; }
@@ -89,6 +92,7 @@ namespace lsfgvk::backend {
         ~InstanceImpl();
     private:
         vk::Vulkan vk;
+        std::vector<vk::PhysicalDeviceSnapshot> visibleDevices;
         vk::PhysicalDeviceIdentity deviceIdentity;
         ShaderRegistry shaders;
 
@@ -146,19 +150,26 @@ namespace lsfgvk::backend {
 Instance::Instance(
         const DevicePicker& devicePicker,
         const std::filesystem::path& shaderDllPath,
-        bool allowLowPrecision) {
-    const auto selectFunc = [&devicePicker](const vk::VulkanInstanceFuncs funcs,
+        bool allowLowPrecision,
+        const DeviceEnumerationObserver& deviceObserver) {
+    auto observedDevices = std::make_shared<std::vector<vk::PhysicalDeviceSnapshot>>();
+    const auto selectFunc = [&devicePicker, &deviceObserver, observedDevices](
+            const vk::VulkanInstanceFuncs& funcs,
             const std::vector<VkPhysicalDevice>& devices) {
-        for (const auto& device : devices) {
-            if (devicePicker(vk::getPhysicalDeviceIdentity(funcs, device)))
-                return device;
+        *observedDevices = vk::snapshotPhysicalDevices(funcs, devices);
+        if (deviceObserver)
+            deviceObserver(*observedDevices);
+
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (devicePicker(observedDevices->at(i).identity))
+                return devices.at(i);
         }
 
         throw ls::vulkan_error("no suitable physical device found");
     };
 
     this->m_impl = std::make_unique<InstanceImpl>(
-        selectFunc, shaderDllPath, allowLowPrecision
+        selectFunc, observedDevices, shaderDllPath, allowLowPrecision
     );
 }
 
@@ -233,9 +244,11 @@ namespace {
 }
 
 InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
+            std::shared_ptr<std::vector<vk::PhysicalDeviceSnapshot>> observedDevices,
             const std::filesystem::path& shaderDllPath,
             bool allowLowPrecision)
         : vk(createVulkanInstance(selectPhysicalDevice)),
+        visibleDevices(std::move(*observedDevices)),
         deviceIdentity(vk::getPhysicalDeviceIdentity(
             this->vk.fi(), this->vk.physdev())),
         shaders(createShaderRegistry(this->vk, shaderDllPath,
@@ -248,6 +261,10 @@ InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
 
 const vk::PhysicalDeviceIdentity& Instance::deviceIdentity() const {
     return this->m_impl->getDeviceIdentity();
+}
+
+const std::vector<vk::PhysicalDeviceSnapshot>& Instance::visibleDevices() const {
+    return this->m_impl->getVisibleDevices();
 }
 
 Context& Instance::openContext(std::pair<int, int> sourceFds, const std::vector<int>& destFds,

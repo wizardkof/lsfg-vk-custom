@@ -3,9 +3,11 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -47,6 +49,33 @@ namespace vk {
         [[nodiscard]] std::string vendorDeviceIdentifier() const;
         [[nodiscard]] bool matchesSelector(const std::string& selector) const;
     };
+
+    /// Immutable device information observed through one VkInstance.
+    struct PhysicalDeviceSnapshot {
+        PhysicalDeviceIdentity identity;
+        std::vector<std::string> advertisedDeviceExtensions;
+    };
+
+    /// Diagnostic result of resolving a profile selection against backend-visible devices.
+    enum class DeviceSelectionResolution {
+        Selected,
+        ApplicationDeviceNotVisibleToBackend,
+        SelectorNotFoundInBackend,
+        SelectorAmbiguous
+    };
+
+    struct DeviceSelectionResult {
+        DeviceSelectionResolution resolution;
+        std::optional<size_t> selectedIndex;
+        size_t matchCount{};
+    };
+
+    /// driverUUID relationship for diagnostics only; never physical-device identity.
+    enum class DriverUuidRelationship {
+        Same,
+        Different,
+        Unknown
+    };
     // NOLINTEND(misc-non-private-member-variables-in-classes)
 
     /// Format a Vulkan UUID for diagnostics.
@@ -57,6 +86,37 @@ namespace vk {
     [[nodiscard]] PhysicalDeviceIdentity getPhysicalDeviceIdentity(
         const VulkanInstanceFuncs& funcs,
         VkPhysicalDevice device
+    );
+
+    /// Enumerate and sort all device extension names advertised by a physical device.
+    [[nodiscard]] std::vector<std::string> enumerateDeviceExtensionNames(
+        const VulkanInstanceFuncs& funcs,
+        VkPhysicalDevice device
+    );
+
+    /// Snapshot already-enumerated physical-device handles, preserving device order.
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> snapshotPhysicalDevices(
+        const VulkanInstanceFuncs& funcs,
+        const std::vector<VkPhysicalDevice>& devices
+    );
+
+    /// Enumerate all physical devices visible to an instance and snapshot each one.
+    [[nodiscard]] std::vector<PhysicalDeviceSnapshot> enumeratePhysicalDeviceSnapshots(
+        const VulkanInstanceFuncs& funcs,
+        VkInstance instance
+    );
+
+    /// Resolve Default or an explicit selector without changing first-match selection semantics.
+    [[nodiscard]] DeviceSelectionResult resolveDeviceSelection(
+        const std::vector<PhysicalDeviceSnapshot>& backendDevices,
+        const PhysicalDeviceIdentity& applicationIdentity,
+        const std::optional<std::string>& selector
+    );
+
+    /// Compare driver UUIDs for diagnostics, returning Unknown for invalid UUIDs.
+    [[nodiscard]] DriverUuidRelationship compareDriverUuids(
+        const PhysicalDeviceIdentity& first,
+        const PhysicalDeviceIdentity& second
     );
 
 }
