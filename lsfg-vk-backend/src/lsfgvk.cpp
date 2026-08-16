@@ -107,7 +107,8 @@ namespace lsfgvk::backend {
         /// create a context
         /// (see lsfg-vk documentation)
         ContextImpl(const InstanceImpl& instance,
-            std::pair<int, int> sourceFds, const std::vector<int>& destFds, int syncFd,
+            std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
+            std::vector<vk::ExternalImage> destImages, int syncFd,
             VkExtent2D extent, bool hdr, float flow, bool perf);
 
         /// schedule frames
@@ -267,12 +268,31 @@ const std::vector<vk::PhysicalDeviceSnapshot>& Instance::visibleDevices() const 
     return this->m_impl->getVisibleDevices();
 }
 
-Context& Instance::openContext(std::pair<int, int> sourceFds, const std::vector<int>& destFds,
-        int syncFd, uint32_t width, uint32_t height,
-        bool hdr, float flow, bool perf) {
-    const VkExtent2D extent{ width, height };
+Context& Instance::openContext(
+        std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
+        std::vector<vk::ExternalImage> destImages,
+        int syncFd, float flow, bool perf) {
+    const auto& descriptor = sourceImages.first.descriptor;
+    const VkExtent2D extent{ descriptor.extent.width, descriptor.extent.height };
+    const auto expectedSource = vk::makeSourceExchangeImageDescriptor(
+        extent, descriptor.format);
+    const auto expectedDestination = vk::makeDestinationExchangeImageDescriptor(
+        extent, descriptor.format);
+
+    if (!(sourceImages.first.descriptor == expectedSource)
+            || !(sourceImages.second.descriptor == expectedSource))
+        throw backend::error("Source exchange image descriptors do not match");
+    for (const auto& image : destImages) {
+        if (!(image.descriptor == expectedDestination))
+            throw backend::error("Destination exchange image descriptors do not match");
+    }
+
+    const bool hdr = descriptor.format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!hdr && descriptor.format != VK_FORMAT_R8G8B8A8_UNORM)
+        throw backend::error("Unsupported exchange image format");
+
     return *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
-        sourceFds, destFds, syncFd,
+        std::move(sourceImages), std::move(destImages), syncFd,
         extent, hdr, flow, perf
     )).get();
 }
@@ -280,30 +300,25 @@ Context& Instance::openContext(std::pair<int, int> sourceFds, const std::vector<
 namespace {
     /// import source images
     std::pair<vk::Image, vk::Image> importImages(const vk::Vulkan& vk,
-            const std::pair<int, int>& sourceFds,
-            VkExtent2D extent, VkFormat format) {
+            std::pair<vk::ExternalImage, vk::ExternalImage>& sourceImages) {
         try {
             return {
-                vk::Image(vk, extent, format,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, sourceFds.first),
-                vk::Image(vk, extent, format,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, sourceFds.second)
+                vk::Image(vk, std::move(sourceImages.first)),
+                vk::Image(vk, std::move(sourceImages.second))
             };
         } catch (const std::exception& e) {
-            throw backend::error("Unable to import destination images", e);
+            throw backend::error("Unable to import source images", e);
         }
     }
     /// import destination images
     std::vector<vk::Image> importImages(const vk::Vulkan& vk,
-            const std::vector<int>& destFds,
-            VkExtent2D extent, VkFormat format) {
+            std::vector<vk::ExternalImage>& externalImages) {
         try {
             std::vector<vk::Image> destImages;
-            destImages.reserve(destFds.size());
+            destImages.reserve(externalImages.size());
 
-            for (const auto& fd : destFds)
-                destImages.emplace_back(vk, extent, format,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, fd);
+            for (auto& image : externalImages)
+                destImages.emplace_back(vk, std::move(image));
 
             return destImages;
         } catch (const std::exception& e) {
@@ -393,18 +408,17 @@ namespace {
 }
 
 ContextImpl::ContextImpl(const InstanceImpl& instance,
-            std::pair<int, int> sourceFds, const std::vector<int>& destFds, int syncFd,
+            std::pair<vk::ExternalImage, vk::ExternalImage> externalSourceImages,
+            std::vector<vk::ExternalImage> externalDestImages, int syncFd,
             VkExtent2D extent, bool hdr, float flow, bool perf) :
-        sourceImages(importImages(instance.getVulkan(), sourceFds,
-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM)),
-        destImages(importImages(instance.getVulkan(), destFds,
-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM)),
+        sourceImages(importImages(instance.getVulkan(), externalSourceImages)),
+        destImages(importImages(instance.getVulkan(), externalDestImages)),
         blackImage(createBlackImage(instance.getVulkan())),
         syncSemaphore(importTimelineSemaphore(instance.getVulkan(), syncFd)),
         prepassSemaphore(createPrepassSemaphore(instance.getVulkan())),
-        cmdbufs(createCommandBuffers(instance.getVulkan(), destFds.size() + 1)),
+        cmdbufs(createCommandBuffers(instance.getVulkan(), externalDestImages.size() + 1)),
         cmdbufFence(instance.getVulkan()),
-        ctx(createCtx(instance, extent, hdr, flow, perf, destFds.size())),
+        ctx(createCtx(instance, extent, hdr, flow, perf, externalDestImages.size())),
         mipmaps(ctx, sourceImages),
         alpha0{
             Alpha0(ctx, mipmaps.getImages().at(0)),

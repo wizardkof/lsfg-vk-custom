@@ -76,27 +76,21 @@ int benchmark::run(const Options& opts) {
         const auto applicationIdentity = vk::getPhysicalDeviceIdentity(
             vk.fi(), vk.physdev());
 
-        std::pair<int, int> srcfds{};
-        const vk::Image frame_0{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            std::nullopt, &srcfds.first};
-        const vk::Image frame_1{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-            std::nullopt, &srcfds.second};
+        const auto sourceDescriptor = vk::makeSourceExchangeImageDescriptor(
+            extent, VK_FORMAT_R8G8B8A8_UNORM);
+        const auto destinationDescriptor = vk::makeDestinationExchangeImageDescriptor(
+            extent, VK_FORMAT_R8G8B8A8_UNORM);
+        std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages{};
+        const vk::Image frame_0{vk, sourceDescriptor, sourceImages.first};
+        const vk::Image frame_1{vk, sourceDescriptor, sourceImages.second};
 
         std::vector<vk::Image> destimgs{};
-        std::vector<int> destfds{};
+        std::vector<vk::ExternalImage> externalDestImages{};
+        destimgs.reserve(static_cast<size_t>(opts.multiplier - 1));
+        externalDestImages.resize(static_cast<size_t>(opts.multiplier - 1));
         for (int i = 0; i < (opts.multiplier - 1); i++) {
-            int fd{};
-            destimgs.emplace_back(vk,
-                extent, VK_FORMAT_R8G8B8A8_UNORM,
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                std::nullopt,
-                &fd
-            );
-            destfds.push_back(fd);
+            destimgs.emplace_back(vk, destinationDescriptor,
+                externalDestImages.at(static_cast<size_t>(i)));
         }
 
         int syncfd{};
@@ -118,9 +112,8 @@ int benchmark::run(const Options& opts) {
             dll, opts.allow_fp16
         };
         lsfgvk::backend::Context& lsfgvk_ctx = lsfgvk.openContext(
-            srcfds, destfds,
-            syncfd, extent.width, extent.height,
-            false, 1.0F / opts.flow, opts.performance_mode
+            std::move(sourceImages), std::move(externalDestImages),
+            syncfd, 1.0F / opts.flow, opts.performance_mode
         );
 
         // run the benchmark

@@ -40,8 +40,6 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
             spec.extent,
             spec.format,
             spec.usage,
-            std::nullopt,
-            std::nullopt,
             spec.imageOptions(pNext));
         this->readySemaphores.emplace_back(vk);
     }

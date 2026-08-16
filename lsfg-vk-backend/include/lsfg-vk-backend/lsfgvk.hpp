@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
 
 #include <exception>
@@ -94,23 +95,19 @@ namespace lsfgvk::backend {
         /// - Library signals N -> N-th frame between (curr, next) is ready
         /// - Application signals N+1 -> Start generating with (next, curr) source images
         ///
-        /// @param sourceFds Pair of file descriptors for the source images alternated between.
-        /// @param destFds Vector with file descriptors to import output images from.
+        /// @param sourceImages Pair of exported source images; ownership is consumed.
+        /// @param destImages Vector of exported output images; ownership is consumed.
         /// @param syncFd File descriptor for the timeline semaphore used for synchronization.
-        /// @param width Width of the images.
-        /// @param height Height of the images.
-        /// @param hdr Whether the images are HDR.
         /// @param flow Motion flow factor.
         /// @param perf Whether to enable performance mode.
         ///
         /// @throws backend::error on failure
         ///
         Context& openContext(
-            std::pair<int, int> sourceFds,
-            const std::vector<int>& destFds,
+            std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
+            std::vector<vk::ExternalImage> destImages,
             int syncFd,
-            uint32_t width, uint32_t height,
-            bool hdr, float flow, bool perf
+            float flow, bool perf
         );
 
         ///

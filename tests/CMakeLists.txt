@@ -114,6 +114,34 @@ add_test(
     NAME lsfg-vk-test-external-capabilities
     COMMAND lsfg-vk-test-external-capabilities)
 
+add_executable(lsfg-vk-test-external-image-contract
+    external_image_contract_test.cpp)
+
+target_compile_options(lsfg-vk-test-external-image-contract PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-external-image-contract
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-external-image-contract
+    COMMAND lsfg-vk-test-external-image-contract)
+
+add_executable(lsfg-vk-test-owned-fd
+    owned_fd_test.cpp)
+
+target_compile_options(lsfg-vk-test-owned-fd PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-owned-fd
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-owned-fd
+    COMMAND lsfg-vk-test-owned-fd)
+
 if(LSFGVK_BUILD_CLI)
     add_executable(lsfg-vk-test-cli-devices
         cli_devices_test.cpp
