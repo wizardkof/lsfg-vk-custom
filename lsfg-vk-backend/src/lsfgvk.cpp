@@ -9,6 +9,7 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/buffer.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
@@ -117,6 +118,8 @@ namespace lsfgvk::backend {
         /// schedule zero or more frames at explicit interpolation timestamps
         void scheduleFrames(const std::vector<float>& timestamps);
     private:
+        void schedulePreparedFrames(size_t generatedFrames);
+
         std::pair<vk::Image, vk::Image> sourceImages;
         std::vector<vk::Image> destImages;
         vk::Image blackImage;
@@ -125,6 +128,7 @@ namespace lsfgvk::backend {
         vk::TimelineSemaphore prepassSemaphore;
         size_t idx{1};
         size_t fidx{0}; // real frame index
+        std::vector<bool> destinationFirstUse;
 
         std::vector<vk::CommandBuffer> cmdbufs;
         vk::Fence cmdbufFence;
@@ -416,6 +420,7 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
         blackImage(createBlackImage(instance.getVulkan())),
         syncSemaphore(importTimelineSemaphore(instance.getVulkan(), syncFd)),
         prepassSemaphore(createPrepassSemaphore(instance.getVulkan())),
+        destinationFirstUse(externalDestImages.size(), true),
         cmdbufs(createCommandBuffers(instance.getVulkan(), externalDestImages.size() + 1)),
         cmdbufFence(instance.getVulkan()),
         ctx(createCtx(instance, extent, hdr, flow, perf, externalDestImages.size())),
@@ -607,14 +612,35 @@ void Instance::scheduleFrames(Context& context) { // NOLINT (static)
 }
 
 void Context::scheduleFrames() {
-    // wait for previous pre-pass to complete
     if (this->fidx && !this->cmdbufFence.wait(this->ctx.vk))
         throw backend::error("Timeout waiting for previous frame to complete");
     this->cmdbufFence.reset(this->ctx.vk);
+    this->schedulePreparedFrames(this->destImages.size());
+}
+
+void Context::schedulePreparedFrames(size_t generatedFrames) {
+    const auto timeline = vk::makeExchangeTimelineFrame(this->idx, generatedFrames);
+    const size_t currentSource = this->fidx % 2;
+    const size_t returnedSource = (this->fidx + 1) % 2;
+    const uint32_t family = this->ctx.vk.get().queueFamilyIndex();
 
     // schedule pre-pass
     const auto& cmdbuf = this->cmdbufs.at(0);
     cmdbuf.begin(ctx.vk);
+
+    std::vector<vk::Barrier> sourceAcquires;
+    if (this->fidx == 0) {
+        sourceAcquires = {
+            vk::sourceAcquireFromLayer(this->sourceImages.first.handle(), family),
+            vk::sourceAcquireFromLayer(this->sourceImages.second.handle(), family)
+        };
+    } else {
+        const auto& source = currentSource == 0
+            ? this->sourceImages.first : this->sourceImages.second;
+        sourceAcquires = { vk::sourceAcquireFromLayer(source.handle(), family) };
+    }
+    cmdbuf.insertBarriers(ctx.vk, sourceAcquires,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
     for (size_t i = 0; i < 7; ++i) {
@@ -624,18 +650,40 @@ void Context::scheduleFrames() {
     this->beta0.render(ctx.vk, cmdbuf, this->fidx);
     this->beta1.render(ctx.vk, cmdbuf);
 
-    cmdbuf.end(ctx.vk);
-    cmdbuf.submit(this->ctx.vk,
-        {}, this->syncSemaphore.handle(), this->idx,
-        {}, this->prepassSemaphore.handle(), this->idx
-    );
+    // Generate samples both alternating source images. With no Generate job,
+    // queue order after this prepass is the last-read point for the previous
+    // image; otherwise it is released by the final Generate command buffer.
+    if (generatedFrames == 0) {
+        const auto& source = returnedSource == 0
+            ? this->sourceImages.first : this->sourceImages.second;
+        cmdbuf.insertBarriers(ctx.vk,
+            { vk::sourceReleaseToLayer(source.handle(), family) },
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
 
-    this->idx++;
+    cmdbuf.end(ctx.vk);
+    if (generatedFrames == 0) {
+        cmdbuf.submit(this->ctx.vk,
+            {}, this->syncSemaphore.handle(), timeline.sourceReady,
+            {}, this->syncSemaphore.handle(), timeline.sourceReturn,
+            this->cmdbufFence.handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    } else {
+        cmdbuf.submit(this->ctx.vk,
+            {}, this->syncSemaphore.handle(), timeline.sourceReady,
+            {}, this->prepassSemaphore.handle(), timeline.sourceReady,
+            VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
 
     // schedule main passes
-    for (size_t i = 0; i < this->destImages.size(); i++) {
+    for (size_t i = 0; i < generatedFrames; i++) {
         const auto& cmdbuf = this->cmdbufs.at(i + 1);
         cmdbuf.begin(ctx.vk);
+
+        const auto destinationAcquire = this->destinationFirstUse.at(i)
+            ? vk::destinationInitialAcquireFromLayer(this->destImages.at(i).handle(), family)
+            : vk::destinationAcquireFromLayer(this->destImages.at(i).handle(), family);
+        cmdbuf.insertBarriers(ctx.vk, { destinationAcquire },
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
         const auto& pass = this->passes.at(i);
         for (size_t j = 0; j < 7; j++) {
@@ -648,15 +696,28 @@ void Context::scheduleFrames() {
         }
         pass.generate->render(ctx.vk, cmdbuf, this->fidx);
 
+        std::vector<vk::Barrier> releases;
+        if (i == generatedFrames - 1) {
+            const auto& source = returnedSource == 0
+                ? this->sourceImages.first : this->sourceImages.second;
+            releases.push_back(vk::sourceReleaseToLayer(source.handle(), family));
+        }
+        releases.push_back(vk::destinationReleaseToLayer(
+            this->destImages.at(i).handle(), family));
+        cmdbuf.insertBarriers(ctx.vk, releases,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
         cmdbuf.end(ctx.vk);
         cmdbuf.submit(this->ctx.vk,
-            {}, this->prepassSemaphore.handle(), this->idx - 1,
-            {}, this->syncSemaphore.handle(), this->idx + i,
-            i == this->destImages.size() - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE
+            {}, this->prepassSemaphore.handle(), timeline.sourceReady,
+            {}, this->syncSemaphore.handle(), timeline.destinationReady(i),
+            i == generatedFrames - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
         );
+        this->destinationFirstUse.at(i) = false;
     }
 
-    this->idx += this->destImages.size();
+    this->idx = timeline.nextBase;
     this->fidx++;
 }
 
@@ -686,54 +747,8 @@ void Context::scheduleFrames(const std::vector<float>& timestamps) {
         this->ctx.constantBuffers.at(i).update(this->ctx.vk, constants);
     }
 
-    // Schedule the same pre-pass used by the adaptive path. This must run even
-    // when no intermediate frame is generated so temporal history advances.
-    const auto& prepass = this->cmdbufs.at(0);
-    prepass.begin(ctx.vk);
-
-    this->mipmaps.render(ctx.vk, prepass, this->fidx);
-    for (size_t i = 0; i < 7; ++i) {
-        this->alpha0.at(6 - i).render(ctx.vk, prepass);
-        this->alpha1.at(6 - i).render(ctx.vk, prepass, this->fidx);
-    }
-    this->beta0.render(ctx.vk, prepass, this->fidx);
-    this->beta1.render(ctx.vk, prepass);
-
-    prepass.end(ctx.vk);
-    prepass.submit(this->ctx.vk,
-        {}, this->syncSemaphore.handle(), this->idx,
-        {}, this->prepassSemaphore.handle(), this->idx,
-        timestamps.empty() ? this->cmdbufFence.handle() : VK_NULL_HANDLE
-    );
-
-    this->idx++;
-
-    // Schedule only the generated-frame passes requested for this source frame.
-    for (size_t i = 0; i < timestamps.size(); ++i) {
-        const auto& cmdbuf = this->cmdbufs.at(i + 1);
-        cmdbuf.begin(ctx.vk);
-
-        const auto& pass = this->passes.at(i);
-        for (size_t j = 0; j < 7; ++j) {
-            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
-            pass.gamma1.at(j).render(ctx.vk, cmdbuf);
-
-            if (j < 4) continue;
-            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
-            pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
-        }
-        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
-
-        cmdbuf.end(ctx.vk);
-        cmdbuf.submit(this->ctx.vk,
-            {}, this->prepassSemaphore.handle(), this->idx - 1,
-            {}, this->syncSemaphore.handle(), this->idx + i,
-            i == timestamps.size() - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE
-        );
-    }
-
-    this->idx += timestamps.size();
-    this->fidx++;
+    // The shared path keeps prepass/history processing active for g == 0.
+    this->schedulePreparedFrames(timestamps.size());
 }
 
 void Instance::closeContext(const Context& context) {

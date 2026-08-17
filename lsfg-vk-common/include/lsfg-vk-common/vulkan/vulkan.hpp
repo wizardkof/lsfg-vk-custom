@@ -240,6 +240,8 @@ namespace vk {
         /// get the compute queue
         /// @return the compute queue handle
         [[nodiscard]] const auto& queue() const { return this->computeQueue; }
+        /// Queue family used by queue(), cmdpool(), and their command buffers.
+        [[nodiscard]] uint32_t queueFamilyIndex() const { return this->queueFamilyIdx; }
 
         /// check if fp16 is supported
         /// @return true if fp16 is supported

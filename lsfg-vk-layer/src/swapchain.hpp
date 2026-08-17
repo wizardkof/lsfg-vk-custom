@@ -15,6 +15,7 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -109,6 +110,7 @@ namespace lsfgvk::layer {
         ls::owned_ptr<ls::R<backend::Context>> ctx;
         size_t idx{1};
         size_t fidx{0}; // real frame index
+        std::array<std::optional<uint64_t>, 2> sourceReturnValues{};
 
         FixedFrameScheduler fixedScheduler;
         FixedOutputPacer fixedOutputPacer;

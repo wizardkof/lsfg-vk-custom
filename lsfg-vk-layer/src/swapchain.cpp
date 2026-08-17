@@ -6,6 +6,7 @@
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -76,24 +77,13 @@ namespace {
             VkAccessFlags srcAccessMask,
             VkAccessFlags dstAccessMask,
             VkImageLayout oldLayout,
-            VkImageLayout newLayout) {
-        return VkImageMemoryBarrier{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = srcAccessMask,
-            .dstAccessMask = dstAccessMask,
-            .oldLayout = oldLayout,
-            .newLayout = newLayout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = handle,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1
-            }
-        };
+            VkImageLayout newLayout,
+            uint32_t srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            uint32_t dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            VkImageSubresourceRange range = vk::exchangeImageSubresourceRange()) {
+        return vk::makeImageBarrier(handle,
+            srcAccessMask, dstAccessMask, oldLayout, newLayout,
+            srcQueueFamilyIndex, dstQueueFamilyIndex, range);
     }
 
     VkResult acquireRealSwapchainImage(const vk::Vulkan& vk,
@@ -175,6 +165,24 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     this->destinationImages.reserve(externalDestinationImages.size());
     for (auto& image : externalDestinationImages)
         this->destinationImages.emplace_back(vk, destinationDescriptor, image);
+
+    // A owns every exported destination initially, while B is its first
+    // writer. Complete the one-time A -> EXTERNAL releases before importing
+    // the same allocations into the backend context.
+    if (!this->destinationImages.empty()) {
+        std::vector<vk::Barrier> initialDestinationReleases;
+        initialDestinationReleases.reserve(this->destinationImages.size());
+        for (const auto& image : this->destinationImages) {
+            initialDestinationReleases.push_back(
+                vk::destinationInitialReleaseToBackend(
+                    image.handle(), vk.queueFamilyIndex()));
+        }
+        const vk::CommandBuffer initialRelease{vk};
+        initialRelease.begin(vk);
+        initialRelease.insertBarriers(vk, initialDestinationReleases);
+        initialRelease.end(vk);
+        initialRelease.submit(vk);
+    }
 
     int syncFd{};
     this->syncSemaphore.emplace(vk, 0, std::nullopt, &syncFd);
@@ -435,6 +443,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     const size_t generatedFrames = fixedMode
         ? fixedPlan.timestamps.size()
         : this->destinationImages.size();
+    const auto timeline = vk::makeExchangeTimelineFrame(this->idx, generatedFrames);
 
     // Fixed virtual mode must not rely exclusively on FIFO/vblank to space
     // generated output. Use a cancellable host-side target cadence; the WSI
@@ -509,6 +518,12 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     const auto& cmdbuf = *this->renderCommandBuffer;
     cmdbuf.begin(vk);
 
+    const auto sourcePreBarrier = this->fidx == 0
+        ? barrierHelper(sourceImage.handle(),
+            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+        : vk::sourceAcquireFromBackend(
+            sourceImage.handle(), vk.queueFamilyIndex());
     cmdbuf.blitImage(vk,
         {
             barrierHelper(swapchainImage,
@@ -517,12 +532,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
             ),
-            barrierHelper(sourceImage.handle(),
-                VK_ACCESS_NONE,
-                VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-            ),
+            sourcePreBarrier,
         },
         { swapchainImage, sourceImage.handle() },
         sourceImage.getExtent(),
@@ -533,8 +543,38 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
             ),
+            vk::sourceReleaseToBackend(
+                sourceImage.handle(), vk.queueFamilyIndex()),
         }
     );
+
+    // Generate samples both source descriptors. Seed the second alternating
+    // resource with the first real frame so B can legally acquire/read both on
+    // its first dispatch; subsequent frames update one resource at a time.
+    if (this->fidx == 0) {
+        const auto& secondSource = this->sourceImages.at(1);
+        cmdbuf.blitImage(vk,
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_NONE, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                barrierHelper(secondSource.handle(),
+                    VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+            },
+            { swapchainImage, secondSource.handle() },
+            secondSource.getExtent(),
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                vk::sourceReleaseToBackend(
+                    secondSource.handle(), vk.queueFamilyIndex()),
+            });
+    }
 
     cmdbuf.end(vk);
 
@@ -542,6 +582,10 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     // binary semaphore to chain either the legacy final present or the virtual
     // real-frame copy.
     vk::Semaphore* zeroPresentSemaphore{};
+    const auto sourceReturn = this->sourceReturnValues.at(this->fidx % 2);
+    const VkSemaphore sourceWaitSemaphore = sourceReturn.has_value()
+        ? this->syncSemaphore->handle() : VK_NULL_HANDLE;
+    const uint64_t sourceWaitValue = sourceReturn.value_or(0);
     if (generatedFrames == 0) {
         auto& pcs = this->postCopySemaphores.at(
             this->idx % this->postCopySemaphores.size());
@@ -549,33 +593,38 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
             cmdbuf.submit(vk, queue,
-                semaphores, VK_NULL_HANDLE, 0,
+                semaphores, sourceWaitSemaphore, sourceWaitValue,
                 { zeroPresentSemaphore->handle() },
-                this->syncSemaphore->handle(), this->idx++,
-                VK_NULL_HANDLE
+                this->syncSemaphore->handle(), timeline.sourceReady,
+                VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         } else {
             cmdbuf.submit(vk,
-                semaphores, VK_NULL_HANDLE, 0,
+                semaphores, sourceWaitSemaphore, sourceWaitValue,
                 { zeroPresentSemaphore->handle() },
-                this->syncSemaphore->handle(), this->idx++,
-                this->info.virtualized ? VK_NULL_HANDLE : this->renderFence->handle()
+                this->syncSemaphore->handle(), timeline.sourceReady,
+                this->info.virtualized ? VK_NULL_HANDLE : this->renderFence->handle(),
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         }
     } else {
         if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
             cmdbuf.submit(vk, queue,
-                semaphores, VK_NULL_HANDLE, 0,
-                {}, this->syncSemaphore->handle(), this->idx++
+                semaphores, sourceWaitSemaphore, sourceWaitValue,
+                {}, this->syncSemaphore->handle(), timeline.sourceReady,
+                VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         } else {
             cmdbuf.submit(vk,
-                semaphores, VK_NULL_HANDLE, 0,
-                {}, this->syncSemaphore->handle(), this->idx++
+                semaphores, sourceWaitSemaphore, sourceWaitValue,
+                {}, this->syncSemaphore->handle(), timeline.sourceReady,
+                VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         }
     }
+    this->idx = timeline.sourceReady + 1;
+    this->sourceReturnValues.at((this->fidx + 1) % 2) = timeline.sourceReturn;
 
     for (size_t i = 0; i < generatedFrames; i++) {
         auto& pcs = this->postCopySemaphores.at(this->idx % this->postCopySemaphores.size());
@@ -605,12 +654,8 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
         passCmdbuf.blitImage(vk,
             {
-                barrierHelper(destinationImage.handle(),
-                    VK_ACCESS_NONE,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                ),
+                vk::destinationAcquireFromBackend(
+                    destinationImage.handle(), vk.queueFamilyIndex()),
                 barrierHelper(acquiredSwapchainImage,
                     VK_ACCESS_NONE,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -621,6 +666,8 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             { destinationImage.handle(), acquiredSwapchainImage },
             destinationImage.getExtent(),
             {
+                vk::destinationReleaseToBackend(
+                    destinationImage.handle(), vk.queueFamilyIndex()),
                 barrierHelper(acquiredSwapchainImage,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_ACCESS_MEMORY_READ_BIT,
@@ -646,17 +693,18 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
             passCmdbuf.submit(vk, queue,
-                waitSemaphores, this->syncSemaphore->handle(), this->idx,
+                waitSemaphores, this->syncSemaphore->handle(), timeline.destinationReady(i),
                 signalSemaphores, VK_NULL_HANDLE, 0,
-                VK_NULL_HANDLE
+                VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         } else {
             passCmdbuf.submit(vk,
-                waitSemaphores, this->syncSemaphore->handle(), this->idx,
+                waitSemaphores, this->syncSemaphore->handle(), timeline.destinationReady(i),
                 signalSemaphores, VK_NULL_HANDLE, 0,
                 (!this->info.virtualized && i == generatedFrames - 1)
                     ? this->renderFence->handle()
-                    : VK_NULL_HANDLE
+                    : VK_NULL_HANDLE,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
             );
         }
 
@@ -699,6 +747,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
         this->idx++;
     }
+    this->idx = timeline.nextBase;
 
     const VkSemaphore finalWaitSemaphore = generatedFrames
         ? this->postCopySemaphores.at(

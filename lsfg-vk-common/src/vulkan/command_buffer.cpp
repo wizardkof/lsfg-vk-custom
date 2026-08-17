@@ -66,9 +66,11 @@ void CommandBuffer::begin(const vk::Vulkan& vk) const {
 }
 
 void CommandBuffer::insertBarriers(const vk::Vulkan& vk,
-        const std::vector<vk::Barrier>& barriers) const {
+        const std::vector<vk::Barrier>& barriers,
+        VkPipelineStageFlags srcStageMask,
+        VkPipelineStageFlags dstStageMask) const {
     vk.df().CmdPipelineBarrier(*this->commandBuffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        srcStageMask, dstStageMask,
         0,
         0, VK_NULL_HANDLE,
         0, VK_NULL_HANDLE,
@@ -204,7 +206,7 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
         VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
         std::vector<VkSemaphore> signalSemaphores,
         VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-        VkFence fence) const {
+        VkFence fence, VkPipelineStageFlags waitStage) const {
     // create arrays of semaphores and values
     if (waitTimelineSemaphore)
         waitSemaphores.push_back(waitTimelineSemaphore);
@@ -226,8 +228,7 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
         .signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size()),
         .pSignalSemaphoreValues = signalValues.data()
     };
-    std::vector<VkPipelineStageFlags> stages(waitSemaphores.size(),
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+    std::vector<VkPipelineStageFlags> stages(waitSemaphores.size(), waitStage);
     const VkSubmitInfo submitInfo{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = &timelineInfo,
@@ -250,7 +251,7 @@ void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
         VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
         std::vector<VkSemaphore> signalSemaphores,
         VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-        VkFence fence) const {
+        VkFence fence, VkPipelineStageFlags waitStage) const {
     if (waitTimelineSemaphore)
         waitSemaphores.push_back(waitTimelineSemaphore);
 
@@ -272,8 +273,7 @@ void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
         .signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size()),
         .pSignalSemaphoreValues = signalValues.data()
     };
-    std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(),
-        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    std::vector<VkPipelineStageFlags> waitStages(waitSemaphores.size(), waitStage);
     const VkSubmitInfo submitInfo{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = &timelineInfo,

@@ -49,7 +49,9 @@ namespace vk {
         /// @param barriers image memory barriers to apply
         /// throws ls::vulkan_error on failure
         void insertBarriers(const vk::Vulkan& vk,
-            const std::vector<vk::Barrier>& barriers) const;
+            const std::vector<vk::Barrier>& barriers,
+            VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VkPipelineStageFlags dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) const;
 
         /// dispatch a compute shader
         /// @param vk the vulkan instance
@@ -84,13 +86,15 @@ namespace vk {
         /// @param signalTimelineSemaphore the timeline semaphore to signal
         /// @param signalValue the value to signal
         /// @param fence optional fence to signal on completion
+        /// @param waitStage stage at which all semaphore waits take effect
         /// @throws ls::vulkan_error on failure
         void submit(const vk::Vulkan& vk,
             std::vector<VkSemaphore> waitSemaphores,
             VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
             std::vector<VkSemaphore> signalSemaphores,
             VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-            VkFence fence = VK_NULL_HANDLE) const;
+            VkFence fence = VK_NULL_HANDLE,
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) const;
 
         /// submit the command buffer on an explicit queue
         /// @param vk the vulkan instance
@@ -102,13 +106,15 @@ namespace vk {
         /// @param signalTimelineSemaphore optional timeline semaphore to signal
         /// @param signalValue timeline value to signal
         /// @param fence optional fence to signal on completion
+        /// @param waitStage stage at which all semaphore waits take effect
         /// @throws ls::vulkan_error on failure
         void submit(const vk::Vulkan& vk, VkQueue queue,
             std::vector<VkSemaphore> waitSemaphores,
             VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
             std::vector<VkSemaphore> signalSemaphores,
             VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-            VkFence fence = VK_NULL_HANDLE) const;
+            VkFence fence = VK_NULL_HANDLE,
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) const;
 
         /// submit the command buffer instantly
         /// @param vk the vulkan instance
