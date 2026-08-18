@@ -3,6 +3,7 @@
 #include "tools/benchmark.hpp"
 #include "tools/debug.hpp"
 #include "tools/devices.hpp"
+#include "tools/interop.hpp"
 #include "tools/validate.hpp"
 
 #include <array>
@@ -34,6 +35,8 @@ namespace {
             std::cerr << " debug [OPTIONS] <folder>\n\n";
         else if (command == "devices")
             std::cerr << " devices [--help]\n\n";
+        else if (command == "interop")
+            std::cerr << " interop\n\n";
         else
             std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
 
@@ -43,6 +46,7 @@ R"(COMMANDS:
     benchmark   Run a benchmark
     debug       Run lsfg-vk on a set of images
     devices     List Vulkan devices visible to this process
+    interop     Query external buffer and SYNC_FD capabilities
     help        Show this help text
 
 GLOBAL OPTIONS:
@@ -271,6 +275,8 @@ int main(int argc, char** argv) {
         on_validate(argc - 1, argv + 1, prog);
     else if (command == "devices")
         on_devices(argc - 1, argv + 1, prog);
+    else if (command == "interop")
+        return lsfgvk::cli::interop::run();
     else if (command == "benchmark")
         on_benchmark(argc - 1, argv + 1, prog);
     else if (command == "debug")

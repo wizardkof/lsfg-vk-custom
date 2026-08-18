@@ -272,6 +272,12 @@ std::vector<PhysicalDeviceSnapshot> vk::enumeratePhysicalDeviceSnapshots(
     return enumeratePhysicalDeviceSnapshotsImpl(funcs, instance);
 }
 
+std::vector<VkPhysicalDevice> vk::enumeratePhysicalDevices(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkInstance instance) {
+    return enumeratePhysicalDeviceHandles(funcs, instance);
+}
+
 std::vector<PhysicalDeviceSnapshot> vk::enumeratePhysicalDeviceSnapshots(
         const VulkanInstanceInventoryFuncs& funcs,
         VkInstance instance) {

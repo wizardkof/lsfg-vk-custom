@@ -157,7 +157,7 @@ add_test(
     COMMAND lsfg-vk-test-owned-fd)
 
 if(LSFGVK_BUILD_CLI)
-    add_executable(lsfg-vk-test-cli-devices
+add_executable(lsfg-vk-test-cli-devices
         cli_devices_test.cpp
         "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/devices.cpp")
 
@@ -171,8 +171,24 @@ if(LSFGVK_BUILD_CLI)
     target_link_libraries(lsfg-vk-test-cli-devices
         PRIVATE lsfg-vk-common)
 
-    add_test(NAME lsfg-vk-test-cli-devices
-        COMMAND lsfg-vk-test-cli-devices)
+add_test(NAME lsfg-vk-test-cli-devices
+    COMMAND lsfg-vk-test-cli-devices)
+
+add_executable(lsfg-vk-test-cli-interop
+    cli_interop_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/interop.cpp")
+
+target_include_directories(lsfg-vk-test-cli-interop PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src")
+
+target_compile_options(lsfg-vk-test-cli-interop PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-cli-interop PRIVATE lsfg-vk-common)
+
+add_test(NAME lsfg-vk-test-cli-interop
+    COMMAND lsfg-vk-test-cli-interop)
     add_test(NAME lsfg-vk-test-cli-help
         COMMAND lsfg-vk-cli --help)
     add_test(NAME lsfg-vk-test-cli-devices-help

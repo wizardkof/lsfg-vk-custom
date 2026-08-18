@@ -123,6 +123,11 @@ namespace vk {
         VkInstance instance
     );
 
+    [[nodiscard]] std::vector<VkPhysicalDevice> enumeratePhysicalDevices(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkInstance instance
+    );
+
     /// Resolve Default or an explicit selector without changing first-match selection semantics.
     [[nodiscard]] DeviceSelectionResult resolveDeviceSelection(
         const std::vector<PhysicalDeviceSnapshot>& backendDevices,
