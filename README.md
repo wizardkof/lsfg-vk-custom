@@ -1,12 +1,17 @@
-# lsfg-vk
+# lsfg-vk — Fixed Target / Dual-GPU Development Fork
+
+This repository is the **fixed-target** development fork of lsfg-vk.
+
+- Fork version: **2.0.0-fixed-target**
+- Upstream baseline: **2.0.0-dev28**
+- Development branch: **fixed-target**
+
+The fork preserves same-GPU operation as the safe default while developing
+explicit fixed-cadence output and isolated cross-device transport probes.
+
 **Lossless Scaling** is a Windows-exclusive program featuring various algorithms for scaling and interpolating programs.
 
 **lsfg-vk** is a Vulkan layer that hooks into Vulkan applications and generates additional frames using Lossless Scaling's frame generation algorithm.
-
-> [!NOTE]
-> Fork version: **2.0.0-fixed-target**
->
-> Based on upstream lsfg-vk **2.0.0-dev28**.
 
 >[!CAUTION]
 > You are reading the README for the upcoming version 2.0 of lsfg-vk. For the stable version 1.x, [please read here](https://github.com/PancakeTAS/lsfg-vk/tree/ff1a0f72a7d6d08b84d58b7b4dc5f05c9f904f98)
@@ -81,6 +86,54 @@ multiplier = 1
 `target_fps` controls Fixed output cadence; it does not directly cap the
 application's source FPS. See [Configuration](docs/Configuration.md) for the
 complete semantics and hot-reload limitations.
+
+Fixed Target also keeps a stable physical-device identity for diagnostics and
+explicit device-pair experiments. Dual-GPU transport is not automatically
+selected for production frame generation.
+
+### Adaptive 1x bypass
+
+Adaptive mode with `multiplier = 1` bypasses frame generation while keeping the
+profile and layer active. This is a generation bypass, not a complete unload of
+the Vulkan layer or backend.
+
+## Cross-device development probes
+
+The CLI exposes diagnostic commands. They are not production runtime features
+and do not change the default same-GPU path:
+
+```bash
+lsfg-vk-cli devices
+lsfg-vk-cli interop
+lsfg-vk-cli interop-buffer-probe --allocator PATH --device-a INDEX --device-b INDEX
+lsfg-vk-cli interop-sync-fd-probe --allocator PATH --device-a INDEX --device-b INDEX
+```
+
+The probes cover, in isolated steps:
+
+- external buffer capability discovery;
+- cross-device DMA-BUF `VkBuffer` import/use;
+- binary semaphore `SYNC_FD` synchronization between Vulkan devices.
+
+The DMA-BUF buffer probe and the `SYNC_FD` bridge were validated on the
+development hardware combination **AMD Ryzen 9 7900 / RADV** and **NVIDIA RTX
+3060**. This validates that specific diagnostic path and pair only. It is not a
+claim of PCIe peer-to-peer access, physical zero-copy, performance, universal
+compatibility, shared `VkImage` support, or modifier compatibility.
+
+Cross-device transport is not integrated into LSFG frame generation, the
+swapchain, the production backend, or the configuration UI. Same-GPU remains
+the default safe runtime behavior.
+
+## Current limitations
+
+- Fixed Target does not limit the application's source FPS.
+- Adaptive 1x does not completely unload the layer/backend.
+- Dual-GPU operation is not integrated into the production runtime or UI.
+- The validated probes do not establish PCIe P2P, physical zero-copy, or
+  performance characteristics.
+- Results are not a universal compatibility claim for other GPUs, drivers, or
+  allocator paths.
 
 ### Benchmarking Mode
 You can run a frame generation benchmark using `lsfg-vk-cli`:
