@@ -81,6 +81,26 @@ bool ExternalSemaphoreCapability::queriedHandleCompatible() const {
         && hasFlag(this->compatibleHandleTypes, this->handleType);
 }
 
+bool ExternalBufferCapability::exportable() const {
+    return hasFlag(this->externalMemoryFeatures,
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+}
+
+bool ExternalBufferCapability::importable() const {
+    return hasFlag(this->externalMemoryFeatures,
+        VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+}
+
+bool ExternalBufferCapability::dedicatedOnly() const {
+    return hasFlag(this->externalMemoryFeatures,
+        VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT);
+}
+
+bool ExternalBufferCapability::queriedHandleCompatible() const {
+    return this->query.handleType != 0
+        && hasFlag(this->compatibleHandleTypes, this->query.handleType);
+}
+
 ExternalImageCapability vk::queryExternalImageCapability(
         const VulkanInstanceInventoryFuncs& funcs,
         VkPhysicalDevice device,
@@ -144,5 +164,28 @@ ExternalSemaphoreCapability vk::queryExternalSemaphoreCapability(
         .exportFromImportedHandleTypes =
             externalProperties.exportFromImportedHandleTypes,
         .compatibleHandleTypes = externalProperties.compatibleHandleTypes
+    };
+}
+
+ExternalBufferCapability vk::queryExternalBufferCapability(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkPhysicalDevice device,
+        const ExternalBufferCapabilityQuery& query) {
+    const VkPhysicalDeviceExternalBufferInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+        .flags = query.flags,
+        .usage = query.usage,
+        .handleType = query.handleType
+    };
+    VkExternalBufferProperties properties{
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES
+    };
+    funcs.GetPhysicalDeviceExternalBufferProperties(device, &info, &properties);
+    return {
+        .query = query,
+        .externalMemoryFeatures = properties.externalMemoryProperties.externalMemoryFeatures,
+        .exportFromImportedHandleTypes =
+            properties.externalMemoryProperties.exportFromImportedHandleTypes,
+        .compatibleHandleTypes = properties.externalMemoryProperties.compatibleHandleTypes
     };
 }

@@ -151,6 +151,9 @@ namespace {
             .GetPhysicalDeviceImageFormatProperties2 =
                 ipa<PFN_vkGetPhysicalDeviceImageFormatProperties2>(mpa, instance,
                     "vkGetPhysicalDeviceImageFormatProperties2"),
+            .GetPhysicalDeviceExternalBufferProperties =
+                ipa<PFN_vkGetPhysicalDeviceExternalBufferProperties>(mpa, instance,
+                    "vkGetPhysicalDeviceExternalBufferProperties"),
             .GetPhysicalDeviceExternalSemaphoreProperties =
                 ipa<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, instance,
                     "vkGetPhysicalDeviceExternalSemaphoreProperties")

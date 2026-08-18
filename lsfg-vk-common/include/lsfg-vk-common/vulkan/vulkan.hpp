@@ -24,6 +24,8 @@ namespace vk {
         PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
         PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
         PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalBufferProperties
+            GetPhysicalDeviceExternalBufferProperties;
         PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
             GetPhysicalDeviceExternalSemaphoreProperties;
     };

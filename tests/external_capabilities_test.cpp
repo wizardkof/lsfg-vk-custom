@@ -25,6 +25,13 @@ namespace {
     VkExternalSemaphoreHandleTypeFlags semaphoreCompatible{};
     VkExternalSemaphoreHandleTypeFlagBits observedSemaphoreHandle{};
 
+    VkExternalMemoryFeatureFlags bufferFeatures{};
+    VkExternalMemoryHandleTypeFlags bufferExportFromImported{};
+    VkExternalMemoryHandleTypeFlags bufferCompatible{};
+    VkBufferCreateFlags observedBufferFlags{};
+    VkBufferUsageFlags observedBufferUsage{};
+    VkExternalMemoryHandleTypeFlagBits observedBufferHandle{};
+
     VKAPI_ATTR VkResult VKAPI_CALL getPhysicalDeviceImageFormatProperties2(
             VkPhysicalDevice,
             const VkPhysicalDeviceImageFormatInfo2* info,
@@ -77,10 +84,30 @@ namespace {
         properties->compatibleHandleTypes = semaphoreCompatible;
     }
 
+    VKAPI_ATTR void VKAPI_CALL getPhysicalDeviceExternalBufferProperties(
+            VkPhysicalDevice,
+            const VkPhysicalDeviceExternalBufferInfo* info,
+            VkExternalBufferProperties* properties) {
+        assert(info != nullptr);
+        assert(info->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO);
+        observedBufferFlags = info->flags;
+        observedBufferUsage = info->usage;
+        observedBufferHandle = info->handleType;
+        assert(properties != nullptr);
+        assert(properties->sType == VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES);
+        properties->externalMemoryProperties = {
+            .externalMemoryFeatures = bufferFeatures,
+            .exportFromImportedHandleTypes = bufferExportFromImported,
+            .compatibleHandleTypes = bufferCompatible
+        };
+    }
+
     vk::VulkanInstanceInventoryFuncs fakeFunctions() {
         return {
             .GetPhysicalDeviceImageFormatProperties2 =
                 getPhysicalDeviceImageFormatProperties2,
+            .GetPhysicalDeviceExternalBufferProperties =
+                getPhysicalDeviceExternalBufferProperties,
             .GetPhysicalDeviceExternalSemaphoreProperties =
                 getPhysicalDeviceExternalSemaphoreProperties
         };
@@ -261,6 +288,33 @@ int main() {
     semaphoreCompatible = 0;
     semaphoreCapability = querySemaphore(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
     assert(!semaphoreCapability.queriedHandleCompatible());
+
+    bufferFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT
+        | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT
+        | VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+    bufferExportFromImported = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    bufferCompatible = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    const vk::ExternalBufferCapabilityQuery bufferQuery{
+        .flags = 0,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+    auto bufferCapability = vk::queryExternalBufferCapability(
+        fakeFunctions(), reinterpret_cast<VkPhysicalDevice>(uintptr_t{1}), bufferQuery);
+    assert(observedBufferFlags == 0);
+    assert(observedBufferUsage == bufferQuery.usage);
+    assert(observedBufferHandle == bufferQuery.handleType);
+    assert(bufferCapability.exportable());
+    assert(bufferCapability.importable());
+    assert(bufferCapability.dedicatedOnly());
+    assert(bufferCapability.queriedHandleCompatible());
+    bufferFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+    bufferCompatible = 0;
+    bufferCapability = vk::queryExternalBufferCapability(
+        fakeFunctions(), reinterpret_cast<VkPhysicalDevice>(uintptr_t{1}), bufferQuery);
+    assert(!bufferCapability.exportable());
+    assert(bufferCapability.importable());
+    assert(!bufferCapability.queriedHandleCompatible());
 
     return 0;
 }

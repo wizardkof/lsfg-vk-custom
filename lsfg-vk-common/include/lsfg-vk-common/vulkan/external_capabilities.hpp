@@ -56,6 +56,24 @@ namespace vk {
         [[nodiscard]] bool importable() const;
         [[nodiscard]] bool queriedHandleCompatible() const;
     };
+
+    struct ExternalBufferCapabilityQuery {
+        VkBufferCreateFlags flags{};
+        VkBufferUsageFlags usage{};
+        VkExternalMemoryHandleTypeFlagBits handleType{};
+    };
+
+    struct ExternalBufferCapability {
+        ExternalBufferCapabilityQuery query;
+        VkExternalMemoryFeatureFlags externalMemoryFeatures{};
+        VkExternalMemoryHandleTypeFlags exportFromImportedHandleTypes{};
+        VkExternalMemoryHandleTypeFlags compatibleHandleTypes{};
+
+        [[nodiscard]] bool exportable() const;
+        [[nodiscard]] bool importable() const;
+        [[nodiscard]] bool dedicatedOnly() const;
+        [[nodiscard]] bool queriedHandleCompatible() const;
+    };
     // NOLINTEND(misc-non-private-member-variables-in-classes)
 
     /// Query raw external-memory capabilities for one exact image descriptor.
@@ -70,6 +88,12 @@ namespace vk {
         const VulkanInstanceInventoryFuncs& funcs,
         VkPhysicalDevice device,
         VkExternalSemaphoreHandleTypeFlagBits handleType
+    );
+
+    [[nodiscard]] ExternalBufferCapability queryExternalBufferCapability(
+        const VulkanInstanceInventoryFuncs& funcs,
+        VkPhysicalDevice device,
+        const ExternalBufferCapabilityQuery& query
     );
 
 }
