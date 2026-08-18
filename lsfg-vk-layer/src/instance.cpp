@@ -7,6 +7,7 @@
 #include "lsfg-vk-common/configuration/detection.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/runtime_device_pair.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
@@ -157,8 +158,9 @@ namespace {
                     << yesNo(extensionAdvertised(snapshot, extension)) << "\n";
         }
 
-        const auto selection = vk::resolveDeviceSelection(
+        const auto pairResolution = vk::resolveRuntimeDevicePair(
             backendDevices, applicationIdentity, selector);
+        const auto& selection = pairResolution.selection;
         std::cerr << "[DG2A] Selection\n"
             << "  Requested: " << (selector.has_value() ? *selector : "Default") << "\n"
             << "  Resolution: " << selectionResolutionName(selection.resolution) << "\n";
@@ -179,6 +181,26 @@ namespace {
                 << "  Cross-GPU required: UNKNOWN\n";
         }
         logVulkanEnvironment();
+    }
+
+    [[nodiscard]] const char* runtimePairModeName(vk::RuntimeDevicePairMode mode) {
+        switch (mode) {
+            case vk::RuntimeDevicePairMode::SamePhysicalDevice:
+                return "SAME_PHYSICAL_DEVICE";
+            case vk::RuntimeDevicePairMode::CrossPhysicalDevice:
+                return "CROSS_PHYSICAL_DEVICE";
+        }
+        return "UNKNOWN";
+    }
+
+    void logRuntimeDevicePair(const vk::RuntimeDevicePair& pair) {
+        std::cerr << "[DG2X-P3C] Runtime device pair\n"
+            << "  Render device: " << pair.render.identity.name << "\n"
+            << "  Generation device: " << pair.generation.identity.name << "\n"
+            << "  Mode: " << runtimePairModeName(pair.mode) << "\n"
+            << "  Render logical-device owner: APPLICATION\n"
+            << "  Generation logical-device owner: BACKEND\n"
+            << "  Cross-device transport connected: NO\n";
     }
 }
 
@@ -347,7 +369,7 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
         std::vector<vk::PhysicalDeviceSnapshot> backendDevices;
         bool backendEnumerationObserved{false};
         bool diagnosticLogged{false};
-        std::optional<vk::PhysicalDeviceIdentity> selectedIdentity;
+        std::optional<vk::RuntimeDevicePairResolution> plannedPair;
         try {
             std::string dll{};
             if (global.dll.has_value())
@@ -356,21 +378,20 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
                 dll = ls::findShaderDll();
 
             const backend::DevicePicker picker{
-                [gpu = profile.gpu, applicationIdentity, &selectedIdentity](
-                    const vk::PhysicalDeviceIdentity& candidate) {
-                    const bool selected = !gpu
-                        ? candidate.samePhysicalDevice(applicationIdentity)
-                        : candidate.matchesSelector(*gpu);
-                    if (selected && !selectedIdentity.has_value())
-                        selectedIdentity = candidate;
-                    return selected;
+                [&plannedPair](const vk::PhysicalDeviceIdentity& candidate) {
+                    return plannedPair.has_value()
+                        && plannedPair->pair.has_value()
+                        && plannedPair->pair->matchesGenerationDevice(candidate);
                 }
             };
             const backend::DeviceEnumerationObserver observer{
-                [&backendDevices, &backendEnumerationObserved](
+                [&backendDevices, &backendEnumerationObserved, &plannedPair,
+                    applicationIdentity, generationSelector = profile.gpu](
                         const std::vector<vk::PhysicalDeviceSnapshot>& devices) {
                     backendDevices = devices;
                     backendEnumerationObserved = true;
+                    plannedPair = vk::resolveRuntimeDevicePair(
+                        devices, applicationIdentity, generationSelector);
                 }
             };
             this->backend.emplace(
@@ -380,15 +401,23 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
             );
 
             const auto& generationIdentity = this->backend->deviceIdentity();
+            if (!plannedPair.has_value() || !plannedPair->pair.has_value()
+                    || !plannedPair->pair->matchesGenerationDevice(generationIdentity))
+                throw ls::error(
+                    "backend generation GPU does not match the resolved runtime device pair");
+
             logDeviceSelectionDiagnostic(applicationIdentity,
                 backendDevices, backendEnumerationObserved,
                 profile.gpu, generationIdentity);
             diagnosticLogged = true;
         } catch (const std::exception& e) {
+            std::optional<vk::PhysicalDeviceIdentity> plannedGenerationIdentity;
+            if (plannedPair.has_value() && plannedPair->pair.has_value())
+                plannedGenerationIdentity = plannedPair->pair->generation.identity;
             if (!diagnosticLogged)
                 logDeviceSelectionDiagnostic(applicationIdentity,
                     backendDevices, backendEnumerationObserved,
-                    profile.gpu, selectedIdentity);
+                    profile.gpu, plannedGenerationIdentity);
             unsetenv("DISABLE_LSFGVK");
             throw ls::error("failed to create backend instance", e);
         }
@@ -396,12 +425,18 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
         unsetenv("DISABLE_LSFGVK");
     }
 
-    if (!profile.gpu
-            && !this->backend->deviceIdentity().samePhysicalDevice(applicationIdentity))
-        throw ls::error("default frame generation GPU does not match the application GPU");
+    const auto runtimePair = vk::bindRuntimeDevicePair(
+        applicationIdentity, this->backend->deviceIdentity(), profile.gpu);
+    if (!runtimePair.has_value())
+        throw ls::error("runtime render/generation device pair contract mismatch");
+
+    logRuntimeDevicePair(*runtimePair);
+    if (runtimePair->crossDevice())
+        throw ls::error(
+            "cross-device runtime pair resolved, but frame transport is not connected yet");
 
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), profile, info));
+        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info));
 }
 
 VkResult Root::presentSwapchain(const vk::Vulkan& vk,
@@ -429,9 +464,20 @@ void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
     if (!this->backend.has_value())
         throw ls::error("attempted to recreate swapchain context without backend");
 
+    const auto applicationIdentity = vk::getPhysicalDeviceIdentity(
+        vk.fi(), vk.physdev());
+    const auto& profile = snapshot.activeProfile();
+    const auto runtimePair = vk::bindRuntimeDevicePair(
+        applicationIdentity, this->backend->deviceIdentity(), profile.gpu);
+    if (!runtimePair.has_value())
+        throw ls::error("runtime render/generation device pair contract mismatch");
+    if (runtimePair->crossDevice())
+        throw ls::error(
+            "cross-device runtime pair resolved, but frame transport is not connected yet");
+
     this->swapchains.erase(swapchain);
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), snapshot.activeProfile(), info));
+        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info));
 }
 
 void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {

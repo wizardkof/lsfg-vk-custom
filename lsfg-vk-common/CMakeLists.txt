@@ -13,6 +13,7 @@ set(COMMON_SOURCES
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
     "src/vulkan/physical_device.cpp"
+    "src/vulkan/runtime_device_pair.cpp"
     "src/vulkan/sampler.cpp"
     "src/vulkan/semaphore.cpp"
     "src/vulkan/shader.cpp"

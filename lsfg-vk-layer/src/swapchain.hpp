@@ -10,6 +10,7 @@
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
+#include "lsfg-vk-common/vulkan/runtime_device_pair.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -67,10 +68,18 @@ namespace lsfgvk::layer {
         /// create a new swapchain context
         /// @param vk vulkan instance
         /// @param backend lsfg-vk backend instance
+        /// @param devicePair immutable render/generation physical-device role binding
         /// @param profile active game profile
         /// @param info swapchain info
         Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
+            vk::RuntimeDevicePair devicePair,
             ls::GameConf profile, SwapchainInfo info);
+
+        /// Runtime render/generation role binding captured for this swapchain.
+        /// P3C exposes identity/ownership only; transport is connected later.
+        [[nodiscard]] const vk::RuntimeDevicePair& runtimeDevicePair() const noexcept {
+            return this->devicePair;
+        }
 
         /// present a frame
         /// @param vk vulkan instance
@@ -107,6 +116,7 @@ namespace lsfgvk::layer {
         ls::lazy<vk::Semaphore> virtualFinalPresentSemaphore;
 
         ls::R<backend::Instance> instance;
+        vk::RuntimeDevicePair devicePair;
         ls::owned_ptr<ls::R<backend::Context>> ctx;
         size_t idx{1};
         size_t fidx{0}; // real frame index

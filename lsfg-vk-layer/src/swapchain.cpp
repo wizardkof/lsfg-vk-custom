@@ -127,8 +127,10 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
 }
 
 Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
+            vk::RuntimeDevicePair devicePair,
             ls::GameConf profile, SwapchainInfo info) :
         instance(backend),
+        devicePair(std::move(devicePair)),
         fixedScheduler(profile.target_fps),
         fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {

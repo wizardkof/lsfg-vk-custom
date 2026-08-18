@@ -100,6 +100,20 @@ add_test(
     NAME lsfg-vk-test-physical-device-diagnostics
     COMMAND lsfg-vk-test-physical-device-diagnostics)
 
+add_executable(lsfg-vk-test-runtime-device-pair
+    runtime_device_pair_test.cpp)
+
+target_compile_options(lsfg-vk-test-runtime-device-pair PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-runtime-device-pair
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-runtime-device-pair
+    COMMAND lsfg-vk-test-runtime-device-pair)
+
 add_executable(lsfg-vk-test-external-capabilities
     external_capabilities_test.cpp)
 
