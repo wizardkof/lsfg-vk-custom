@@ -5,6 +5,7 @@
 #include "tools/devices.hpp"
 #include "tools/interop.hpp"
 #include "tools/interop_buffer_probe.hpp"
+#include "tools/interop_sync_fd_probe.hpp"
 #include "tools/validate.hpp"
 
 #include <array>
@@ -41,6 +42,8 @@ namespace {
             std::cerr << " interop\n\n";
         else if (command == "interop-buffer-probe")
             std::cerr << " interop-buffer-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
+        else if (command == "interop-sync-fd-probe")
+            std::cerr << " interop-sync-fd-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
         else
             std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
 
@@ -52,6 +55,7 @@ R"(COMMANDS:
     devices     List Vulkan devices visible to this process
     interop     Query external buffer and SYNC_FD capabilities
     interop-buffer-probe  Probe cross-device DMA_BUF buffer import/use
+    interop-sync-fd-probe  Probe cross-device SYNC_FD semaphore prerequisites
     help        Show this help text
 
 GLOBAL OPTIONS:
@@ -289,6 +293,14 @@ int main(int argc, char** argv) {
         const auto options = interop_buffer_probe::parse(args, error);
         if (!options) { std::cerr << "error: " << error << "\n"; return EXIT_FAILURE; }
         return interop_buffer_probe::run(*options);
+    }
+    else if (command == "interop-sync-fd-probe") {
+        std::vector<std::string> args;
+        for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
+        std::string error;
+        const auto options = interop_sync_fd_probe::parse(args, error);
+        if (!options) { std::cerr << "error: " << error << "\n"; return EXIT_FAILURE; }
+        return interop_sync_fd_probe::run(*options);
     }
     else if (command == "benchmark")
         on_benchmark(argc - 1, argv + 1, prog);

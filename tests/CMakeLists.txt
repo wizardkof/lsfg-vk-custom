@@ -203,6 +203,18 @@ target_link_libraries(lsfg-vk-test-interop-buffer-probe PRIVATE
     lsfg-vk-common PkgConfig::TEST_GBM)
 add_test(NAME lsfg-vk-test-interop-buffer-probe
     COMMAND lsfg-vk-test-interop-buffer-probe)
+
+add_executable(lsfg-vk-test-interop-sync-fd-probe
+    interop_sync_fd_probe_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/interop_sync_fd_probe.cpp")
+target_include_directories(lsfg-vk-test-interop-sync-fd-probe PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src")
+target_compile_options(lsfg-vk-test-interop-sync-fd-probe PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-interop-sync-fd-probe PRIVATE
+    lsfg-vk-common PkgConfig::TEST_GBM)
+add_test(NAME lsfg-vk-test-interop-sync-fd-probe
+    COMMAND lsfg-vk-test-interop-sync-fd-probe)
     add_test(NAME lsfg-vk-test-cli-help
         COMMAND lsfg-vk-cli --help)
     add_test(NAME lsfg-vk-test-cli-devices-help
