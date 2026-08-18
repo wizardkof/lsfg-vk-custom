@@ -45,6 +45,18 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         .CreateFence = vk.df().CreateFence,
         .DestroyFence = vk.df().DestroyFence,
         .WaitForFences = vk.df().WaitForFences,
-        .DeviceWaitIdle = vk.df().DeviceWaitIdle
+        .DeviceWaitIdle = vk.df().DeviceWaitIdle,
+        .CreateCommandPool = vk.df().CreateCommandPool,
+        .DestroyCommandPool = vk.df().DestroyCommandPool,
+        .AllocateCommandBuffers = vk.df().AllocateCommandBuffers,
+        .FreeCommandBuffers = vk.df().FreeCommandBuffers,
+        .BeginCommandBuffer = vk.df().BeginCommandBuffer,
+        .EndCommandBuffer = vk.df().EndCommandBuffer,
+        .CmdPipelineBarrier = vk.df().CmdPipelineBarrier,
+        .CmdFillBuffer = vk.df().CmdFillBuffer,
+        .CmdCopyBuffer = vk.df().CmdCopyBuffer,
+        .MapMemory = vk.df().MapMemory,
+        .UnmapMemory = vk.df().UnmapMemory,
+        .InvalidateMappedMemoryRanges = vk.df().InvalidateMappedMemoryRanges
     };
 }

@@ -83,11 +83,14 @@ namespace vk {
         PFN_vkBindBufferMemory BindBufferMemory;
         PFN_vkMapMemory MapMemory;
         PFN_vkUnmapMemory UnmapMemory;
+        PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges;
         PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
         PFN_vkFreeCommandBuffers FreeCommandBuffers;
         PFN_vkBeginCommandBuffer BeginCommandBuffer;
         PFN_vkEndCommandBuffer EndCommandBuffer;
         PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+        PFN_vkCmdFillBuffer CmdFillBuffer;
+        PFN_vkCmdCopyBuffer CmdCopyBuffer;
         PFN_vkCmdBlitImage CmdBlitImage;
         PFN_vkCmdClearColorImage CmdClearColorImage;
         PFN_vkCmdBindPipeline CmdBindPipeline;

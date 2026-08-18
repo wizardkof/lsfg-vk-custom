@@ -128,6 +128,16 @@ add_test(
     NAME lsfg-vk-test-runtime-exchange-channel
     COMMAND lsfg-vk-test-runtime-exchange-channel)
 
+add_executable(lsfg-vk-test-runtime-payload-exchange
+    runtime_payload_exchange_test.cpp)
+target_compile_options(lsfg-vk-test-runtime-payload-exchange PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-runtime-payload-exchange PRIVATE lsfg-vk-common)
+add_test(
+    NAME lsfg-vk-test-runtime-payload-exchange
+    COMMAND lsfg-vk-test-runtime-payload-exchange)
+
 if(LSFGVK_BUILD_VK_LAYER)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(TEST_RUNTIME_GBM REQUIRED IMPORTED_TARGET gbm)

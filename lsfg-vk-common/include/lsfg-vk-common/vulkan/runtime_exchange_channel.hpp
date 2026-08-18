@@ -7,6 +7,8 @@
 #include "runtime_device_pair.hpp"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -27,6 +29,18 @@ namespace vk {
         PFN_vkDestroyFence DestroyFence{};
         PFN_vkWaitForFences WaitForFences{};
         PFN_vkDeviceWaitIdle DeviceWaitIdle{};
+        PFN_vkCreateCommandPool CreateCommandPool{};
+        PFN_vkDestroyCommandPool DestroyCommandPool{};
+        PFN_vkAllocateCommandBuffers AllocateCommandBuffers{};
+        PFN_vkFreeCommandBuffers FreeCommandBuffers{};
+        PFN_vkBeginCommandBuffer BeginCommandBuffer{};
+        PFN_vkEndCommandBuffer EndCommandBuffer{};
+        PFN_vkCmdPipelineBarrier CmdPipelineBarrier{};
+        PFN_vkCmdFillBuffer CmdFillBuffer{};
+        PFN_vkCmdCopyBuffer CmdCopyBuffer{};
+        PFN_vkMapMemory MapMemory{};
+        PFN_vkUnmapMemory UnmapMemory{};
+        PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges{};
     };
 
     struct RuntimeExchangeChannelInfo {
@@ -40,6 +54,20 @@ namespace vk {
         bool generationToRenderSentinel{};
         bool hostWaitBeforeFinalSubmit{};
     };
+
+    struct RuntimeExchangePayloadDiagnostics {
+        VkDeviceSize payloadSize{};
+        bool renderWrite{};
+        bool generationObservedRender{};
+        bool generationWrite{};
+        bool renderObservedGeneration{};
+        bool hostWaitBeforeFinalSubmit{};
+    };
+
+    [[nodiscard]] bool validRuntimePayloadExchangeOrder(
+        const std::vector<std::string>& events) noexcept;
+    [[nodiscard]] bool verifyRuntimePayloadPattern(
+        const std::vector<uint32_t>& words, uint32_t expected) noexcept;
 
     /// Adapt an already-created logical Vulkan device to the narrow P3D endpoint contract.
     [[nodiscard]] RuntimeExchangeEndpoint makeRuntimeExchangeEndpoint(const Vulkan& vk);
@@ -72,6 +100,12 @@ namespace vk {
         /// Submit an empty binary-semaphore round trip A -> B -> A using SYNC_FD.
         /// The only host fence wait occurs after the final A submit.
         [[nodiscard]] RuntimeExchangeSyncDiagnostics validateSyncRoundTrip();
+
+        /// Execute a real GPU-side A -> B -> A payload exchange over the already
+        /// imported DMA-BUF buffers. CPU readback is performed only after the
+        /// final A fence and is never used as the cross-device transport.
+        [[nodiscard]] RuntimeExchangePayloadDiagnostics validatePayloadRoundTrip(
+            VkDeviceSize payloadSize);
 
     private:
         friend RuntimeExchangeChannel createRuntimeExchangeChannel(
