@@ -167,7 +167,10 @@ namespace {
                     "vkGetPhysicalDeviceExternalBufferProperties"),
             .GetPhysicalDeviceExternalSemaphoreProperties =
                 ipa<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, instance,
-                    "vkGetPhysicalDeviceExternalSemaphoreProperties")
+                    "vkGetPhysicalDeviceExternalSemaphoreProperties"),
+            .GetPhysicalDeviceFormatProperties2 =
+                ipa<PFN_vkGetPhysicalDeviceFormatProperties2>(mpa, instance,
+                    "vkGetPhysicalDeviceFormatProperties2")
         };
     }
 
@@ -447,6 +450,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CmdBindDescriptorSets = dpa<PFN_vkCmdBindDescriptorSets>(f, d, "vkCmdBindDescriptorSets"),
         .CmdDispatch = dpa<PFN_vkCmdDispatch>(f, d, "vkCmdDispatch"),
         .CmdCopyBufferToImage = dpa<PFN_vkCmdCopyBufferToImage>(f, d, "vkCmdCopyBufferToImage"),
+        .CmdCopyImageToBuffer = dpa<PFN_vkCmdCopyImageToBuffer>(f, d, "vkCmdCopyImageToBuffer"),
         .QueueSubmit = dpa<PFN_vkQueueSubmit>(f, d, "vkQueueSubmit"),
         .AllocateDescriptorSets = dpa<PFN_vkAllocateDescriptorSets>(f, d,
             "vkAllocateDescriptorSets"),
@@ -460,6 +464,8 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .DestroyImage = dpa<PFN_vkDestroyImage>(f, d, "vkDestroyImage"),
         .GetImageMemoryRequirements = dpa<PFN_vkGetImageMemoryRequirements>(f, d,
             "vkGetImageMemoryRequirements"),
+        .GetImageMemoryRequirements2 = dpa<PFN_vkGetImageMemoryRequirements2>(f, d,
+            "vkGetImageMemoryRequirements2"),
         .BindImageMemory = dpa<PFN_vkBindImageMemory>(f, d, "vkBindImageMemory"),
         .CreateImageView = dpa<PFN_vkCreateImageView>(f, d, "vkCreateImageView"),
         .DestroyImageView = dpa<PFN_vkDestroyImageView>(f, d, "vkDestroyImageView"),

@@ -189,6 +189,14 @@ add_test(
     NAME lsfg-vk-test-external-image-contract
     COMMAND lsfg-vk-test-external-image-contract)
 
+add_executable(lsfg-vk-test-external-image-transport
+    external_image_transport_test.cpp)
+target_compile_options(lsfg-vk-test-external-image-transport PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-external-image-transport PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-external-image-transport
+    COMMAND lsfg-vk-test-external-image-transport)
+
 add_executable(lsfg-vk-test-exchange-image-sync
     exchange_image_sync_test.cpp)
 

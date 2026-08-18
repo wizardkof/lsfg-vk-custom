@@ -6,6 +6,7 @@
 #include "tools/interop.hpp"
 #include "tools/interop_buffer_probe.hpp"
 #include "tools/interop_sync_fd_probe.hpp"
+#include "tools/interop_image_probe.hpp"
 #include "tools/validate.hpp"
 
 #include <array>
@@ -44,6 +45,8 @@ namespace {
             std::cerr << " interop-buffer-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
         else if (command == "interop-sync-fd-probe")
             std::cerr << " interop-sync-fd-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
+        else if (command == "interop-image-probe")
+            std::cerr << " interop-image-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
         else
             std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
 
@@ -56,6 +59,7 @@ R"(COMMANDS:
     interop     Query external buffer and SYNC_FD capabilities
     interop-buffer-probe  Probe cross-device DMA_BUF buffer import/use
     interop-sync-fd-probe  Probe cross-device SYNC_FD semaphore prerequisites
+    interop-image-probe  Discover a common cross-device DMA-BUF VkImage contract
     help        Show this help text
 
 GLOBAL OPTIONS:
@@ -301,6 +305,14 @@ int main(int argc, char** argv) {
         const auto options = interop_sync_fd_probe::parse(args, error);
         if (!options) { std::cerr << "error: " << error << "\n"; return EXIT_FAILURE; }
         return interop_sync_fd_probe::run(*options);
+    }
+    else if (command == "interop-image-probe") {
+        std::vector<std::string> args;
+        for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
+        std::string error;
+        const auto options = interop_image_probe::parse(args, error);
+        if (!options) { std::cerr << "error: " << error << "\n"; return EXIT_FAILURE; }
+        return interop_image_probe::run(*options);
     }
     else if (command == "benchmark")
         on_benchmark(argc - 1, argv + 1, prog);

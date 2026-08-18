@@ -5,6 +5,7 @@ set(CLI_SOURCES
     "src/tools/interop.cpp"
     "src/tools/interop_buffer_probe.cpp"
     "src/tools/interop_sync_fd_probe.cpp"
+    "src/tools/interop_image_probe.cpp"
     "src/tools/validate.cpp"
     "src/main.cpp")
 

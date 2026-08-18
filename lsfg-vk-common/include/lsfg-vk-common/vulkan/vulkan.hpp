@@ -32,6 +32,7 @@ namespace vk {
             GetPhysicalDeviceExternalBufferProperties;
         PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
             GetPhysicalDeviceExternalSemaphoreProperties;
+        PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
     };
 
     /// vulkan instance function pointers
@@ -97,6 +98,7 @@ namespace vk {
         PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
         PFN_vkCmdDispatch CmdDispatch;
         PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+        PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
         PFN_vkQueueSubmit QueueSubmit;
         PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
         PFN_vkFreeDescriptorSets FreeDescriptorSets;
@@ -108,6 +110,7 @@ namespace vk {
         PFN_vkCreateImage CreateImage;
         PFN_vkDestroyImage DestroyImage;
         PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
+        PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2;
         PFN_vkBindImageMemory BindImageMemory;
         PFN_vkCreateImageView CreateImageView;
         PFN_vkDestroyImageView DestroyImageView;
