@@ -4,6 +4,7 @@
 #include "tools/debug.hpp"
 #include "tools/devices.hpp"
 #include "tools/interop.hpp"
+#include "tools/interop_buffer_probe.hpp"
 #include "tools/validate.hpp"
 
 #include <array>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <getopt.h> // NOLINT (IWYU)
 #include <bits/getopt_core.h>
@@ -37,6 +39,8 @@ namespace {
             std::cerr << " devices [--help]\n\n";
         else if (command == "interop")
             std::cerr << " interop\n\n";
+        else if (command == "interop-buffer-probe")
+            std::cerr << " interop-buffer-probe --allocator PATH --device-a INDEX --device-b INDEX\n\n";
         else
             std::cerr << " <COMMAND> [OPTIONS] [ARGS]\n\n";
 
@@ -47,6 +51,7 @@ R"(COMMANDS:
     debug       Run lsfg-vk on a set of images
     devices     List Vulkan devices visible to this process
     interop     Query external buffer and SYNC_FD capabilities
+    interop-buffer-probe  Probe cross-device DMA_BUF buffer import/use
     help        Show this help text
 
 GLOBAL OPTIONS:
@@ -277,6 +282,14 @@ int main(int argc, char** argv) {
         on_devices(argc - 1, argv + 1, prog);
     else if (command == "interop")
         return lsfgvk::cli::interop::run();
+    else if (command == "interop-buffer-probe") {
+        std::vector<std::string> args;
+        for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
+        std::string error;
+        const auto options = interop_buffer_probe::parse(args, error);
+        if (!options) { std::cerr << "error: " << error << "\n"; return EXIT_FAILURE; }
+        return interop_buffer_probe::run(*options);
+    }
     else if (command == "benchmark")
         on_benchmark(argc - 1, argv + 1, prog);
     else if (command == "debug")

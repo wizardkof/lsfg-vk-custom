@@ -148,6 +148,15 @@ namespace {
                     "vkEnumerateDeviceExtensionProperties"),
             .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, instance,
                 "vkGetPhysicalDeviceProperties2"),
+            .GetPhysicalDeviceQueueFamilyProperties =
+                ipa<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(mpa, instance,
+                    "vkGetPhysicalDeviceQueueFamilyProperties"),
+            .GetPhysicalDeviceMemoryProperties =
+                ipa<PFN_vkGetPhysicalDeviceMemoryProperties>(mpa, instance,
+                    "vkGetPhysicalDeviceMemoryProperties"),
+            .CreateDevice = ipa<PFN_vkCreateDevice>(mpa, instance, "vkCreateDevice"),
+            .GetDeviceProcAddr = ipa<PFN_vkGetDeviceProcAddr>(mpa, instance,
+                "vkGetDeviceProcAddr"),
             .GetPhysicalDeviceImageFormatProperties2 =
                 ipa<PFN_vkGetPhysicalDeviceImageFormatProperties2>(mpa, instance,
                     "vkGetPhysicalDeviceImageFormatProperties2"),

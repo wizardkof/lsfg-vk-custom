@@ -23,6 +23,10 @@ namespace vk {
         PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
         PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
         PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+        PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
+        PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
+        PFN_vkCreateDevice CreateDevice;
+        PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
         PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
         PFN_vkGetPhysicalDeviceExternalBufferProperties
             GetPhysicalDeviceExternalBufferProperties;
