@@ -2,6 +2,7 @@
 #include "interop_sync_fd_probe.hpp"
 
 #include "lsfg-vk-common/helpers/owned_fd.hpp"
+#include "lsfg-vk-common/vulkan/external_semaphore_sync.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -155,23 +156,6 @@ struct CommandWork {
     }
 };
 
-struct Semaphore {
-    Device* device{};
-    VkSemaphore semaphore{};
-
-    explicit Semaphore(Device* device = nullptr) : device(device) {}
-    Semaphore(const Semaphore&) = delete;
-    Semaphore& operator=(const Semaphore&) = delete;
-    Semaphore(Semaphore&& other) noexcept
-        : device(std::exchange(other.device, nullptr)),
-          semaphore(std::exchange(other.semaphore, VK_NULL_HANDLE)) {}
-
-    ~Semaphore() {
-        if (device && semaphore)
-            device->destroySemaphore(device->device, semaphore, nullptr);
-    }
-};
-
 struct Fence {
     Device* device{};
     VkFence fence{};
@@ -202,16 +186,6 @@ struct GbmPayload {
             gbm_bo_destroy(bo);
         if (device)
             gbm_device_destroy(device);
-    }
-};
-
-struct SyncFdPayload {
-    bool valid{};
-    bool sentinel{};
-    ls::OwnedFd fd;
-
-    [[nodiscard]] int nativeFd() const noexcept {
-        return sentinel ? -1 : fd.get();
     }
 };
 
@@ -529,64 +503,53 @@ CommandWork recordAFinal(Device& device, VkBuffer shared, VkBuffer staging) {
     return work;
 }
 
-Semaphore createSemaphore(Device& device, bool exportable, probe::Failure failure) {
-    Semaphore out{&device};
-    VkExportSemaphoreCreateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO};
-    exportInfo.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-
-    VkSemaphoreCreateInfo createInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    createInfo.pNext = exportable ? &exportInfo : nullptr;
-    const VkResult result = device.createSemaphore(device.device, &createInfo, nullptr, &out.semaphore);
-    if (result != VK_SUCCESS)
-        throw ProbeFailure(failure, "VkResult=" + std::to_string(result));
-    return out;
+vk::ExternalSemaphoreDevice externalSemaphoreDevice(const Device& device) {
+    return {
+        device.device,
+        {
+            device.createSemaphore,
+            device.destroySemaphore,
+            device.getSemaphoreFd,
+            device.importSemaphoreFd
+        }
+    };
 }
 
-SyncFdPayload exportSyncFd(Device& device,
-                           VkSemaphore semaphore,
-                           probe::Failure failure) {
-    VkSemaphoreGetFdInfoKHR info{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
-    info.semaphore = semaphore;
-    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-
-    int nativeFd = -2;
-    const VkResult result = device.getSemaphoreFd(device.device, &info, &nativeFd);
-    if (result != VK_SUCCESS)
-        throw ProbeFailure(failure, "VkResult=" + std::to_string(result));
-    if (nativeFd < -1)
-        throw ProbeFailure(failure, "driver returned invalid fd");
-
-    SyncFdPayload payload;
-    payload.valid = true;
-    payload.sentinel = nativeFd == -1;
-    if (nativeFd >= 0)
-        payload.fd.reset(nativeFd);
-    return payload;
+vk::SyncFdSemaphore createSemaphore(
+        Device& device, bool exportable, probe::Failure failure) {
+    try {
+        const auto external = externalSemaphoreDevice(device);
+        return exportable
+            ? vk::createExportableSyncFdSemaphore(external)
+            : vk::createSyncFdImportSemaphore(external);
+    } catch (const vk::ExternalSemaphoreError& error) {
+        throw ProbeFailure(failure,
+            std::string(error.what()) + " VkResult=" + std::to_string(error.result()));
+    }
 }
 
-void importSyncFd(Device& device,
-                  VkSemaphore semaphore,
-                  SyncFdPayload& payload,
-                  probe::Failure failure) {
-    const probe::ExportedFd publicView{payload.nativeFd(), payload.valid};
-    if (!probe::acceptsSyncFd(publicView))
-        throw ProbeFailure(failure, "invalid SYNC_FD payload state");
+vk::SyncFdPayload exportProbeSyncFd(
+        Device& device, VkSemaphore semaphore, probe::Failure failure) {
+    try {
+        return vk::exportSyncFd(externalSemaphoreDevice(device), semaphore);
+    } catch (const vk::ExternalSemaphoreError& error) {
+        throw ProbeFailure(failure,
+            std::string(error.what()) + " VkResult=" + std::to_string(error.result()));
+    }
+}
 
-    VkImportSemaphoreFdInfoKHR info{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR};
-    info.semaphore = semaphore;
-    info.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
-    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-    info.fd = payload.nativeFd();
-
-    const VkResult result = device.importSemaphoreFd(device.device, &info);
-    if (result != VK_SUCCESS)
-        throw ProbeFailure(failure, "VkResult=" + std::to_string(result));
-
-    // A successful fd import transfers ownership to Vulkan. -1 is the valid
-    // already-signaled SYNC_FD sentinel and has no userspace descriptor to close.
-    if (!payload.sentinel)
-        static_cast<void>(payload.fd.release());
-    payload.valid = false;
+void importProbeSyncFd(
+        Device& device,
+        VkSemaphore semaphore,
+        vk::SyncFdPayload& payload,
+        probe::Failure failure) {
+    try {
+        vk::importSyncFdTemporary(
+            externalSemaphoreDevice(device), semaphore, payload);
+    } catch (const vk::ExternalSemaphoreError& error) {
+        throw ProbeFailure(failure,
+            std::string(error.what()) + " VkResult=" + std::to_string(error.result()));
+    }
 }
 
 void submit(Device& device,
@@ -651,14 +614,6 @@ PatternResult readPattern(Device& device, Buffer& staging, uint32_t expected) {
 }
 
 } // namespace
-
-bool probe::temporaryImport() noexcept {
-    return true;
-}
-
-bool probe::acceptsSyncFd(const ExportedFd& fd) noexcept {
-    return fd.valid && fd.fd >= -1;
-}
 
 const char* probe::failureName(Failure failure) noexcept {
     switch (failure) {
@@ -826,36 +781,36 @@ int probe::run(const Options& options) {
         CommandWork workB = recordB(b, sharedB.buffer, stagingB.buffer);
         CommandWork workAFinal = recordAFinal(a, sharedA.buffer, stagingA.buffer);
 
-        Semaphore signalA = createSemaphore(a, true, Failure::ExportCreate);
-        Semaphore waitB = createSemaphore(b, false, Failure::ImportCreate);
-        Semaphore signalB = createSemaphore(b, true, Failure::ExportCreate);
-        Semaphore waitA = createSemaphore(a, false, Failure::ImportCreate);
+        vk::SyncFdSemaphore signalA = createSemaphore(a, true, Failure::ExportCreate);
+        vk::SyncFdSemaphore waitB = createSemaphore(b, false, Failure::ImportCreate);
+        vk::SyncFdSemaphore signalB = createSemaphore(b, true, Failure::ExportCreate);
+        vk::SyncFdSemaphore waitA = createSemaphore(a, false, Failure::ImportCreate);
         Fence finalFence = createFence(a);
 
         std::vector<std::string> events;
-        submit(a, workA.command, VK_NULL_HANDLE, signalA.semaphore,
+        submit(a, workA.command, VK_NULL_HANDLE, signalA.handle(),
             VK_NULL_HANDLE, Failure::SubmitA);
         events.emplace_back("A_SUBMIT");
 
-        auto syncAB = exportSyncFd(a, signalA.semaphore, Failure::ExportAB);
+        auto syncAB = exportProbeSyncFd(a, signalA.handle(), Failure::ExportAB);
         std::cout << "A_TO_B_SYNC_FD_EXPORT "
-                  << (syncAB.sentinel ? "SENTINEL_-1" : "FD") << "\n";
-        events.emplace_back(syncAB.sentinel ? "EXPORT_AB_SENTINEL" : "EXPORT_AB_FD");
-        importSyncFd(b, waitB.semaphore, syncAB, Failure::ImportB);
+                  << (syncAB.sentinel() ? "SENTINEL_-1" : "FD") << "\n";
+        events.emplace_back(syncAB.sentinel() ? "EXPORT_AB_SENTINEL" : "EXPORT_AB_FD");
+        importProbeSyncFd(b, waitB.handle(), syncAB, Failure::ImportB);
         events.emplace_back("IMPORT_B_TEMPORARY");
 
-        submit(b, workB.command, waitB.semaphore, signalB.semaphore,
+        submit(b, workB.command, waitB.handle(), signalB.handle(),
             VK_NULL_HANDLE, Failure::SubmitB);
         events.emplace_back("B_SUBMIT");
 
-        auto syncBA = exportSyncFd(b, signalB.semaphore, Failure::ExportBA);
+        auto syncBA = exportProbeSyncFd(b, signalB.handle(), Failure::ExportBA);
         std::cout << "B_TO_A_SYNC_FD_EXPORT "
-                  << (syncBA.sentinel ? "SENTINEL_-1" : "FD") << "\n";
-        events.emplace_back(syncBA.sentinel ? "EXPORT_BA_SENTINEL" : "EXPORT_BA_FD");
-        importSyncFd(a, waitA.semaphore, syncBA, Failure::ImportA);
+                  << (syncBA.sentinel() ? "SENTINEL_-1" : "FD") << "\n";
+        events.emplace_back(syncBA.sentinel() ? "EXPORT_BA_SENTINEL" : "EXPORT_BA_FD");
+        importProbeSyncFd(a, waitA.handle(), syncBA, Failure::ImportA);
         events.emplace_back("IMPORT_A_TEMPORARY");
 
-        submit(a, workAFinal.command, waitA.semaphore, VK_NULL_HANDLE,
+        submit(a, workAFinal.command, waitA.handle(), VK_NULL_HANDLE,
             finalFence.fence, Failure::SubmitFinal);
         events.emplace_back("A_FINAL_SUBMIT");
 

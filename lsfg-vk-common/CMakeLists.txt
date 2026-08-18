@@ -9,6 +9,7 @@ set(COMMON_SOURCES
     "src/vulkan/descriptor_set.cpp"
     "src/vulkan/external_capabilities.cpp"
     "src/vulkan/external_buffer_transport.cpp"
+    "src/vulkan/external_semaphore_sync.cpp"
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
     "src/vulkan/physical_device.cpp"

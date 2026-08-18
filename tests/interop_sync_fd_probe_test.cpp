@@ -8,15 +8,6 @@
 using namespace lsfgvk::cli::interop_sync_fd_probe;
 
 int main() {
-    assert(temporaryImport());
-
-    // SYNC_FD permits the Linux already-signaled sentinel -1 as well as a
-    // regular non-negative descriptor, but not an uninitialized payload.
-    assert(acceptsSyncFd(ExportedFd{-1, true}));
-    assert(acceptsSyncFd(ExportedFd{42, true}));
-    assert(!acceptsSyncFd(ExportedFd{-2, true}));
-    assert(!acceptsSyncFd(ExportedFd{-1, false}));
-
     assert(std::string(failureName(Failure::ImportB)) ==
         "A_SYNC_FD_IMPORT_ON_B_FAILED");
     assert(std::string(failureName(Failure::SubmitFinal)) ==

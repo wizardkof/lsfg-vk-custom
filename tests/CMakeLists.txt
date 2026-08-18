@@ -213,6 +213,15 @@ target_link_libraries(lsfg-vk-test-external-buffer-transport PRIVATE
 add_test(NAME lsfg-vk-test-external-buffer-transport
     COMMAND lsfg-vk-test-external-buffer-transport)
 
+add_executable(lsfg-vk-test-external-semaphore-sync
+    external_semaphore_sync_test.cpp)
+target_compile_options(lsfg-vk-test-external-semaphore-sync PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-external-semaphore-sync PRIVATE
+    lsfg-vk-common)
+add_test(NAME lsfg-vk-test-external-semaphore-sync
+    COMMAND lsfg-vk-test-external-semaphore-sync)
+
 add_executable(lsfg-vk-test-interop-sync-fd-probe
     interop_sync_fd_probe_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/interop_sync_fd_probe.cpp")
