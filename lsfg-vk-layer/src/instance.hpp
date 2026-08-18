@@ -22,6 +22,19 @@
 
 namespace lsfgvk::layer {
 
+    /// Layer-owned/safely-shareable queue reserved during VkDevice creation.
+    /// P3D uses it for the one-shot A -> B -> A control-channel handshake instead
+    /// of submitting through the application's ordinary queue without synchronization.
+    struct RuntimeExchangeQueue {
+        VkQueue queue{VK_NULL_HANDLE};
+        uint32_t familyIndex{};
+        std::shared_ptr<std::mutex> mutex;
+
+        [[nodiscard]] bool valid() const noexcept {
+            return this->queue != VK_NULL_HANDLE && this->mutex;
+        }
+    };
+
     /// root context of the lsfg-vk layer
     class Root {
     public:
@@ -80,7 +93,8 @@ namespace lsfgvk::layer {
         /// @throws ls::error on failure
         void createSwapchainContext(const ConfigSnapshot& snapshot,
             const vk::Vulkan& vk, VkSwapchainKHR swapchain,
-            const SwapchainInfo& info);
+            const SwapchainInfo& info,
+            std::optional<RuntimeExchangeQueue> exchangeQueue = std::nullopt);
         /// get swapchain context
         /// @param swapchain swapchain handle
         /// @return swapchain context
@@ -103,7 +117,8 @@ namespace lsfgvk::layer {
         /// @param snapshot immutable configuration for this reload
         void recreateSwapchainContext(const ConfigSnapshot& snapshot,
             const vk::Vulkan& vk, VkSwapchainKHR swapchain,
-            const SwapchainInfo& info);
+            const SwapchainInfo& info,
+            std::optional<RuntimeExchangeQueue> exchangeQueue = std::nullopt);
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);

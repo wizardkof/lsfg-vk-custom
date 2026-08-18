@@ -114,6 +114,43 @@ add_test(
     NAME lsfg-vk-test-runtime-device-pair
     COMMAND lsfg-vk-test-runtime-device-pair)
 
+add_executable(lsfg-vk-test-runtime-exchange-channel
+    runtime_exchange_channel_test.cpp)
+
+target_compile_options(lsfg-vk-test-runtime-exchange-channel PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+
+target_link_libraries(lsfg-vk-test-runtime-exchange-channel
+    PRIVATE lsfg-vk-common)
+
+add_test(
+    NAME lsfg-vk-test-runtime-exchange-channel
+    COMMAND lsfg-vk-test-runtime-exchange-channel)
+
+if(LSFGVK_BUILD_VK_LAYER)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(TEST_RUNTIME_GBM REQUIRED IMPORTED_TARGET gbm)
+
+    add_executable(lsfg-vk-test-runtime-dma-buf-backing
+        runtime_dma_buf_backing_test.cpp
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/runtime_dma_buf_backing.cpp")
+
+    target_include_directories(lsfg-vk-test-runtime-dma-buf-backing PRIVATE
+        "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+
+    target_compile_options(lsfg-vk-test-runtime-dma-buf-backing PRIVATE
+        -UNDEBUG
+        -Wno-unknown-warning-option)
+
+    target_link_libraries(lsfg-vk-test-runtime-dma-buf-backing PRIVATE
+        lsfg-vk-common PkgConfig::TEST_RUNTIME_GBM)
+
+    add_test(
+        NAME lsfg-vk-test-runtime-dma-buf-backing
+        COMMAND lsfg-vk-test-runtime-dma-buf-backing)
+endif()
+
 add_executable(lsfg-vk-test-external-capabilities
     external_capabilities_test.cpp)
 

@@ -14,6 +14,8 @@ set(COMMON_SOURCES
     "src/vulkan/image.cpp"
     "src/vulkan/physical_device.cpp"
     "src/vulkan/runtime_device_pair.cpp"
+    "src/vulkan/runtime_exchange_channel.cpp"
+    "src/vulkan/runtime_exchange_endpoint.cpp"
     "src/vulkan/sampler.cpp"
     "src/vulkan/semaphore.cpp"
     "src/vulkan/shader.cpp"

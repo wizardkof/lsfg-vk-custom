@@ -4,6 +4,7 @@
 
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -79,6 +80,9 @@ namespace lsfgvk::backend {
         [[nodiscard]] const vk::PhysicalDeviceIdentity& deviceIdentity() const;
         /// Complete physical-device inventory seen by the backend VkInstance.
         [[nodiscard]] const std::vector<vk::PhysicalDeviceSnapshot>& visibleDevices() const;
+        /// Narrow Vulkan endpoint used by the P3D runtime cross-device control channel.
+        /// Handles remain owned by backend::Instance.
+        [[nodiscard]] vk::RuntimeExchangeEndpoint runtimeExchangeEndpoint() const;
 
         ///
         /// Open a frame generation context.

@@ -4,6 +4,7 @@ set(LAYER_SOURCES
     "src/fixed_output_pacer.cpp"
     "src/fixed_present_mode.cpp"
     "src/instance.cpp"
+    "src/runtime_dma_buf_backing.cpp"
     "src/swapchain.cpp"
     "src/virtual_swapchain_state.cpp"
     "src/virtual_swapchain_image_spec.cpp"
@@ -14,6 +15,10 @@ add_library(lsfg-vk-layer SHARED ${LAYER_SOURCES})
 target_link_libraries(lsfg-vk-layer
     PUBLIC lsfg-vk-common
     PUBLIC lsfg-vk-backend)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LAYER_GBM REQUIRED IMPORTED_TARGET gbm)
+target_link_libraries(lsfg-vk-layer PRIVATE PkgConfig::LAYER_GBM)
 
 target_compile_options(lsfg-vk-layer PRIVATE
     -Wno-unknown-warning-option

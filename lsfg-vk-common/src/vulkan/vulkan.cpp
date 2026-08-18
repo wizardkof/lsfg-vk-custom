@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
+#include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bitset>
 #include <cstddef>
@@ -246,11 +248,15 @@ namespace {
             .queueCount = 1,
             .pQueuePriorities = &queuePriority
         };
-        const std::vector<const char*> requestedExtensions{
+        std::vector<const char*> requestedExtensions{
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
         };
+        const auto advertisedExtensions = enumerateDeviceExtensionNames(fi, physdev);
+        if (std::ranges::binary_search(advertisedExtensions,
+                std::string(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)))
+            requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
         const VkDeviceCreateInfo deviceInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &requestedFeaturesVulkan12,
@@ -276,12 +282,30 @@ namespace {
     }
 
     /// get a queue from the logical device
-    VkQueue getQueue(const VulkanDeviceFuncs& fd, VkDevice device,
-            std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
-            uint32_t cfi) {
+    VkQueue getQueue(const VulkanInstanceFuncs& fi, const VulkanDeviceFuncs& fd,
+            VkDevice device, std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
+            uint32_t cfi, VkDeviceQueueCreateFlags queueFlags = 0) {
         VkQueue queue{};
 
-        fd.GetDeviceQueue(device, cfi, 0, &queue);
+        if (queueFlags == 0) {
+            fd.GetDeviceQueue(device, cfi, 0, &queue);
+        } else {
+            const auto getDeviceQueue2 = reinterpret_cast<PFN_vkGetDeviceQueue2>(
+                fi.GetDeviceProcAddr(device, "vkGetDeviceQueue2"));
+            if (!getDeviceQueue2)
+                throw ls::vulkan_error("failed to get vkGetDeviceQueue2 symbol");
+
+            const VkDeviceQueueInfo2 queueInfo{
+                .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
+                .flags = queueFlags,
+                .queueFamilyIndex = cfi,
+                .queueIndex = 0
+            };
+            getDeviceQueue2(device, &queueInfo, &queue);
+        }
+
+        if (queue == VK_NULL_HANDLE)
+            throw ls::vulkan_error("failed to get Vulkan queue");
 
         if (setLoaderData) { // optionally set loader data
             auto res = (*setLoaderData)(device, queue);
@@ -511,8 +535,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         this->instance_funcs,
         *this->device, false
     )),
-    computeQueue(getQueue(this->device_funcs, *this->device,
-        this->setLoaderData,
+    computeQueue(getQueue(this->instance_funcs, this->device_funcs,
+        *this->device, this->setLoaderData,
         this->queueFamilyIdx)),
     cmdPool(createCommandPool(this->device_funcs,
         *this->device,
@@ -530,7 +554,8 @@ Vulkan::Vulkan(VkInstance instance, VkDevice device,
         VulkanDeviceFuncs deviceFuncs,
         bool isGraphical,
         std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
-        const std::optional<std::filesystem::path>& cachefile) :
+        const std::optional<std::filesystem::path>& cachefile,
+        VkDeviceQueueCreateFlags queueFlags) :
     instance(new VkInstance(instance)),
     instance_funcs(instanceFuncs),
     phys_dev(physdev),
@@ -540,9 +565,9 @@ Vulkan::Vulkan(VkInstance instance, VkDevice device,
     device(new VkDevice(device)),
     setLoaderData(setLoaderData),
     device_funcs(deviceFuncs),
-    computeQueue(getQueue(this->device_funcs, *this->device,
-        this->setLoaderData,
-        this->queueFamilyIdx)),
+    computeQueue(getQueue(this->instance_funcs, this->device_funcs,
+        *this->device, this->setLoaderData,
+        this->queueFamilyIdx, queueFlags)),
     cmdPool(createCommandPool(this->device_funcs,
         *this->device,
         this->queueFamilyIdx

@@ -49,6 +49,7 @@ namespace {
     enum class QueueReservationMode {
         None,
         DedicatedSpare,
+        DedicatedAuxiliary,
         SharedInternallySynchronized
     };
 
@@ -123,6 +124,9 @@ namespace {
             if (this->mode == QueueReservationMode::DedicatedSpare) {
                 this->queueInfos.at(*this->queueInfoIndex).pQueuePriorities =
                     this->priorities.data();
+            } else if (this->mode == QueueReservationMode::DedicatedAuxiliary) {
+                this->queueInfos.at(*this->queueInfoIndex).pQueuePriorities =
+                    &this->internalPriority;
             } else if (this->shared()) {
                 this->queueInfos.at(*this->internalQueueInfoIndex).pQueuePriorities =
                     &this->internalPriority;
@@ -321,6 +325,7 @@ namespace {
             VkPhysicalDevice physdev,
             const vk::VulkanInstanceFuncs& funcs,
             PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2,
+            uint32_t applicationApiVersion,
             const VkDeviceCreateInfo& info) {
         QueueReservation result{};
         if (!info.queueCreateInfoCount || !info.pQueueCreateInfos)
@@ -385,12 +390,52 @@ namespace {
                 return result;
             }
 
+            // If the graphics family is full, prefer a queue from an entirely
+            // unrequested auxiliary family. P3D only needs queue submission for
+            // semaphore hand-off, so a compute/transfer-capable family is enough
+            // and does not require changing the application's graphics queue.
+            for (uint32_t auxiliaryFamily = 0; auxiliaryFamily < familyCount; ++auxiliaryFamily) {
+                if (auxiliaryFamily == *graphicsFamily)
+                    continue;
+
+                const auto& family = families.at(auxiliaryFamily);
+                if (family.queueCount == 0
+                        || !(family.queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)))
+                    continue;
+
+                const bool alreadyRequested = std::ranges::any_of(
+                    result.queueInfos,
+                    [auxiliaryFamily](const VkDeviceQueueCreateInfo& candidate) {
+                        return candidate.queueFamilyIndex == auxiliaryFamily;
+                    });
+                if (alreadyRequested)
+                    continue;
+
+                result.queueInfos.push_back(VkDeviceQueueCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .queueFamilyIndex = auxiliaryFamily,
+                    .queueCount = 1,
+                    .pQueuePriorities = nullptr
+                });
+                result.queueInfoIndex =
+                    static_cast<uint32_t>(result.queueInfos.size() - 1);
+                result.familyIndex = auxiliaryFamily;
+                result.queueIndex = 0;
+                result.applicationQueueIndex = 0;
+                result.internalPriority = 1.0F;
+                result.mode = QueueReservationMode::DedicatedAuxiliary;
+                return result;
+            }
+
             // If the application already consumes the full graphics family,
             // split its final flags==0 logical queue into a separate internally
             // synchronized queue. The layer remaps the application's original
             // logical index to that same VkQueue, allowing the Fixed worker and
             // application to share it without external queue synchronization.
-            if (requested == available
+            if (applicationApiVersion >= VK_API_VERSION_1_1
+                    && requested == available
                     && queueInfo.queueCount > 0
                     && supportsInternallySynchronizedQueues(
                         physdev, funcs, getPhysicalDeviceFeatures2)) {
@@ -728,6 +773,7 @@ namespace {
     // instance-wide info initialized at instance creation(s)
     struct InstanceInfo {
         std::vector<VkInstance> handles; // there may be several instances
+        uint32_t applicationApiVersion{VK_API_VERSION_1_0};
         vk::VulkanInstanceFuncs funcs;
 
         std::unordered_map<VkDevice, vk::Vulkan> devices;
@@ -785,6 +831,11 @@ namespace {
             return VK_ERROR_INITIALIZATION_FAILED;
         }
 
+        const uint32_t applicationApiVersion = info->pApplicationInfo
+            && info->pApplicationInfo->apiVersion
+            ? info->pApplicationInfo->apiVersion
+            : VK_API_VERSION_1_0;
+
         try {
             const auto configSnapshot = layer_info->root.snapshot();
             VkInstanceCreateInfo newInfo = *info;
@@ -815,9 +866,13 @@ namespace {
 
             if (!instance_info)
                 instance_info = new InstanceInfo{ // NOLINT (memory management)
+                    .applicationApiVersion = applicationApiVersion,
                     .funcs = vk::initVulkanInstanceFuncs(*instance,
                         layer_info->GetInstanceProcAddr, true),
                 };
+            else
+                instance_info->applicationApiVersion = std::min(
+                    instance_info->applicationApiVersion, applicationApiVersion);
 
             if (instance_info->handles.empty())
                 instance_info->surfaceMaintenanceFamily = maintenanceFamily;
@@ -912,7 +967,8 @@ namespace {
                     PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
                         instance_info->handles.front(), "vkGetPhysicalDeviceFeatures2"));
                 offloadReservation = reserveOffloadGraphicsQueue(
-                    physdev, instance_info->funcs, getPhysicalDeviceFeatures2, newInfo);
+                    physdev, instance_info->funcs, getPhysicalDeviceFeatures2,
+                    instance_info->applicationApiVersion, newInfo);
                 offloadReservation.apply(newInfo);
 
                 const auto requestedFamily = instance_info->surfaceMaintenanceFamily;
@@ -956,7 +1012,13 @@ namespace {
                     instance_info->handles.front(), *device, physdev,
                     instance_info->funcs, vk::initVulkanDeviceFuncs(instance_info->funcs, *device,
                         true),
-                    true, setLoaderData
+                    true, setLoaderData, std::nullopt,
+                    offloadReservation.shared()
+                        && offloadReservation.queueInfoIndex
+                            == offloadReservation.internalQueueInfoIndex
+                        ? VkDeviceQueueCreateFlags{
+                            VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR}
+                        : VkDeviceQueueCreateFlags{0}
                 )
             );
         } catch (const std::exception& e) {
@@ -1014,7 +1076,9 @@ namespace {
                         std::cerr << "lsfg-vk: dual-ready offload queue prepared: "
                             << (offloadReservation.shared()
                                 ? "shared-internally-synchronized"
-                                : "dedicated")
+                                : offloadReservation.mode == QueueReservationMode::DedicatedAuxiliary
+                                    ? "dedicated-auxiliary"
+                                    : "dedicated")
                             << " family=" << offloadReservation.familyIndex
                             << " queue=" << offloadReservation.queueIndex
                             << " app-index=" << offloadReservation.applicationQueueIndex
@@ -1423,8 +1487,17 @@ namespace {
             auto& swapchainInfo = infoIt->second;
 
             try {
+                std::optional<RuntimeExchangeQueue> runtimeExchangeQueue;
+                if (queueIt != instance_info->offloadQueues.end()) {
+                    runtimeExchangeQueue = RuntimeExchangeQueue{
+                        .queue = queueIt->second.queue,
+                        .familyIndex = queueIt->second.familyIndex,
+                        .mutex = queueIt->second.mutex
+                    };
+                }
                 layer_info->root.createSwapchainContext(
-                    configSnapshot, it->second, *swapchain, swapchainInfo);
+                    configSnapshot, it->second, *swapchain, swapchainInfo,
+                    std::move(runtimeExchangeQueue));
 
                 if (virtualRuntime) {
                     const auto& offload = instance_info->offloadQueues.at(device);
@@ -1602,8 +1675,18 @@ namespace {
                             : swapchainInfo.adaptivePresentMode;
                     }
 
+                    std::optional<RuntimeExchangeQueue> runtimeExchangeQueue;
+                    const auto queueIt = instance_info->offloadQueues.find(vk.get().dev());
+                    if (queueIt != instance_info->offloadQueues.end()) {
+                        runtimeExchangeQueue = RuntimeExchangeQueue{
+                            .queue = queueIt->second.queue,
+                            .familyIndex = queueIt->second.familyIndex,
+                            .mutex = queueIt->second.mutex
+                        };
+                    }
                     layer_info->root.recreateSwapchainContext(
-                        configSnapshot, vk, swapchain, swapchainInfo);
+                        configSnapshot, vk, swapchain, swapchainInfo,
+                        std::move(runtimeExchangeQueue));
 
                     if (swapchainInfo.virtualized) {
                         if (modeChanged && swapchainInfo.dynamicPresentModeEligible) {

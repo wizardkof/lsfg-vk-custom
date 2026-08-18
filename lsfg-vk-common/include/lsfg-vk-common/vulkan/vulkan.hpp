@@ -209,6 +209,7 @@ namespace vk {
         /// @param isGraphical whether the device is graphical (rather than compute)
         /// @param setLoaderData optional function to set loader data
         /// @param cachefile optional path to pipeline cache file
+        /// @param queueFlags creation flags used to retrieve the wrapped queue at queue index 0
         /// @throws ls::vulkan_error on failure
         Vulkan(VkInstance instance, VkDevice device,
             VkPhysicalDevice physdev,
@@ -216,7 +217,8 @@ namespace vk {
             VulkanDeviceFuncs deviceFuncs,
             bool isGraphical = true,
             std::optional<PFN_vkSetDeviceLoaderData> setLoaderData = std::nullopt,
-            const std::optional<std::filesystem::path>& cachefile = std::nullopt);
+            const std::optional<std::filesystem::path>& cachefile = std::nullopt,
+            VkDeviceQueueCreateFlags queueFlags = 0);
 
         /// find a memory type index
         /// @param validTypes bitset of valid memory types

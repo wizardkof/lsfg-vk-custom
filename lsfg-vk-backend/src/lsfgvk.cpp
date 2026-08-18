@@ -272,6 +272,10 @@ const std::vector<vk::PhysicalDeviceSnapshot>& Instance::visibleDevices() const 
     return this->m_impl->getVisibleDevices();
 }
 
+vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {
+    return vk::makeRuntimeExchangeEndpoint(this->m_impl->getVulkan());
+}
+
 Context& Instance::openContext(
         std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
         std::vector<vk::ExternalImage> destImages,
