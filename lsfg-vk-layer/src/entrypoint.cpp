@@ -65,6 +65,12 @@ namespace {
     constexpr const char* SWAPCHAIN_MAINTENANCE_EXT = "VK_EXT_swapchain_maintenance1";
     constexpr const char* GET_SURFACE_CAPABILITIES_2_KHR = "VK_KHR_get_surface_capabilities2";
     constexpr const char* SURFACE_KHR = "VK_KHR_surface";
+    constexpr const char* GET_MEMORY_REQUIREMENTS_2_KHR = "VK_KHR_get_memory_requirements2";
+    constexpr const char* DEDICATED_ALLOCATION_KHR = "VK_KHR_dedicated_allocation";
+    constexpr const char* GET_PHYSICAL_DEVICE_PROPERTIES_2_KHR =
+        "VK_KHR_get_physical_device_properties2";
+    constexpr const char* IMAGE_DRM_FORMAT_MODIFIER_EXT =
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
 
     [[nodiscard]] const char* maintenanceFamilyName(SwapchainMaintenanceFamily family) {
         switch (family) {
@@ -839,8 +845,32 @@ namespace {
         try {
             const auto configSnapshot = layer_info->root.snapshot();
             VkInstanceCreateInfo newInfo = *info;
+            std::vector<const char*> compatibilityInstanceExtensions;
+            if (configSnapshot.active() && applicationApiVersion < VK_API_VERSION_1_1) {
+                if (!hasInstanceExtension(layer_info->GetInstanceProcAddr,
+                        GET_PHYSICAL_DEVICE_PROPERTIES_2_KHR)) {
+                    std::cerr << "lsfg-vk: P4B Vulkan 1.0 compatibility unavailable: "
+                        "VK_KHR_get_physical_device_properties2 not available\n";
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
+                }
+                compatibilityInstanceExtensions.assign(
+                    newInfo.ppEnabledExtensionNames ? newInfo.ppEnabledExtensionNames : nullptr,
+                    newInfo.ppEnabledExtensionNames
+                        ? newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount
+                        : nullptr);
+                appendExtension(compatibilityInstanceExtensions,
+                    GET_PHYSICAL_DEVICE_PROPERTIES_2_KHR);
+                newInfo.enabledExtensionCount =
+                    static_cast<uint32_t>(compatibilityInstanceExtensions.size());
+                newInfo.ppEnabledExtensionNames = compatibilityInstanceExtensions.data();
+            }
             const auto maintenanceFamily = selectSurfaceMaintenanceFamily(
                 layer_info->GetInstanceProcAddr, newInfo, configSnapshot.active());
+            const bool usesCompatibilityInstanceExtensions =
+                applicationApiVersion < VK_API_VERSION_1_1
+                && extensionEnabled(newInfo.ppEnabledExtensionNames,
+                    newInfo.enabledExtensionCount,
+                    GET_PHYSICAL_DEVICE_PROPERTIES_2_KHR);
             std::vector<const char*> maintenanceExtensions;
             if (maintenanceFamily != SwapchainMaintenanceFamily::None) {
                 if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
@@ -866,9 +896,10 @@ namespace {
 
             if (!instance_info)
                 instance_info = new InstanceInfo{ // NOLINT (memory management)
-                    .applicationApiVersion = applicationApiVersion,
-                    .funcs = vk::initVulkanInstanceFuncs(*instance,
-                        layer_info->GetInstanceProcAddr, true),
+                        .applicationApiVersion = applicationApiVersion,
+                        .funcs = vk::initVulkanInstanceFuncs(*instance,
+                        layer_info->GetInstanceProcAddr, true,
+                        usesCompatibilityInstanceExtensions),
                 };
             else
                 instance_info->applicationApiVersion = std::min(
@@ -962,6 +993,55 @@ namespace {
         // create device
         try {
             VkDeviceCreateInfo newInfo = *info;
+            std::vector<const char*> compatibilityDeviceExtensions;
+            const bool vulkan10 = instance_info->applicationApiVersion < VK_API_VERSION_1_1;
+            const bool needsMemoryRequirements2 = configSnapshot.active() && vulkan10
+                && hasDeviceExtension(physdev, instance_info->funcs,
+                    GET_MEMORY_REQUIREMENTS_2_KHR);
+            const bool needsDedicatedAllocation = needsMemoryRequirements2
+                && hasDeviceExtension(physdev, instance_info->funcs,
+                    DEDICATED_ALLOCATION_KHR);
+            if (configSnapshot.active() && vulkan10) {
+                if (!needsMemoryRequirements2) {
+                    std::cerr << "lsfg-vk: P4B Vulkan 1.0 compatibility unavailable: "
+                        "VK_KHR_get_memory_requirements2 not available\n";
+                } else if (!needsDedicatedAllocation) {
+                    std::cerr << "lsfg-vk: P4B Vulkan 1.0 compatibility unavailable: "
+                        "VK_KHR_dedicated_allocation not available\n";
+                } else {
+                    compatibilityDeviceExtensions.assign(
+                        newInfo.ppEnabledExtensionNames ? newInfo.ppEnabledExtensionNames : nullptr,
+                        newInfo.ppEnabledExtensionNames
+                            ? newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount
+                            : nullptr);
+                    appendExtension(compatibilityDeviceExtensions, GET_MEMORY_REQUIREMENTS_2_KHR);
+                    appendExtension(compatibilityDeviceExtensions, DEDICATED_ALLOCATION_KHR);
+                    newInfo.enabledExtensionCount =
+                        static_cast<uint32_t>(compatibilityDeviceExtensions.size());
+                    newInfo.ppEnabledExtensionNames = compatibilityDeviceExtensions.data();
+                }
+                if (!needsMemoryRequirements2 || !needsDedicatedAllocation)
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
+            }
+            if (configSnapshot.active()) {
+                if (!hasDeviceExtension(physdev, instance_info->funcs,
+                        IMAGE_DRM_FORMAT_MODIFIER_EXT)) {
+                    std::cerr << "lsfg-vk: runtime image compatibility unavailable: "
+                        << IMAGE_DRM_FORMAT_MODIFIER_EXT << " not available\n";
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
+                }
+                if (compatibilityDeviceExtensions.empty()) {
+                    compatibilityDeviceExtensions.assign(
+                        newInfo.ppEnabledExtensionNames ? newInfo.ppEnabledExtensionNames : nullptr,
+                        newInfo.ppEnabledExtensionNames
+                            ? newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount
+                            : nullptr);
+                }
+                appendExtension(compatibilityDeviceExtensions, IMAGE_DRM_FORMAT_MODIFIER_EXT);
+                newInfo.enabledExtensionCount =
+                    static_cast<uint32_t>(compatibilityDeviceExtensions.size());
+                newInfo.ppEnabledExtensionNames = compatibilityDeviceExtensions.data();
+            }
             if (configSnapshot.active()) {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
                     PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
@@ -1011,7 +1091,12 @@ namespace {
                 vk::Vulkan(
                     instance_info->handles.front(), *device, physdev,
                     instance_info->funcs, vk::initVulkanDeviceFuncs(instance_info->funcs, *device,
-                        true),
+                        true,
+                        instance_info->applicationApiVersion < VK_API_VERSION_1_1
+                            && hasDeviceExtension(physdev, instance_info->funcs,
+                                GET_MEMORY_REQUIREMENTS_2_KHR)
+                            && hasDeviceExtension(physdev, instance_info->funcs,
+                                DEDICATED_ALLOCATION_KHR)),
                     true, setLoaderData, std::nullopt,
                     offloadReservation.shared()
                         && offloadReservation.queueInfoIndex

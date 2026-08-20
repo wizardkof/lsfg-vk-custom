@@ -36,21 +36,32 @@ namespace lsfgvk::layer {
 
         [[nodiscard]] static RuntimeDmaBufBacking create(
             const vk::PhysicalDeviceIdentity& renderIdentity);
+        [[nodiscard]] static RuntimeDmaBufBacking createImage(
+            const vk::PhysicalDeviceIdentity& renderIdentity);
 
-        [[nodiscard]] ls::OwnedFd duplicateFd() const;
         [[nodiscard]] VkDeviceSize size() const noexcept { return this->backingSize; }
+        [[nodiscard]] uint32_t fourcc() const noexcept { return this->boFourcc; }
+        [[nodiscard]] uint64_t modifier() const noexcept { return this->boModifier; }
+        [[nodiscard]] uint32_t planeCount() const noexcept { return this->boPlanes; }
+        [[nodiscard]] uint32_t stride() const noexcept { return this->boStride; }
+        [[nodiscard]] uint32_t offset() const noexcept { return this->boOffset; }
+        [[nodiscard]] ls::OwnedFd duplicateFd() const;
+        [[nodiscard]] ls::OwnedFd duplicatePlaneFd(uint32_t plane) const;
         [[nodiscard]] const std::filesystem::path& allocatorNode() const noexcept {
             return this->nodePath;
         }
 
     private:
+        [[nodiscard]] static RuntimeDmaBufBacking createBacking(
+            const vk::PhysicalDeviceIdentity& renderIdentity, bool image);
         RuntimeDmaBufBacking(
             std::filesystem::path nodePath,
             ls::OwnedFd nodeFd,
             gbm_device* device,
             gbm_bo* bo,
             ls::OwnedFd dmaBufFd,
-            VkDeviceSize size) noexcept;
+            VkDeviceSize size, uint32_t fourcc, uint64_t modifier,
+            uint32_t planes, uint32_t stride, uint32_t offset) noexcept;
 
         void reset() noexcept;
 
@@ -60,6 +71,11 @@ namespace lsfgvk::layer {
         gbm_bo* gbmBo{};
         ls::OwnedFd dmaBufFd;
         VkDeviceSize backingSize{};
+        uint32_t boFourcc{};
+        uint64_t boModifier{};
+        uint32_t boPlanes{};
+        uint32_t boStride{};
+        uint32_t boOffset{};
     };
 
 }

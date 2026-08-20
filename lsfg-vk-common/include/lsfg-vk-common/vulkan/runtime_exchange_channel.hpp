@@ -5,6 +5,7 @@
 #include "external_buffer_transport.hpp"
 #include "external_semaphore_sync.hpp"
 #include "runtime_device_pair.hpp"
+#include "external_memory_import.hpp"
 
 #include <cstdint>
 #include <string>
@@ -28,6 +29,7 @@ namespace vk {
         PFN_vkCreateFence CreateFence{};
         PFN_vkDestroyFence DestroyFence{};
         PFN_vkWaitForFences WaitForFences{};
+        PFN_vkResetFences ResetFences{};
         PFN_vkDeviceWaitIdle DeviceWaitIdle{};
         PFN_vkCreateCommandPool CreateCommandPool{};
         PFN_vkDestroyCommandPool DestroyCommandPool{};
@@ -41,6 +43,25 @@ namespace vk {
         PFN_vkMapMemory MapMemory{};
         PFN_vkUnmapMemory UnmapMemory{};
         PFN_vkInvalidateMappedMemoryRanges InvalidateMappedMemoryRanges{};
+
+        // Borrowed physical-device/image dispatch. The endpoint never destroys
+        // the instance, physical device, logical device, or queue.
+        VkPhysicalDevice physicalDevice{};
+        PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2{};
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2{};
+        PFN_vkCreateImage CreateImage{};
+        PFN_vkDestroyImage DestroyImage{};
+        PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2{};
+        PFN_vkBindImageMemory BindImageMemory{};
+        PFN_vkCmdClearColorImage CmdClearColorImage{};
+        PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer{};
+        PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR{};
+        PFN_vkAllocateMemory AllocateMemory{};
+        PFN_vkFreeMemory FreeMemory{};
+        PFN_vkCreateBuffer CreateBuffer{};
+        PFN_vkDestroyBuffer DestroyBuffer{};
+        PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements{};
+        PFN_vkBindBufferMemory BindBufferMemory{};
     };
 
     struct RuntimeExchangeChannelInfo {
@@ -48,6 +69,56 @@ namespace vk {
         VkDeviceSize backingSize{};
         VkBufferUsageFlags usage{};
     };
+
+    struct RuntimeImageBackingInfo {
+        uint32_t fourcc{};
+        uint64_t modifier{};
+        uint32_t planeCount{};
+        VkSubresourceLayout plane{};
+    };
+
+
+    class RuntimeImageEndpoint {
+    public:
+        RuntimeImageEndpoint() noexcept = default;
+        RuntimeImageEndpoint(const RuntimeImageEndpoint&) = delete;
+        RuntimeImageEndpoint& operator=(const RuntimeImageEndpoint&) = delete;
+        RuntimeImageEndpoint(RuntimeImageEndpoint&&) noexcept;
+        RuntimeImageEndpoint& operator=(RuntimeImageEndpoint&&) noexcept;
+        ~RuntimeImageEndpoint();
+        [[nodiscard]] VkImage image() const noexcept { return imageHandle; }
+        [[nodiscard]] const ExternalMemoryImportDiagnostics& diagnostics() const noexcept { return importDiagnostics; }
+        [[nodiscard]] const VkMemoryRequirements2& requirements() const noexcept { return memoryRequirements; }
+        [[nodiscard]] bool executionResourcesCreated() const noexcept { return commandPool != VK_NULL_HANDLE; }
+        [[nodiscard]] static RuntimeImageEndpoint createExecutionResources(
+            RuntimeImageEndpoint&& endpoint, uint32_t commandBufferCount);
+        static void executeInitialDiagnostic(RuntimeImageEndpoint& endpoint);
+        [[nodiscard]] static SyncFdPayload executeInitialChained(RuntimeImageEndpoint& endpoint);
+        static void executeAtoBDiagnostic(RuntimeImageEndpoint& imageA,
+            RuntimeImageEndpoint& imageB);
+        static void executeCompleteRoundTrip(RuntimeImageEndpoint& imageA,
+            RuntimeImageEndpoint& imageB);
+    private:
+        friend RuntimeImageEndpoint createRuntimeImageEndpoint(
+            const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);
+        RuntimeExchangeEndpoint endpoint{};
+        VkImage imageHandle{};
+        ImportedExternalMemory memory{};
+        VkMemoryRequirements2 memoryRequirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+        ExternalMemoryImportDiagnostics importDiagnostics{};
+        VkCommandPool commandPool{};
+        std::vector<VkCommandBuffer> commandBuffers;
+        VkBuffer stagingBuffer{};
+        VkDeviceMemory stagingMemory{};
+        void* stagingMapped{};
+        bool stagingHostCoherent{};
+        VkDeviceSize stagingSize{};
+        VkFence finalFence{};
+    };
+
+    [[nodiscard]] RuntimeImageEndpoint createRuntimeImageEndpoint(
+        const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);
+
 
     struct RuntimeExchangeSyncDiagnostics {
         bool renderToGenerationSentinel{};

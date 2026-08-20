@@ -45,6 +45,7 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         .CreateFence = vk.df().CreateFence,
         .DestroyFence = vk.df().DestroyFence,
         .WaitForFences = vk.df().WaitForFences,
+        .ResetFences = vk.df().ResetFences,
         .DeviceWaitIdle = vk.df().DeviceWaitIdle,
         .CreateCommandPool = vk.df().CreateCommandPool,
         .DestroyCommandPool = vk.df().DestroyCommandPool,
@@ -58,5 +59,21 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         .MapMemory = vk.df().MapMemory,
         .UnmapMemory = vk.df().UnmapMemory,
         .InvalidateMappedMemoryRanges = vk.df().InvalidateMappedMemoryRanges
+        ,.physicalDevice = vk.physdev()
+        ,.GetPhysicalDeviceFormatProperties2 = vk.fi().GetPhysicalDeviceFormatProperties2
+        ,.GetPhysicalDeviceImageFormatProperties2 = vk.fi().GetPhysicalDeviceImageFormatProperties2
+        ,.CreateImage = vk.df().CreateImage
+        ,.DestroyImage = vk.df().DestroyImage
+        ,.GetImageMemoryRequirements2 = vk.df().GetImageMemoryRequirements2
+        ,.BindImageMemory = vk.df().BindImageMemory
+        ,.CmdClearColorImage = vk.df().CmdClearColorImage
+        ,.CmdCopyImageToBuffer = vk.df().CmdCopyImageToBuffer
+        ,.GetMemoryFdPropertiesKHR = getMemoryFdProperties
+        ,.AllocateMemory = vk.df().AllocateMemory
+        ,.FreeMemory = vk.df().FreeMemory
+        ,.CreateBuffer = vk.df().CreateBuffer
+        ,.DestroyBuffer = vk.df().DestroyBuffer
+        ,.GetBufferMemoryRequirements = vk.df().GetBufferMemoryRequirements
+        ,.BindBufferMemory = vk.df().BindBufferMemory
     };
 }

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <ios>
 #include <optional>
 #include <sstream>
@@ -258,8 +259,18 @@ namespace {
         };
         const auto advertisedExtensions = enumerateDeviceExtensionNames(fi, physdev);
         if (std::ranges::binary_search(advertisedExtensions,
+                std::string(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)))
+            requestedExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+        if (std::ranges::binary_search(advertisedExtensions,
                 std::string(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)))
             requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        if (std::ranges::binary_search(advertisedExtensions,
+                std::string(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)))
+            requestedExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+        std::cerr << "[DG2X-P4B-A4H1] Backend extension contract\n"
+                  << "  API version: 1.2\n";
+        for (const auto* extension : requestedExtensions)
+            std::cerr << "  enabled: " << extension << "\n";
         const VkDeviceCreateInfo deviceInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &requestedFeaturesVulkan12,
@@ -384,7 +395,11 @@ namespace {
 
 /// initialize vulkan instance function pointers
 VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceProcAddr mpa,
-        bool graphical) {
+        bool graphical, bool khrProperties2) {
+    const auto formatProperties2 = ipa<PFN_vkGetPhysicalDeviceFormatProperties2>(mpa, i,
+        khrProperties2 ? "vkGetPhysicalDeviceFormatProperties2KHR" : "vkGetPhysicalDeviceFormatProperties2");
+    const auto imageFormatProperties2 = ipa<PFN_vkGetPhysicalDeviceImageFormatProperties2>(mpa, i,
+        khrProperties2 ? "vkGetPhysicalDeviceImageFormatProperties2KHR" : "vkGetPhysicalDeviceImageFormatProperties2");
     return {
         .DestroyInstance = ipa<PFN_vkDestroyInstance>(mpa, i, "vkDestroyInstance"),
         .EnumeratePhysicalDevices = ipa<PFN_vkEnumeratePhysicalDevices>(mpa, i,
@@ -402,6 +417,8 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
             "vkGetPhysicalDeviceMemoryProperties"),
         .CreateDevice = ipa<PFN_vkCreateDevice>(mpa, i, "vkCreateDevice"),
         .GetDeviceProcAddr = ipa<PFN_vkGetDeviceProcAddr>(mpa, i, "vkGetDeviceProcAddr"),
+        .GetPhysicalDeviceImageFormatProperties2 = graphical ? imageFormatProperties2 : nullptr,
+        .GetPhysicalDeviceFormatProperties2 = graphical ? formatProperties2 : nullptr,
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,
@@ -417,7 +434,9 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
 
 /// initialize vulkan device function pointers
 VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevice d,
-        bool graphical) {
+        bool graphical, bool khrMemoryRequirements2) {
+    const auto imageMemoryRequirements2 = dpa<PFN_vkGetImageMemoryRequirements2>(f, d,
+        khrMemoryRequirements2 ? "vkGetImageMemoryRequirements2KHR" : "vkGetImageMemoryRequirements2");
     return {
         .GetDeviceQueue = dpa<PFN_vkGetDeviceQueue>(f, d, "vkGetDeviceQueue"),
         .DeviceWaitIdle = dpa<PFN_vkDeviceWaitIdle>(f, d, "vkDeviceWaitIdle"),
@@ -464,8 +483,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .DestroyImage = dpa<PFN_vkDestroyImage>(f, d, "vkDestroyImage"),
         .GetImageMemoryRequirements = dpa<PFN_vkGetImageMemoryRequirements>(f, d,
             "vkGetImageMemoryRequirements"),
-        .GetImageMemoryRequirements2 = dpa<PFN_vkGetImageMemoryRequirements2>(f, d,
-            "vkGetImageMemoryRequirements2"),
+        .GetImageMemoryRequirements2 = imageMemoryRequirements2,
         .BindImageMemory = dpa<PFN_vkBindImageMemory>(f, d, "vkBindImageMemory"),
         .CreateImageView = dpa<PFN_vkCreateImageView>(f, d, "vkCreateImageView"),
         .DestroyImageView = dpa<PFN_vkDestroyImageView>(f, d, "vkDestroyImageView"),

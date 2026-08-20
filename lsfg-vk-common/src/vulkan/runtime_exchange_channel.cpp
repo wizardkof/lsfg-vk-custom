@@ -8,6 +8,9 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <cstdio>
+#include <iostream>
+#include <libdrm/drm_fourcc.h>
 
 #include <vulkan/vulkan_core.h>
 
@@ -272,6 +275,418 @@ namespace {
         endpoint.UnmapMemory(endpoint.bufferDevice.device, staging.memory);
         return matches;
     }
+}
+
+RuntimeImageEndpoint::RuntimeImageEndpoint(RuntimeImageEndpoint&& other) noexcept
+    : endpoint(std::move(other.endpoint)), imageHandle(std::exchange(other.imageHandle, VK_NULL_HANDLE)),
+      memory(std::move(other.memory)), memoryRequirements(other.memoryRequirements),
+      importDiagnostics(other.importDiagnostics), commandPool(std::exchange(other.commandPool, VK_NULL_HANDLE)),
+      commandBuffers(std::move(other.commandBuffers)), stagingBuffer(std::exchange(other.stagingBuffer, VK_NULL_HANDLE)),
+      stagingMemory(std::exchange(other.stagingMemory, VK_NULL_HANDLE)), stagingMapped(std::exchange(other.stagingMapped, nullptr)),
+      stagingHostCoherent(other.stagingHostCoherent), stagingSize(other.stagingSize),
+      finalFence(std::exchange(other.finalFence, VK_NULL_HANDLE)) {}
+
+RuntimeImageEndpoint& RuntimeImageEndpoint::operator=(RuntimeImageEndpoint&& other) noexcept {
+    if (this != &other) {
+        this->~RuntimeImageEndpoint();
+        endpoint = std::move(other.endpoint);
+        imageHandle = std::exchange(other.imageHandle, VK_NULL_HANDLE);
+        memory = std::move(other.memory);
+        memoryRequirements = other.memoryRequirements;
+        importDiagnostics = other.importDiagnostics;
+        commandPool = std::exchange(other.commandPool, VK_NULL_HANDLE);
+        commandBuffers = std::move(other.commandBuffers);
+        stagingBuffer = std::exchange(other.stagingBuffer, VK_NULL_HANDLE);
+        stagingMemory = std::exchange(other.stagingMemory, VK_NULL_HANDLE);
+        stagingMapped = std::exchange(other.stagingMapped, nullptr);
+        stagingHostCoherent = other.stagingHostCoherent;
+        stagingSize = other.stagingSize;
+        finalFence = std::exchange(other.finalFence, VK_NULL_HANDLE);
+    }
+    return *this;
+}
+
+RuntimeImageEndpoint::~RuntimeImageEndpoint() {
+    if (stagingMapped && endpoint.UnmapMemory)
+        endpoint.UnmapMemory(endpoint.bufferDevice.device, stagingMemory);
+    if (finalFence && endpoint.DestroyFence)
+        endpoint.DestroyFence(endpoint.bufferDevice.device, finalFence, nullptr);
+    if (!commandBuffers.empty() && endpoint.FreeCommandBuffers)
+        endpoint.FreeCommandBuffers(endpoint.bufferDevice.device, commandPool,
+            static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+    if (commandPool && endpoint.DestroyCommandPool)
+        endpoint.DestroyCommandPool(endpoint.bufferDevice.device, commandPool, nullptr);
+    if (stagingBuffer && endpoint.bufferDevice.funcs.DestroyBuffer)
+        endpoint.bufferDevice.funcs.DestroyBuffer(endpoint.bufferDevice.device, stagingBuffer, nullptr);
+    if (stagingMemory && endpoint.bufferDevice.funcs.FreeMemory)
+        endpoint.bufferDevice.funcs.FreeMemory(endpoint.bufferDevice.device, stagingMemory, nullptr);
+    if (imageHandle && endpoint.DestroyImage)
+        endpoint.DestroyImage(endpoint.bufferDevice.device, imageHandle, nullptr);
+}
+
+RuntimeImageEndpoint RuntimeImageEndpoint::createExecutionResources(
+        RuntimeImageEndpoint&& source, uint32_t commandBufferCount) {
+    auto& endpoint = source.endpoint;
+    if (!endpoint.CreateCommandPool || !endpoint.DestroyCommandPool
+            || !endpoint.AllocateCommandBuffers || !endpoint.CreateBuffer
+            || !endpoint.DestroyBuffer || !endpoint.GetBufferMemoryRequirements
+            || !endpoint.AllocateMemory || !endpoint.FreeMemory
+            || !endpoint.BindBufferMemory || !endpoint.MapMemory || !endpoint.UnmapMemory
+            || !endpoint.CreateFence || !endpoint.DestroyFence)
+        throw std::runtime_error("runtime image execution dispatch incomplete");
+    source.stagingSize = 256 * 256 * 4;
+    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufferInfo.size = source.stagingSize;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    auto result = endpoint.CreateBuffer(endpoint.bufferDevice.device, &bufferInfo, nullptr,
+        &source.stagingBuffer);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 staging buffer failed");
+    VkMemoryRequirements requirements{};
+    endpoint.GetBufferMemoryRequirements(endpoint.bufferDevice.device, source.stagingBuffer,
+        &requirements);
+    std::optional<uint32_t> selected;
+    for (uint32_t i = 0; i < endpoint.bufferDevice.memoryProperties.memoryTypeCount; ++i) {
+        if (!(requirements.memoryTypeBits & (1u << i))) continue;
+        const auto flags = endpoint.bufferDevice.memoryProperties.memoryTypes[i].propertyFlags;
+        if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            selected = i; break;
+        }
+        if (!selected && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) selected = i;
+    }
+    if (!selected) throw std::runtime_error("B3.1 staging memory type unavailable");
+    source.stagingHostCoherent = (endpoint.bufferDevice.memoryProperties
+        .memoryTypes[*selected].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = *selected;
+    result = endpoint.AllocateMemory(endpoint.bufferDevice.device, &allocate, nullptr,
+        &source.stagingMemory);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 staging memory failed");
+    result = endpoint.BindBufferMemory(endpoint.bufferDevice.device, source.stagingBuffer,
+        source.stagingMemory, 0);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 staging bind failed");
+    result = endpoint.MapMemory(endpoint.bufferDevice.device, source.stagingMemory, 0,
+        source.stagingSize, 0, &source.stagingMapped);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 staging map failed");
+    VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool.queueFamilyIndex = endpoint.queueFamilyIndex;
+    result = endpoint.CreateCommandPool(endpoint.bufferDevice.device, &pool, nullptr,
+        &source.commandPool);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 command pool failed");
+    VkCommandBufferAllocateInfo commands{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    commands.commandPool = source.commandPool;
+    commands.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commands.commandBufferCount = commandBufferCount;
+    source.commandBuffers.resize(commandBufferCount);
+    result = endpoint.AllocateCommandBuffers(endpoint.bufferDevice.device, &commands,
+        source.commandBuffers.data());
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 command buffers failed");
+    if (commandBufferCount > 1) {
+        VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        result = endpoint.CreateFence(endpoint.bufferDevice.device, &fence, nullptr,
+            &source.finalFence);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.1 final fence failed");
+    }
+    return std::move(source);
+}
+
+SyncFdPayload RuntimeImageEndpoint::executeInitialChained(RuntimeImageEndpoint& endpoint) {
+    if (endpoint.commandBuffers.empty() || !endpoint.endpoint.CmdPipelineBarrier
+            || !endpoint.endpoint.CmdClearColorImage || !endpoint.endpoint.QueueSubmit)
+        throw std::runtime_error("B3.2 A dispatch/resources incomplete");
+    const VkCommandBuffer command = endpoint.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = endpoint.endpoint.BeginCommandBuffer(command, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 vkBeginCommandBuffer");
+    const VkImageMemoryBarrier acquire{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, endpoint.endpoint.queueFamilyIndex,
+        endpoint.imageHandle, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    endpoint.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
+    const VkClearColorValue pattern{{0.6470588F, 0.6470588F, 0.6470588F, 0.6470588F}};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    endpoint.endpoint.CmdClearColorImage(command, endpoint.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &pattern, 1, &range);
+    const VkImageMemoryBarrier release{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        endpoint.endpoint.queueFamilyIndex, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        endpoint.imageHandle, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    endpoint.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+    result = endpoint.endpoint.EndCommandBuffer(command);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 vkEndCommandBuffer");
+
+    auto signal = createExportableSyncFdSemaphore(endpoint.endpoint.semaphoreDevice);
+    const VkSemaphore signalHandle = signal.handle();
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &signalHandle;
+    if (endpoint.finalFence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        result = endpoint.endpoint.CreateFence(endpoint.endpoint.bufferDevice.device,
+            &fenceInfo, nullptr, &endpoint.finalFence);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 fence creation");
+    }
+    result = endpoint.endpoint.QueueSubmit(endpoint.endpoint.queue, 1, &submit,
+        VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 vkQueueSubmit A");
+    return exportSyncFd(endpoint.endpoint.semaphoreDevice, signal.handle());
+}
+
+void RuntimeImageEndpoint::executeInitialDiagnostic(RuntimeImageEndpoint& endpoint) {
+    auto exported = executeInitialChained(endpoint);
+    std::cerr << "[DG2X-P4B-B3.2] SYNC_FD A->B export: "
+        << (exported.sentinel() ? "SENTINEL_-1" : "FD") << "\n";
+    VkFence diagnosticFence{};
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    auto result = endpoint.endpoint.CreateFence(endpoint.endpoint.bufferDevice.device,
+        &fenceInfo, nullptr, &diagnosticFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 diagnostic fence creation");
+    // The standalone wrapper submits independently only for its diagnostic mode.
+    // The chained primitive above intentionally returns without a host wait.
+    result = endpoint.endpoint.QueueSubmit(endpoint.endpoint.queue, 0, nullptr, diagnosticFence);
+    if (result != VK_SUCCESS) {
+        endpoint.endpoint.DestroyFence(endpoint.endpoint.bufferDevice.device, diagnosticFence, nullptr);
+        throw ls::vulkan_error(result, "B3.2 diagnostic fence submit");
+    }
+    result = endpoint.endpoint.WaitForFences(endpoint.endpoint.bufferDevice.device, 1,
+        &diagnosticFence, VK_TRUE, UINT64_MAX);
+    endpoint.endpoint.DestroyFence(endpoint.endpoint.bufferDevice.device, diagnosticFence, nullptr);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.2 diagnostic fence wait");
+}
+
+void RuntimeImageEndpoint::executeAtoBDiagnostic(RuntimeImageEndpoint& imageA,
+        RuntimeImageEndpoint& imageB) {
+    auto payloadAB = executeInitialChained(imageA);
+    auto importB = createSyncFdImportSemaphore(imageB.endpoint.semaphoreDevice);
+    importSyncFdTemporary(imageB.endpoint.semaphoreDevice, importB.handle(), payloadAB);
+
+    if (imageB.commandBuffers.empty() || !imageB.endpoint.CmdCopyImageToBuffer)
+        throw std::runtime_error("B3.3 B image execution dispatch incomplete");
+    const VkCommandBuffer command = imageB.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = imageB.endpoint.BeginCommandBuffer(command, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 vkBeginCommandBuffer B");
+    const VkImageMemoryBarrier acquire{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, imageB.endpoint.queueFamilyIndex,
+        imageB.imageHandle, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    imageB.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
+    const VkBufferImageCopy copy{0, 0, 0,
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {256, 256, 1}};
+    imageB.endpoint.CmdCopyImageToBuffer(command, imageB.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageB.stagingBuffer, 1, &copy);
+    const VkImageMemoryBarrier toClear{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, imageB.endpoint.queueFamilyIndex,
+        imageB.endpoint.queueFamilyIndex, imageB.imageHandle,
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    imageB.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+    const VkClearColorValue patternB{{0.3529412F, 0.3529412F, 0.3529412F, 0.3529412F}};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    imageB.endpoint.CmdClearColorImage(command, imageB.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &patternB, 1, &range);
+    const VkImageMemoryBarrier release{
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        imageB.endpoint.queueFamilyIndex, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        imageB.imageHandle, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    imageB.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+    result = imageB.endpoint.EndCommandBuffer(command);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 vkEndCommandBuffer B");
+    auto signalB = createExportableSyncFdSemaphore(imageB.endpoint.semaphoreDevice);
+    const VkSemaphore waitHandle = importB.handle();
+    const VkSemaphore signalHandle = signalB.handle();
+    constexpr VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &waitHandle;
+    submit.pWaitDstStageMask = &waitStage; submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command; submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &signalHandle;
+    VkFence diagnosticFence{};
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    result = imageB.endpoint.CreateFence(imageB.endpoint.bufferDevice.device,
+        &fenceInfo, nullptr, &diagnosticFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 diagnostic fence creation");
+    result = imageB.endpoint.QueueSubmit(imageB.endpoint.queue, 1, &submit, diagnosticFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 vkQueueSubmit B");
+    auto payloadBA = exportSyncFd(imageB.endpoint.semaphoreDevice, signalB.handle());
+    std::cerr << "[DG2X-P4B-B3.3] SYNC_FD B->A export: "
+        << (payloadBA.sentinel() ? "SENTINEL_-1" : "FD") << "\n";
+    result = imageB.endpoint.WaitForFences(imageB.endpoint.bufferDevice.device, 1,
+        &diagnosticFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 diagnostic fence wait");
+    imageB.endpoint.DestroyFence(imageB.endpoint.bufferDevice.device, diagnosticFence, nullptr);
+    if (!imageB.stagingHostCoherent) {
+        VkMappedMemoryRange rangeMemory{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        rangeMemory.memory = imageB.stagingMemory; rangeMemory.size = VK_WHOLE_SIZE;
+        result = imageB.endpoint.InvalidateMappedMemoryRanges(
+            imageB.endpoint.bufferDevice.device, 1, &rangeMemory);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.3 staging invalidate");
+    }
+    const auto* bytes = static_cast<const uint8_t*>(imageB.stagingMapped);
+    constexpr uint8_t expectedByte = 0xA5;
+    for (VkDeviceSize i = 0; i < imageB.stagingSize; ++i)
+        if (bytes[i] != expectedByte)
+            throw std::runtime_error("B3.3 Pattern A mismatch at staging offset "
+                + std::to_string(i) + " expected=0xA5 actual=0x"
+                + [&] { char out[3]{}; std::snprintf(out, sizeof(out), "%02X", bytes[i]);
+                    return std::string(out); }());
+}
+
+void RuntimeImageEndpoint::executeCompleteRoundTrip(RuntimeImageEndpoint& imageA,
+        RuntimeImageEndpoint& imageB) {
+    auto payloadAB = executeInitialChained(imageA);
+    auto importB = createSyncFdImportSemaphore(imageB.endpoint.semaphoreDevice);
+    importSyncFdTemporary(imageB.endpoint.semaphoreDevice, importB.handle(), payloadAB);
+    const VkCommandBuffer bcmd = imageB.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = imageB.endpoint.BeginCommandBuffer(bcmd, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkBeginCommandBuffer B");
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkImageMemoryBarrier acquireB{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, imageB.endpoint.queueFamilyIndex, imageB.imageHandle,
+        range};
+    imageB.endpoint.CmdPipelineBarrier(bcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquireB);
+    const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {0, 0, 0}, {256, 256, 1}};
+    imageB.endpoint.CmdCopyImageToBuffer(bcmd, imageB.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageB.stagingBuffer, 1, &copy);
+    const VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        imageB.endpoint.queueFamilyIndex, imageB.endpoint.queueFamilyIndex, imageB.imageHandle,
+        range};
+    imageB.endpoint.CmdPipelineBarrier(bcmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+    const VkClearColorValue patternB{{0.3529412F, 0.3529412F, 0.3529412F, 0.3529412F}};
+    imageB.endpoint.CmdClearColorImage(bcmd, imageB.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &patternB, 1, &range);
+    const VkImageMemoryBarrier releaseB{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageB.endpoint.queueFamilyIndex,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, imageB.imageHandle, range};
+    imageB.endpoint.CmdPipelineBarrier(bcmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &releaseB);
+    result = imageB.endpoint.EndCommandBuffer(bcmd);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkEndCommandBuffer B");
+    auto signalB = createExportableSyncFdSemaphore(imageB.endpoint.semaphoreDevice);
+    const VkSemaphore waitB = importB.handle(), signalHandle = signalB.handle();
+    constexpr VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submitB{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submitB.waitSemaphoreCount = 1;
+    submitB.pWaitSemaphores = &waitB; submitB.pWaitDstStageMask = &stage;
+    submitB.commandBufferCount = 1; submitB.pCommandBuffers = &bcmd;
+    submitB.signalSemaphoreCount = 1; submitB.pSignalSemaphores = &signalHandle;
+    result = imageB.endpoint.QueueSubmit(imageB.endpoint.queue, 1, &submitB, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkQueueSubmit B");
+    auto payloadBA = exportSyncFd(imageB.endpoint.semaphoreDevice, signalB.handle());
+    auto importA = createSyncFdImportSemaphore(imageA.endpoint.semaphoreDevice);
+    importSyncFdTemporary(imageA.endpoint.semaphoreDevice, importA.handle(), payloadBA);
+    const VkCommandBuffer acmd = imageA.commandBuffers.at(1);
+    result = imageA.endpoint.BeginCommandBuffer(acmd, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkBeginCommandBuffer A final");
+    const VkImageMemoryBarrier acquireA{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        imageA.endpoint.queueFamilyIndex, imageA.imageHandle, range};
+    imageA.endpoint.CmdPipelineBarrier(acmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquireA);
+    imageA.endpoint.CmdCopyImageToBuffer(acmd, imageA.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageA.stagingBuffer, 1, &copy);
+    result = imageA.endpoint.EndCommandBuffer(acmd);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkEndCommandBuffer A final");
+    if (!imageA.finalFence || !imageA.endpoint.ResetFences)
+        throw std::runtime_error("B3.4 final fence/reset dispatch unavailable");
+    result = imageA.endpoint.ResetFences(imageA.endpoint.bufferDevice.device, 1,
+        &imageA.finalFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkResetFences");
+    const VkSemaphore finalWait = importA.handle();
+    VkSubmitInfo finalSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; finalSubmit.waitSemaphoreCount = 1;
+    finalSubmit.pWaitSemaphores = &finalWait; finalSubmit.pWaitDstStageMask = &stage;
+    finalSubmit.commandBufferCount = 1; finalSubmit.pCommandBuffers = &acmd;
+    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &finalSubmit,
+        imageA.finalFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkQueueSubmit A final");
+    result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
+        &imageA.finalFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "B3.4 vkWaitForFences");
+    auto check = [](RuntimeImageEndpoint& image, uint8_t expected) {
+        if (!image.stagingHostCoherent) {
+            VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+            r.memory = image.stagingMemory; r.size = VK_WHOLE_SIZE;
+            auto v = image.endpoint.InvalidateMappedMemoryRanges(image.endpoint.bufferDevice.device, 1, &r);
+            if (v != VK_SUCCESS) throw ls::vulkan_error(v, "B3.4 staging invalidate");
+        }
+        const auto* p = static_cast<const uint8_t*>(image.stagingMapped);
+        for (VkDeviceSize i = 0; i < image.stagingSize; ++i)
+            if (p[i] != expected) throw std::runtime_error("B3.4 staging mismatch offset " + std::to_string(i));
+    };
+    check(imageB, 0xA5); check(imageA, 0x5A);
+}
+
+RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoint& source,
+        ls::OwnedFd fd, const RuntimeImageBackingInfo& backing) {
+    if (!source.CreateImage || !source.DestroyImage || !source.GetImageMemoryRequirements2
+            || !source.BindImageMemory || !source.GetMemoryFdPropertiesKHR)
+        throw std::invalid_argument("image-capable runtime endpoint is incomplete");
+    if (backing.fourcc != DRM_FORMAT_ARGB8888 || backing.planeCount != 1)
+        throw std::invalid_argument("runtime image backing format/plane mismatch");
+    RuntimeImageEndpoint result;
+    result.endpoint = source;
+    VkExternalMemoryImageCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier{
+        VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
+    modifier.drmFormatModifier = backing.modifier;
+    modifier.drmFormatModifierPlaneCount = backing.planeCount;
+    modifier.pPlaneLayouts = &backing.plane;
+    modifier.pNext = &external;
+    const VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &modifier, 0,
+        VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, {256,256,1}, 1, 1,
+        VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, VK_IMAGE_LAYOUT_UNDEFINED};
+    auto r = source.CreateImage(source.bufferDevice.device, &create, nullptr, &result.imageHandle);
+    if (r != VK_SUCCESS) throw ls::vulkan_error(r, "vkCreateImage runtime image failed");
+    VkImageMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+    query.image = result.imageHandle;
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    result.memoryRequirements.pNext = &dedicated;
+    VkMemoryRequirements2 requirements{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    requirements.pNext = &dedicated;
+    source.GetImageMemoryRequirements2(source.bufferDevice.device, &query, &requirements);
+    result.memoryRequirements = requirements;
+    ExternalMemoryImportPlan plan{
+        source.bufferDevice.device, source.AllocateMemory, source.FreeMemory,
+        source.GetMemoryFdPropertiesKHR, source.bufferDevice.memoryProperties,
+        requirements.memoryRequirements.size, requirements.memoryRequirements.memoryTypeBits,
+        result.imageHandle, false, dedicated.requiresDedicatedAllocation == VK_TRUE, false};
+    try {
+        result.memory = ImportedExternalMemory::import(plan, std::move(fd), &result.importDiagnostics);
+    } catch (const ls::vulkan_error& error) {
+        throw ls::vulkan_error(error.error(), "runtime image external import failed");
+    }
+    r = source.BindImageMemory(source.bufferDevice.device, result.imageHandle,
+        result.memory.memory(), 0);
+    if (r != VK_SUCCESS) throw ls::vulkan_error(r, "vkBindImageMemory runtime image failed");
+    return result;
 }
 
 RuntimeExchangeChannel::RuntimeExchangeChannel(

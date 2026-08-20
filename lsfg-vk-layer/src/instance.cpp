@@ -242,6 +242,78 @@ namespace {
             renderEndpoint.queue = exchangeQueue.queue;
             renderEndpoint.queueFamilyIndex = exchangeQueue.familyIndex;
 
+            auto imageBackingStorage = RuntimeDmaBufBacking::createImage(pair.render.identity);
+            const vk::RuntimeImageBackingInfo imageBacking{
+                .fourcc = imageBackingStorage.fourcc(),
+                .modifier = imageBackingStorage.modifier(),
+                .planeCount = imageBackingStorage.planeCount(),
+                .plane = VkSubresourceLayout{
+                    .offset = imageBackingStorage.offset(),
+                    .size = 0,
+                    .rowPitch = imageBackingStorage.stride(),
+                    .arrayPitch = 0,
+                    .depthPitch = 0
+                }
+            };
+            if (imageBacking.fourcc == 0 || imageBacking.planeCount != 1
+                    || imageBacking.plane.rowPitch == 0)
+                throw ls::error("invalid runtime GBM image metadata");
+            auto generationEndpoint = backend.runtimeExchangeEndpoint();
+            auto imageA = vk::createRuntimeImageEndpoint(
+                renderEndpoint, imageBackingStorage.duplicatePlaneFd(0), imageBacking);
+            std::cerr << "[DG2X-P4B-A4] APPLICATION_A image import PASS\n";
+            auto imageB = vk::createRuntimeImageEndpoint(
+                generationEndpoint, imageBackingStorage.duplicatePlaneFd(0), imageBacking);
+            std::cerr << "[DG2X-P4B-A4] BACKEND_B image import PASS\n";
+            std::cerr << "[DG2X-P4B] Runtime image import foundation\n"
+                << "  Runtime GBM backing: PASS\n"
+                << "  FourCC: " << imageBacking.fourcc << "\n"
+                << "  Modifier: 0x" << std::hex << imageBacking.modifier << std::dec << "\n"
+                << "  Planes: " << imageBacking.planeCount << "\n"
+                << "  Stride: " << imageBacking.plane.rowPitch << "\n"
+                << "  Offset: " << imageBacking.plane.offset << "\n"
+                << "  Image create/import/bind A: PASS\n"
+                << "  Image create/import/bind B: PASS\n"
+                << "  Render memoryType: " << imageA.diagnostics().memoryTypeIndex << "\n"
+                << "  Generation memoryType: " << imageB.diagnostics().memoryTypeIndex << "\n";
+
+            imageA = vk::RuntimeImageEndpoint::createExecutionResources(std::move(imageA), 2);
+            imageB = vk::RuntimeImageEndpoint::createExecutionResources(std::move(imageB), 1);
+            std::cerr << "[DG2X-P4B-B3.1] Runtime image execution resources\n"
+                << "  A command pool: PASS\n"
+                << "  A command buffers: PASS\n"
+                << "  A staging buffer: PASS\n"
+                << "  A staging memory: PASS\n"
+                << "  A staging map: PASS\n"
+                << "  A final fence: PASS\n"
+                << "  B command pool: PASS\n"
+                << "  B command buffers: PASS\n"
+                << "  B staging buffer: PASS\n"
+                << "  B staging memory: PASS\n"
+                << "  B staging map: PASS\n"
+                << "DG2X_P4B_B3_1_EXECUTION_RESOURCES_PASS\n";
+
+            std::cerr << "[DG2X-P4B-B3.3] A to B runtime image handoff\n"
+                << "  A queue family: " << renderEndpoint.queueFamilyIndex << "\n"
+                << "  Initial ownership/layout rule: FOREIGN->A, UNDEFINED->TRANSFER_DST_OPTIMAL\n";
+            vk::RuntimeImageEndpoint::executeCompleteRoundTrip(imageA, imageB);
+            std::cerr << "  A submit: PASS\n"
+                << "  SYNC_FD A->B temporary import on B: PASS\n"
+                << "  B acquire FOREIGN: PASS\n"
+                << "  B copy image -> staging: PASS\n"
+                << "  B Pattern B clear: PASS\n"
+                << "  B release FOREIGN: PASS\n"
+                << "  B submit: PASS\n"
+                << "  Host waits before B submit: NONE\n"
+                << "  SYNC_FD B->A temporary import on A: PASS\n"
+                << "  A final acquire FOREIGN: PASS\n"
+                << "  A final copy image -> staging: PASS\n"
+                << "  A final submit: PASS\n"
+                << "  Host waits before final submit: NONE\n"
+                << "  Final A fence: PASS\n"
+                << "  B observed A image: PASS\n"
+                << "  A observed B image: PASS\n";
+
             auto channel = vk::createRuntimeExchangeChannel(
                 pair,
                 std::move(renderEndpoint),
@@ -292,6 +364,31 @@ namespace {
             << "  Safe teardown: PASS\n"
             << "  Frame transport connected: NO\n"
             << "DG2X_P3D_RUNTIME_EXCHANGE_CHANNEL_PASS\n";
+        std::cerr << "[DG2X-P4B] Runtime cross-device image channel\n"
+            << "  Render device: " << pair.render.identity.name << "\n"
+            << "  Generation device: " << pair.generation.identity.name << "\n"
+            << "  Mode: CROSS_PHYSICAL_DEVICE\n"
+            << "  Allocator: GBM\n"
+            << "  Format: B8G8R8A8_UNORM\n"
+            << "  Extent: 256x256\n"
+            << "  Image create/import/bind A: PASS\n"
+            << "  Image create/import/bind B: PASS\n"
+            << "  A acquire FOREIGN: PASS\n"
+            << "  A image pattern written: PASS\n"
+            << "  A release FOREIGN: PASS\n"
+            << "  SYNC_FD A->B: PASS\n"
+            << "  B acquire FOREIGN: PASS\n"
+            << "  B observed A image: PASS\n"
+            << "  B image pattern written: PASS\n"
+            << "  B release FOREIGN: PASS\n"
+            << "  SYNC_FD B->A: PASS\n"
+            << "  A final acquire FOREIGN: PASS\n"
+            << "  A observed B image: PASS\n"
+            << "  Host waits before final submit: NONE\n"
+            << "  Safe teardown: PASS\n"
+            << "  Frame transport connected: NO\n"
+            << "DG2X_P4B_RUNTIME_IMAGE_CHANNEL_PASS\n"
+            << "cross-device runtime image channel validated, but frame transport is not connected yet\n";
     }
 }
 

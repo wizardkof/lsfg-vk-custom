@@ -46,6 +46,8 @@ namespace vk {
         PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
         PFN_vkCreateDevice CreateDevice;
         PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
+        PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
 
         // extension functions
         PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
@@ -59,7 +61,7 @@ namespace vk {
     /// @param graphical whether the device is graphical (rather than compute)
     /// @return initialized function pointers
     VulkanInstanceFuncs initVulkanInstanceFuncs(VkInstance instance, PFN_vkGetInstanceProcAddr mpa,
-        bool graphical);
+        bool graphical, bool khrProperties2 = false);
 
     using PhysicalDeviceSelector = const std::function<
         VkPhysicalDevice(
@@ -149,7 +151,7 @@ namespace vk {
     /// @param graphical whether the device is graphical (rather than compute)
     /// @return initialized function pointers
     VulkanDeviceFuncs initVulkanDeviceFuncs(const VulkanInstanceFuncs& fi, VkDevice device,
-        bool graphical);
+        bool graphical, bool khrMemoryRequirements2 = false);
 
     /// vulkan version wrapper
     class version {
