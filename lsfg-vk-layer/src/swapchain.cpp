@@ -12,6 +12,7 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,18 @@ using namespace lsfgvk;
 using namespace lsfgvk::layer;
 
 namespace {
+    struct CaptureResources {
+        VkDevice device{};
+        PFN_vkDestroyBuffer destroyBuffer{};
+        PFN_vkFreeMemory freeMemory{};
+        VkBuffer buffer{};
+        VkDeviceMemory memory{};
+        ~CaptureResources() {
+            if (buffer) destroyBuffer(device, buffer, nullptr);
+            if (memory) freeMemory(device, memory, nullptr);
+        }
+    };
+
     [[nodiscard]] bool isFixedMode(const ls::GameConf& profile) {
         return profile.frame_generation_mode == ls::FrameGenerationMode::Fixed;
     }
@@ -104,6 +117,135 @@ namespace {
             return res;
         }
     }
+}
+
+void Swapchain::captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
+        uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores) {
+    if (this->info.format != VK_FORMAT_A2R10G10B10_UNORM_PACK32
+            && this->info.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+        throw ls::error("P4C-B unsupported capture source format");
+    const VkDeviceSize byteSize = static_cast<VkDeviceSize>(this->info.extent.width)
+        * this->info.extent.height * 4;
+    CaptureResources resources{vk.dev(), vk.df().DestroyBuffer, vk.df().FreeMemory};
+    const VkBufferCreateInfo bufferInfo{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = byteSize,
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    auto result = vk.df().CreateBuffer(vk.dev(), &bufferInfo, nullptr, &resources.buffer);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-B capture buffer creation");
+    VkMemoryRequirements requirements{};
+    vk.df().GetBufferMemoryRequirements(vk.dev(), resources.buffer, &requirements);
+    VkPhysicalDeviceMemoryProperties memoryProperties{};
+    vk.fi().GetPhysicalDeviceMemoryProperties(vk.physdev(), &memoryProperties);
+    std::optional<uint32_t> memoryType;
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+        if (!(requirements.memoryTypeBits & (1u << i))) continue;
+        const auto flags = memoryProperties.memoryTypes[i].propertyFlags;
+        if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                == (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            memoryType = i; break;
+        }
+        if (!memoryType && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) memoryType = i;
+    }
+    if (!memoryType) throw ls::error("P4C-B capture staging has no host-visible memory type");
+    const auto memoryFlags = memoryProperties.memoryTypes[*memoryType].propertyFlags;
+    const bool coherent = (memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    const VkMemoryAllocateInfo allocation{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = requirements.size,
+        .memoryTypeIndex = *memoryType
+    };
+    result = vk.df().AllocateMemory(vk.dev(), &allocation, nullptr, &resources.memory);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-B capture memory allocation");
+    result = vk.df().BindBufferMemory(vk.dev(), resources.buffer, resources.memory, 0);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-B capture buffer bind");
+
+    vk::CommandBuffer command(vk);
+    command.begin(vk);
+    const auto range = vk::exchangeImageSubresourceRange();
+    const auto toTransfer = vk::makeImageBarrier(sourceImage, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    command.insertBarriers(vk, {toTransfer}, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkBufferImageCopy copy{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {this->info.extent.width, this->info.extent.height, 1}
+    };
+    vk.df().CmdCopyImageToBuffer(command.handle(), sourceImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, resources.buffer, 1, &copy);
+    const auto restore = vk::makeImageBarrier(sourceImage, VK_ACCESS_TRANSFER_READ_BIT, 0,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    command.insertBarriers(vk, {restore}, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    command.end(vk);
+    vk::Fence fence(vk);
+    command.submit(vk, vk.queue(), bridgeSemaphores, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
+        fence.handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    if (!fence.wait(vk)) throw ls::error("P4C-B capture fence wait failed");
+
+    void* mapped{};
+    result = vk.df().MapMemory(vk.dev(), resources.memory, 0, byteSize, 0, &mapped);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-B capture readback map");
+    if (!coherent) {
+        const VkMappedMemoryRange invalidate{
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = resources.memory,
+            .size = byteSize
+        };
+        result = vk.df().InvalidateMappedMemoryRanges(vk.dev(), 1, &invalidate);
+        if (result != VK_SUCCESS) {
+            vk.df().UnmapMemory(vk.dev(), resources.memory);
+            throw ls::vulkan_error(result, "P4C-B capture readback invalidate");
+        }
+    }
+    const auto* bytes = static_cast<const uint8_t*>(mapped);
+    uint64_t checksum = 1469598103934665603ULL;
+    VkDeviceSize nonZero{};
+    for (VkDeviceSize i = 0; i < byteSize; ++i) {
+        checksum ^= bytes[i]; checksum *= 1099511628211ULL;
+        nonZero += bytes[i] != 0;
+    }
+    vk.df().UnmapMemory(vk.dev(), resources.memory);
+    if (nonZero == 0) throw ls::error("P4C-B capture readback is entirely zero");
+    std::cerr << "[DG2X-P4C-B] Real frame capture on application GPU\n"
+        << "  Runtime mode: CAPTURE_ONLY\n"
+        << "  Source image index: " << imageIndex << "\n"
+        << "  Source VkImage: " << sourceImage << "\n"
+        << "  Source format: " << static_cast<int>(this->info.format) << "\n"
+        << "  Source extent: " << this->info.extent.width << 'x' << this->info.extent.height << "\n"
+        << "  Present waits at boundary: " << bridgeSemaphores.size() << "\n"
+        << "  bridgePresentWaits: PASS\n"
+        << "  Capture queue family: " << vk.queueFamilyIndex() << "\n"
+        << "  Capture command pool: PASS\n"
+        << "  Capture staging allocation: PASS\n"
+        << "  Capture byte size: " << byteSize << "\n"
+        << "  Capture memoryType: " << *memoryType << "\n"
+        << "  Capture host coherent: " << (coherent ? "YES" : "NO") << "\n"
+        << "  Source state acquisition: PASS\n"
+        << "  Source layout transition: PASS\n"
+        << "  vkCmdCopyImageToBuffer: PASS\n"
+        << "  Source state restore: PASS\n"
+        << "  Capture submit A: PASS\n"
+        << "  Capture fence completion: PASS\n"
+        << "  Capture readback: PASS\n"
+        << "  Captured byte count: " << byteSize << "\n"
+        << "  Captured non-zero bytes: " << nonZero << "\n"
+        << "  Captured checksum: 0x" << std::hex << checksum << std::dec << "\n"
+        << "  Backend submission: NONE\n"
+        << "  Frame DMA-BUF: NONE\n"
+        << "  Frame FOREIGN ownership: NONE\n"
+        << "  Frame SYNC_FD: NONE\n"
+        << "  LSFG backend execution: NONE\n"
+        << "  Frame transport connected: NO\n"
+        << "DG2X_P4C_B_REAL_FRAME_CAPTURE_A_PASS\n"
+        << "cross-device real frame captured on application GPU, but frame transport is not connected yet\n";
 }
 
 void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint32_t maxImages,
@@ -265,7 +407,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 << "  Backend real-frame workload: NO\n"
                 << "  LSFG execution on B: NO\n"
                 << "  Presentation from B: NO\n"
-                << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
+                << "  Capture hook reached: PASS\n";
+            this->captureRealFrameOnce(vk, sourceImage, imageIdx, semaphores);
+            std::cerr << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
                 << "cross-device capture hook reached, but real frame transport is not connected yet\n";
         }
         throw ls::error(

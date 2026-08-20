@@ -139,6 +139,9 @@ namespace lsfgvk::layer {
         CrossDeviceRuntimeMode crossDeviceMode{CrossDeviceRuntimeMode::BLOCKED};
         bool captureOnlyPresentSeen{};
 
+        void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
+            uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);
+
         ls::GameConf profile;
         SwapchainInfo info;
     };

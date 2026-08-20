@@ -77,6 +77,8 @@ namespace vk {
         /// @throws ls::vulkan_error on failure
         void end(const vk::Vulkan& vk) const;
 
+        [[nodiscard]] VkCommandBuffer handle() const { return *this->commandBuffer; }
+
         /// submit the command buffer
         /// @param vk the vulkan instance
         /// @param waitSemaphores the semaphores to wait on
