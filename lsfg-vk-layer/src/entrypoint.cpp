@@ -1558,6 +1558,21 @@ namespace {
                     .format = newInfo.imageFormat,
                     .colorSpace = newInfo.imageColorSpace,
                     .extent = newInfo.imageExtent,
+                    .usage = newInfo.imageUsage,
+                    .sharingMode = newInfo.imageSharingMode,
+                    .queueFamilyIndices = newInfo.imageSharingMode == VK_SHARING_MODE_CONCURRENT
+                        && newInfo.queueFamilyIndexCount && newInfo.pQueueFamilyIndices
+                        ? std::vector<uint32_t>(newInfo.pQueueFamilyIndices,
+                            newInfo.pQueueFamilyIndices + newInfo.queueFamilyIndexCount)
+                        : std::vector<uint32_t>{},
+                    .surfaceSupportsTransferSrc = [&]() {
+                        VkSurfaceCapabilitiesKHR capabilities{};
+                        const auto query = it->second.fi().GetPhysicalDeviceSurfaceCapabilitiesKHR(
+                            it->second.physdev(), newInfo.surface, &capabilities);
+                        return query == VK_SUCCESS
+                            && (capabilities.supportedUsageFlags
+                                & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+                    }(),
                     .presentMode = newInfo.presentMode,
                     .adaptivePresentMode = adaptivePresentMode,
                     .fixedPresentMode = fixedPresentMode,

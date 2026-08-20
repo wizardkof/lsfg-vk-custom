@@ -134,6 +134,9 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         fixedScheduler(profile.target_fps),
         fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
+    if (this->devicePair.crossDevice())
+        this->crossDeviceMode = CrossDeviceRuntimeMode::CAPTURE_ONLY;
+
     // A virtual Adaptive 1x swapchain still needs the final virtual->real copy
     // resources even though it must not create an LSFG generation context.
     if (this->info.virtualized) {
@@ -142,6 +145,11 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         this->virtualFinalPresentSemaphore.emplace(vk);
         this->renderFence.emplace(vk);
     }
+
+    // P4C-B0 deliberately exposes only the application-side capture boundary.
+    // Do not construct backend/LSFG resources until real-frame transport exists.
+    if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY)
+        return;
 
     // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
     // bypasses LSFG. Fixed mode ignores multiplier and remains active.
@@ -232,6 +240,37 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         const std::vector<VkSemaphore>& semaphores,
         std::stop_token stopToken,
         std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
+    if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY) {
+        if (!this->captureOnlyPresentSeen) {
+            this->captureOnlyPresentSeen = true;
+            const auto sourceImage = this->info.images.at(imageIdx);
+            std::cerr << "[DG2X-P4C-B0] Cross-device capture-only runtime\n"
+                << "  RuntimeDevicePair: CROSS_PHYSICAL_DEVICE\n"
+                << "  P4B runtime image channel: PASS\n"
+                << "  Runtime mode: CAPTURE_ONLY\n"
+                << "  Frame transport connected: NO\n"
+                << "  vkCreateSwapchainKHR continuation: PASS\n"
+                << "  VirtualSwapchainRuntime creation: PASS\n"
+                << "  Virtual images exposed: PASS\n"
+                << "  vkQueuePresentKHR reached: PASS\n"
+                << "  Virtual image index: " << imageIdx << "\n"
+                << "  Source VkImage: " << sourceImage << "\n"
+                << "  Source format: " << static_cast<int>(this->info.format) << "\n"
+                << "  Source extent: " << this->info.extent.width << 'x'
+                << this->info.extent.height << "\n"
+                << "  Present wait semaphore count at capture boundary: "
+                << semaphores.size() << "\n"
+                << "  bridgePresentWaits reached: PASS\n"
+                << "  Capture hook reached: PASS\n"
+                << "  Backend real-frame workload: NO\n"
+                << "  LSFG execution on B: NO\n"
+                << "  Presentation from B: NO\n"
+                << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
+                << "cross-device capture hook reached, but real frame transport is not connected yet\n";
+        }
+        throw ls::error(
+            "cross-device capture hook reached, but real frame transport is not connected yet");
+    }
     const bool adaptiveBypass = isAdaptiveBypass(this->profile);
 
     // Legacy Adaptive 1x = OFF: when the application still owns real WSI

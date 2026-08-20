@@ -29,6 +29,12 @@
 
 namespace lsfgvk::layer {
 
+    enum class CrossDeviceRuntimeMode : uint8_t {
+        BLOCKED,
+        CAPTURE_ONLY,
+        FRAME_TRANSPORT
+    };
+
     /// swapchain info struct
     struct SwapchainInfo {
         // Images exposed to the application. In the Fixed virtual path these
@@ -39,6 +45,10 @@ namespace lsfgvk::layer {
         VkFormat format;
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
+        VkImageUsageFlags usage{};
+        VkSharingMode sharingMode{VK_SHARING_MODE_EXCLUSIVE};
+        std::vector<uint32_t> queueFamilyIndices;
+        bool surfaceSupportsTransferSrc{};
         // Present mode currently selected by the internal context.
         VkPresentModeKHR presentMode;
         // Stable modes declared for the hidden real WSI swapchain. These are
@@ -125,6 +135,9 @@ namespace lsfgvk::layer {
         FixedFrameScheduler fixedScheduler;
         FixedOutputPacer fixedOutputPacer;
         std::optional<std::chrono::steady_clock::time_point> lastSourcePresent;
+
+        CrossDeviceRuntimeMode crossDeviceMode{CrossDeviceRuntimeMode::BLOCKED};
+        bool captureOnlyPresentSeen{};
 
         ls::GameConf profile;
         SwapchainInfo info;

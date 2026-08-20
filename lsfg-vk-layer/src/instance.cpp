@@ -630,10 +630,60 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
         if (!exchangeQueue.has_value() || !exchangeQueue->valid())
             throw ls::error(
                 "cross-device runtime exchange requires a layer-managed offload queue");
+        const bool transferSrc =
+            (info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+        VkFormatProperties2 sourceFormatProperties{
+            VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        VkFormatProperties2 transportFormatProperties{
+            VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        vk.fi().GetPhysicalDeviceFormatProperties2(
+            vk.physdev(), info.format, &sourceFormatProperties);
+        vk.fi().GetPhysicalDeviceFormatProperties2(
+            vk.physdev(), VK_FORMAT_B8G8R8A8_UNORM, &transportFormatProperties);
+        const bool directCopy = info.format == VK_FORMAT_B8G8R8A8_UNORM;
+        const bool blitSupported =
+            (sourceFormatProperties.formatProperties.optimalTilingFeatures
+                & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0
+            && (transportFormatProperties.formatProperties.optimalTilingFeatures
+                & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0;
+        const bool contractResolved = !info.images.empty()
+            && info.format != VK_FORMAT_UNDEFINED
+            && info.extent.width != 0 && info.extent.height != 0
+            && transferSrc && info.surfaceSupportsTransferSrc
+            && (directCopy || blitSupported);
+        std::cerr << "[DG2X-P4C-A] Real frame source contract\n"
+            << "  Source image: "
+            << (info.images.empty() ? VK_NULL_HANDLE : info.images.front()) << "\n"
+            << "  Source image count: " << info.images.size() << "\n"
+            << "  Source kind: " << (info.virtualized ? "VIRTUAL_SWAPCHAIN" : "NATIVE_SWAPCHAIN") << "\n"
+            << "  Format: " << static_cast<int>(info.format)
+            << (info.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32
+                ? " (A2R10G10B10_UNORM_PACK32)" : "") << "\n"
+            << "  Extent: " << info.extent.width << 'x' << info.extent.height << "\n"
+            << "  Usage: 0x" << std::hex << info.usage << std::dec << "\n"
+            << "  TRANSFER_SRC available: " << (transferSrc ? "YES" : "NO") << "\n"
+            << "  Sharing mode: "
+            << (info.sharingMode == VK_SHARING_MODE_CONCURRENT ? "CONCURRENT" : "EXCLUSIVE") << "\n"
+            << "  Queue family: " << vk.queueFamilyIndex() << "\n"
+            << "  Pre-copy layout: PRESENT_SRC_KHR\n"
+            << "  Copy-capable queue: application present queue\n"
+            << "  Surface supports TRANSFER_SRC: "
+            << (info.surfaceSupportsTransferSrc ? "YES" : "NO") << "\n"
+            << "  Transport format candidate: "
+            << static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM)
+            << " (B8G8R8A8_UNORM)\n"
+            << "  Transport extent candidate: "
+            << info.extent.width << 'x' << info.extent.height << "\n"
+            << "  Copy method candidate: "
+            << (!contractResolved ? "BLOCKED" : directCopy ? "COPY" : "BLIT") << "\n"
+            << "  Synchronization insertion point: vkQueuePresentKHR wait-semaphore bridge submit\n"
+            << "  Frame transport connected: NO\n"
+            << (contractResolved
+                ? "DG2X_P4C_A_FRAME_SOURCE_CONTRACT_PASS\n"
+                : "DG2X_P4C_A_FRAME_SOURCE_CONTRACT_BLOCKED\n");
         validateRuntimeExchangeChannel(
             vk, this->backend.mut(), *runtimePair, *exchangeQueue);
-        throw ls::error(
-            "cross-device runtime exchange channel validated, but frame transport is not connected yet");
+        std::cerr << "[DG2X-P4C-B0] CAPTURE_ONLY mode armed; frame transport remains disconnected\n";
     }
 
     this->swapchains.emplace(swapchain,
@@ -679,8 +729,7 @@ void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
                 "cross-device runtime exchange requires a layer-managed offload queue");
         validateRuntimeExchangeChannel(
             vk, this->backend.mut(), *runtimePair, *exchangeQueue);
-        throw ls::error(
-            "cross-device runtime exchange channel validated, but frame transport is not connected yet");
+        std::cerr << "[DG2X-P4C-B0] CAPTURE_ONLY mode armed; frame transport remains disconnected\n";
     }
 
     this->swapchains.erase(swapchain);
