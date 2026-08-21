@@ -37,7 +37,8 @@ namespace lsfgvk::layer {
         [[nodiscard]] static RuntimeDmaBufBacking create(
             const vk::PhysicalDeviceIdentity& renderIdentity);
         [[nodiscard]] static RuntimeDmaBufBacking createImage(
-            const vk::PhysicalDeviceIdentity& renderIdentity);
+            const vk::PhysicalDeviceIdentity& renderIdentity,
+            VkExtent2D extent = {256, 256});
 
         [[nodiscard]] VkDeviceSize size() const noexcept { return this->backingSize; }
         [[nodiscard]] uint32_t fourcc() const noexcept { return this->boFourcc; }
@@ -53,7 +54,8 @@ namespace lsfgvk::layer {
 
     private:
         [[nodiscard]] static RuntimeDmaBufBacking createBacking(
-            const vk::PhysicalDeviceIdentity& renderIdentity, bool image);
+            const vk::PhysicalDeviceIdentity& renderIdentity, bool image,
+            VkExtent2D extent);
         RuntimeDmaBufBacking(
             std::filesystem::path nodePath,
             ls::OwnedFd nodeFd,

@@ -291,7 +291,31 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     // P4C-B0 deliberately exposes only the application-side capture boundary.
     // Do not construct backend/LSFG resources until real-frame transport exists.
     if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY)
+    {
+        auto backing = RuntimeDmaBufBacking::createImage(
+            this->devicePair.render.identity, this->info.extent);
+        auto endpointA = vk::makeRuntimeExchangeEndpoint(vk);
+        auto endpointB = backend.runtimeExchangeEndpoint();
+        const vk::RuntimeImageBackingInfo backingInfo{
+            .extent = this->info.extent,
+            .backingSize = backing.size(),
+            .fourcc = backing.fourcc(),
+            .modifier = backing.modifier(),
+            .planeCount = backing.planeCount(),
+            .plane = {backing.offset(), 0, backing.stride(), 0, 0}
+        };
+        this->frameTransportA = vk::createRuntimeImageEndpoint(
+            endpointA, backing.duplicatePlaneFd(0), backingInfo);
+        this->frameTransportB = vk::createRuntimeImageEndpoint(
+            endpointB, backing.duplicatePlaneFd(0), backingInfo);
+        this->frameTransportA = vk::RuntimeImageEndpoint::createExecutionResources(
+            std::move(this->frameTransportA), 1);
+        this->frameTransportB = vk::RuntimeImageEndpoint::createExecutionResources(
+            std::move(this->frameTransportB), 1);
+        this->frameTransportBacking = std::move(backing);
+        this->frameTransportReady = true;
         return;
+    }
 
     // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
     // bypasses LSFG. Fixed mode ignores multiplier and remains active.
@@ -408,7 +432,12 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 << "  LSFG execution on B: NO\n"
                 << "  Presentation from B: NO\n"
                 << "  Capture hook reached: PASS\n";
-            this->captureRealFrameOnce(vk, sourceImage, imageIdx, semaphores);
+            if (!this->frameTransportReady)
+                throw ls::error("P4C-C frame transport resources unavailable");
+            vk::RuntimeImageEndpoint::executeRealFrameTransport(
+                this->frameTransportA, this->frameTransportB, sourceImage,
+                this->info.extent, semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
+            this->captureRealFrameOnce(vk, sourceImage, imageIdx, {});
             std::cerr << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
                 << "cross-device capture hook reached, but real frame transport is not connected yet\n";
         }

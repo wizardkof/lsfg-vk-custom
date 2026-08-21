@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iomanip>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -130,7 +131,7 @@ void RuntimeDmaBufBacking::reset() noexcept {
 }
 
 RuntimeDmaBufBacking RuntimeDmaBufBacking::createBacking(
-        const vk::PhysicalDeviceIdentity& renderIdentity, bool image) {
+        const vk::PhysicalDeviceIdentity& renderIdentity, bool image, VkExtent2D extent) {
     if (!renderIdentity.pci.has_value())
         throw ls::error("render GPU has no stable PCI address for GBM DMA-BUF allocation");
 
@@ -146,18 +147,22 @@ RuntimeDmaBufBacking RuntimeDmaBufBacking::createBacking(
             + " errno=" + std::to_string(errno));
 
     constexpr uint64_t requestedModifier = DRM_FORMAT_MOD_LINEAR;
-    auto* bo = image
-        ? gbm_bo_create_with_modifiers2(device, CONTROL_WIDTH, CONTROL_HEIGHT,
-            GBM_FORMAT_ARGB8888, &requestedModifier, 1,
-            GBM_BO_USE_RENDERING)
-        : gbm_bo_create(device, CONTROL_WIDTH, CONTROL_HEIGHT, GBM_FORMAT_R8,
-            GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    const auto createBo = [&](uint32_t height) {
+        return image
+            ? gbm_bo_create_with_modifiers2(device, extent.width, height,
+                GBM_FORMAT_ARGB8888, &requestedModifier, 1,
+                GBM_BO_USE_RENDERING)
+            : gbm_bo_create(device, extent.width, height, GBM_FORMAT_R8,
+                GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    };
+    uint32_t physicalHeight = extent.height;
+    auto* bo = createBo(physicalHeight);
     if (!bo) {
         std::fprintf(stderr,
             "[DG2X-A3H2] Runtime %s backing request node=%s fd=%d device=%p "
             "width=%u height=%u fourcc=0x%x usage=0x%x errno=%d (%s)\n",
             image ? "image" : "legacy buffer", nodePath.c_str(), nodeFd.get(),
-            static_cast<void*>(device), CONTROL_WIDTH, CONTROL_HEIGHT,
+            static_cast<void*>(device), extent.width, extent.height,
             image ? GBM_FORMAT_ARGB8888 : GBM_FORMAT_R8,
             GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING, errno, std::strerror(errno));
         gbm_device_destroy(device);
@@ -173,26 +178,61 @@ RuntimeDmaBufBacking RuntimeDmaBufBacking::createBacking(
             + std::to_string(errno));
     }
 
-    const off_t end = ::lseek(dmaBufFd.get(), 0, SEEK_END);
-    if (end <= 0) {
+    auto queryMetadata = [&]() {
+        const off_t end = ::lseek(dmaBufFd.get(), 0, SEEK_END);
+        if (end <= 0)
+            throw ls::error("unable to determine runtime DMA-BUF backing size errno="
+                + std::to_string(errno));
+        static_cast<void>(::lseek(dmaBufFd.get(), 0, SEEK_SET));
+        return end;
+    };
+    off_t end = queryMetadata();
+    auto fourcc = gbm_bo_get_format(bo);
+    auto modifier = gbm_bo_get_modifier(bo);
+    auto planes = gbm_bo_get_plane_count(bo);
+    auto stride = gbm_bo_get_stride_for_plane(bo, 0);
+    auto offset = gbm_bo_get_offset(bo, 0);
+    if (image && end % 65536 != 0) {
+        // Experimental compatibility policy validated for AMD RADV -> NVIDIA:
+        // Vulkan does not universally require this DMA-BUF physical granularity.
+        if (stride == 0)
+            throw ls::error("cannot pad runtime image backing with zero stride");
+        const auto rowQuantum = 65536U / std::gcd(65536U, stride);
+        const auto paddedHeight = ((extent.height + rowQuantum - 1) / rowQuantum) * rowQuantum;
+        std::fprintf(stderr,
+            "[DG2X-P4C-C] DMA-BUF padding policy logical=%ux%u physical=%ux%u stride=%u size=%lld granularity=65536 padding=applied\n",
+            extent.width, extent.height, extent.width, paddedHeight, stride,
+            static_cast<long long>(end));
         gbm_bo_destroy(bo);
-        gbm_device_destroy(device);
-        throw ls::error("unable to determine runtime DMA-BUF backing size errno="
-            + std::to_string(errno));
+        dmaBufFd.reset();
+        physicalHeight = paddedHeight;
+        bo = createBo(physicalHeight);
+        if (!bo)
+            throw ls::error("GBM failed to recreate padded runtime image backing");
+        dmaBufFd = ls::OwnedFd(gbm_bo_get_fd(bo));
+        if (!dmaBufFd)
+            throw ls::error("GBM failed to export recreated padded runtime image backing");
+        end = queryMetadata();
+        fourcc = gbm_bo_get_format(bo);
+        modifier = gbm_bo_get_modifier(bo);
+        planes = gbm_bo_get_plane_count(bo);
+        stride = gbm_bo_get_stride_for_plane(bo, 0);
+        offset = gbm_bo_get_offset(bo, 0);
     }
-    static_cast<void>(::lseek(dmaBufFd.get(), 0, SEEK_SET));
-
-    const auto fourcc = gbm_bo_get_format(bo);
-    const auto modifier = gbm_bo_get_modifier(bo);
-    const auto planes = gbm_bo_get_plane_count(bo);
-    const auto stride = gbm_bo_get_stride_for_plane(bo, 0);
-    const auto offset = gbm_bo_get_offset(bo, 0);
     if (image && (fourcc != DRM_FORMAT_ARGB8888 || modifier != DRM_FORMAT_MOD_LINEAR
-            || planes != 1 || stride == 0)) {
+            || planes != 1 || stride == 0 || end % 65536 != 0
+            || static_cast<VkDeviceSize>(end) < static_cast<VkDeviceSize>(offset)
+                + static_cast<VkDeviceSize>(stride) * extent.height)) {
         gbm_bo_destroy(bo);
+        dmaBufFd.reset();
         gbm_device_destroy(device);
         throw ls::error("GBM returned an incompatible runtime image backing");
     }
+    if (image)
+        std::fprintf(stderr,
+            "[DG2X-P4C-C] DMA-BUF backing logical=%ux%u physicalRows=%u stride=%u size=%lld granularity=65536 padding=%s\n",
+            extent.width, extent.height, physicalHeight, stride,
+            static_cast<long long>(end), physicalHeight != extent.height ? "applied" : "none");
     return RuntimeDmaBufBacking(nodePath, std::move(nodeFd), device, bo,
         std::move(dmaBufFd), static_cast<VkDeviceSize>(end), fourcc, modifier,
         planes, stride, offset);
@@ -200,12 +240,12 @@ RuntimeDmaBufBacking RuntimeDmaBufBacking::createBacking(
 
 RuntimeDmaBufBacking RuntimeDmaBufBacking::create(
         const vk::PhysicalDeviceIdentity& renderIdentity) {
-    return createBacking(renderIdentity, false);
+    return createBacking(renderIdentity, false, {CONTROL_WIDTH, CONTROL_HEIGHT});
 }
 
 RuntimeDmaBufBacking RuntimeDmaBufBacking::createImage(
-        const vk::PhysicalDeviceIdentity& renderIdentity) {
-    return createBacking(renderIdentity, true);
+        const vk::PhysicalDeviceIdentity& renderIdentity, VkExtent2D extent) {
+    return createBacking(renderIdentity, true, extent);
 }
 
 ls::OwnedFd RuntimeDmaBufBacking::duplicateFd() const {

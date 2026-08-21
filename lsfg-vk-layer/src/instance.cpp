@@ -244,6 +244,7 @@ namespace {
 
             auto imageBackingStorage = RuntimeDmaBufBacking::createImage(pair.render.identity);
             const vk::RuntimeImageBackingInfo imageBacking{
+                .backingSize = imageBackingStorage.size(),
                 .fourcc = imageBackingStorage.fourcc(),
                 .modifier = imageBackingStorage.modifier(),
                 .planeCount = imageBackingStorage.planeCount(),

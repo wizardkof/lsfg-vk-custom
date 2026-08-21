@@ -68,6 +68,7 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         ,.BindImageMemory = vk.df().BindImageMemory
         ,.CmdClearColorImage = vk.df().CmdClearColorImage
         ,.CmdCopyImageToBuffer = vk.df().CmdCopyImageToBuffer
+        ,.CmdBlitImage = vk.df().CmdBlitImage
         ,.GetMemoryFdPropertiesKHR = getMemoryFdProperties
         ,.AllocateMemory = vk.df().AllocateMemory
         ,.FreeMemory = vk.df().FreeMemory

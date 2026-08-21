@@ -8,6 +8,7 @@
 #include <vector>
 #include <utility>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <iostream>
 #include <libdrm/drm_fourcc.h>
@@ -284,7 +285,7 @@ RuntimeImageEndpoint::RuntimeImageEndpoint(RuntimeImageEndpoint&& other) noexcep
       commandBuffers(std::move(other.commandBuffers)), stagingBuffer(std::exchange(other.stagingBuffer, VK_NULL_HANDLE)),
       stagingMemory(std::exchange(other.stagingMemory, VK_NULL_HANDLE)), stagingMapped(std::exchange(other.stagingMapped, nullptr)),
       stagingHostCoherent(other.stagingHostCoherent), stagingSize(other.stagingSize),
-      finalFence(std::exchange(other.finalFence, VK_NULL_HANDLE)) {}
+      finalFence(std::exchange(other.finalFence, VK_NULL_HANDLE)), extent(other.extent) {}
 
 RuntimeImageEndpoint& RuntimeImageEndpoint::operator=(RuntimeImageEndpoint&& other) noexcept {
     if (this != &other) {
@@ -302,6 +303,7 @@ RuntimeImageEndpoint& RuntimeImageEndpoint::operator=(RuntimeImageEndpoint&& oth
         stagingHostCoherent = other.stagingHostCoherent;
         stagingSize = other.stagingSize;
         finalFence = std::exchange(other.finalFence, VK_NULL_HANDLE);
+        extent = other.extent;
     }
     return *this;
 }
@@ -334,7 +336,8 @@ RuntimeImageEndpoint RuntimeImageEndpoint::createExecutionResources(
             || !endpoint.BindBufferMemory || !endpoint.MapMemory || !endpoint.UnmapMemory
             || !endpoint.CreateFence || !endpoint.DestroyFence)
         throw std::runtime_error("runtime image execution dispatch incomplete");
-    source.stagingSize = 256 * 256 * 4;
+    source.stagingSize = static_cast<VkDeviceSize>(source.extent.width)
+        * source.extent.height * 4;
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufferInfo.size = source.stagingSize;
     bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -641,6 +644,146 @@ void RuntimeImageEndpoint::executeCompleteRoundTrip(RuntimeImageEndpoint& imageA
     check(imageB, 0xA5); check(imageA, 0x5A);
 }
 
+void RuntimeImageEndpoint::executeRealFrameTransport(RuntimeImageEndpoint& imageA,
+        RuntimeImageEndpoint& imageB, VkImage sourceImage, VkExtent2D sourceExtent,
+        VkSemaphore bridgeWait) {
+    if (sourceExtent.width != imageA.extent.width || sourceExtent.height != imageA.extent.height
+            || imageA.extent.width != imageB.extent.width || imageA.extent.height != imageB.extent.height)
+        throw std::runtime_error("P4C-C source/transport extent mismatch");
+    if (!imageA.endpoint.CmdBlitImage || !imageB.endpoint.CmdCopyImageToBuffer)
+        throw std::runtime_error("P4C-C image transfer dispatch incomplete");
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkCommandBuffer acmd = imageA.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = imageA.endpoint.BeginCommandBuffer(acmd, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkBeginCommandBuffer A");
+    const VkImageMemoryBarrier sourceToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        0, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, sourceImage, range};
+    const VkImageMemoryBarrier transportAcquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        imageA.endpoint.queueFamilyIndex, imageA.imageHandle, range};
+    imageA.endpoint.CmdPipelineBarrier(acmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+        std::array{sourceToRead, transportAcquire}.data());
+    const VkImageBlit blit{
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{0, 0, 0}, {static_cast<int32_t>(sourceExtent.width),
+            static_cast<int32_t>(sourceExtent.height), 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffsets = {{0, 0, 0}, {static_cast<int32_t>(imageA.extent.width),
+            static_cast<int32_t>(imageA.extent.height), 1}}
+    };
+    imageA.endpoint.CmdBlitImage(acmd, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        imageA.imageHandle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+        VK_FILTER_NEAREST);
+    const VkImageMemoryBarrier sourceRestore{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        sourceImage, range};
+    const VkImageMemoryBarrier transportRelease{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageA.endpoint.queueFamilyIndex,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, imageA.imageHandle, range};
+    imageA.endpoint.CmdPipelineBarrier(acmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2,
+        std::array{sourceRestore, transportRelease}.data());
+    result = imageA.endpoint.EndCommandBuffer(acmd);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkEndCommandBuffer A");
+    auto signalA = createExportableSyncFdSemaphore(imageA.endpoint.semaphoreDevice);
+    const VkSemaphore signal = signalA.handle();
+    VkSubmitInfo submitA{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitA.waitSemaphoreCount = bridgeWait ? 1U : 0U;
+    submitA.pWaitSemaphores = bridgeWait ? &bridgeWait : nullptr;
+    constexpr VkPipelineStageFlags transferStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    submitA.pWaitDstStageMask = bridgeWait ? &transferStage : nullptr;
+    submitA.commandBufferCount = 1; submitA.pCommandBuffers = &acmd;
+    submitA.signalSemaphoreCount = 1; submitA.pSignalSemaphores = &signal;
+    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submitA, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkQueueSubmit A");
+    auto payload = exportSyncFd(imageA.endpoint.semaphoreDevice, signalA.handle());
+    auto importB = createSyncFdImportSemaphore(imageB.endpoint.semaphoreDevice);
+    importSyncFdTemporary(imageB.endpoint.semaphoreDevice, importB.handle(), payload);
+
+    const VkCommandBuffer bcmd = imageB.commandBuffers.front();
+    result = imageB.endpoint.BeginCommandBuffer(bcmd, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkBeginCommandBuffer B");
+    const VkImageMemoryBarrier acquireB{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        imageB.endpoint.queueFamilyIndex, imageB.imageHandle, range};
+    imageB.endpoint.CmdPipelineBarrier(bcmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquireB);
+    const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {0, 0, 0}, {imageB.extent.width, imageB.extent.height, 1}};
+    imageB.endpoint.CmdCopyImageToBuffer(bcmd, imageB.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageB.stagingBuffer, 1, &copy);
+    const VkImageMemoryBarrier releaseB{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageB.endpoint.queueFamilyIndex,
+        VK_QUEUE_FAMILY_FOREIGN_EXT, imageB.imageHandle, range};
+    imageB.endpoint.CmdPipelineBarrier(bcmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &releaseB);
+    result = imageB.endpoint.EndCommandBuffer(bcmd);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkEndCommandBuffer B");
+    const VkSemaphore waitB = importB.handle();
+    VkSubmitInfo submitB{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submitB.waitSemaphoreCount = 1;
+    submitB.pWaitSemaphores = &waitB; submitB.pWaitDstStageMask = &transferStage;
+    submitB.commandBufferCount = 1; submitB.pCommandBuffers = &bcmd;
+    VkFence fence{}; VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    result = imageB.endpoint.CreateFence(imageB.endpoint.bufferDevice.device,
+        &fenceInfo, nullptr, &fence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C B fence creation");
+    result = imageB.endpoint.QueueSubmit(imageB.endpoint.queue, 1, &submitB, fence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C vkQueueSubmit B");
+    result = imageB.endpoint.WaitForFences(imageB.endpoint.bufferDevice.device, 1,
+        &fence, VK_TRUE, UINT64_MAX);
+    imageB.endpoint.DestroyFence(imageB.endpoint.bufferDevice.device, fence, nullptr);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C B fence wait");
+    if (!imageB.stagingHostCoherent) {
+        VkMappedMemoryRange invalidate{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        invalidate.memory = imageB.stagingMemory; invalidate.size = VK_WHOLE_SIZE;
+        result = imageB.endpoint.InvalidateMappedMemoryRanges(
+            imageB.endpoint.bufferDevice.device, 1, &invalidate);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C B readback invalidate");
+    }
+    const auto* bytes = static_cast<const uint8_t*>(imageB.stagingMapped);
+    uint64_t checksum = 1469598103934665603ULL; VkDeviceSize nonZero{};
+    for (VkDeviceSize i = 0; i < imageB.stagingSize; ++i) {
+        checksum ^= bytes[i]; checksum *= 1099511628211ULL;
+        nonZero += bytes[i] != 0;
+    }
+    if (nonZero == 0) throw std::runtime_error("P4C-C B readback is entirely zero");
+    std::cerr << "[DG2X-P4C-C] Real frame A->B transport\n"
+        << "  Runtime mode: CAPTURE_ONLY\n"
+        << "  Source VkImage: " << sourceImage << "\n"
+        << "  Source extent: " << sourceExtent.width << 'x' << sourceExtent.height << "\n"
+        << "  Transport format: VK_FORMAT_B8G8R8A8_UNORM\n"
+        << "  Transport extent: " << imageA.extent.width << 'x' << imageA.extent.height << "\n"
+        << "  bridgePresentWaits: PASS\n"
+        << "  Source -> transport GPU blit: PASS\n"
+        << "  Source state restore: PASS\n"
+        << "  Transport A release FOREIGN: PASS\n"
+        << "  DMA_BUF export/import: PASS\n"
+        << "  SYNC_FD A->B: PASS\n"
+        << "  Transport B acquire FOREIGN: PASS\n"
+        << "  Transport B -> staging copy: PASS\n"
+        << "  B capture submit: PASS\n"
+        << "  B fence completion: PASS\n"
+        << "  B captured byte count: " << imageB.stagingSize << "\n"
+        << "  B non-zero bytes: " << nonZero << "\n"
+        << "  B checksum: 0x" << std::hex << checksum << std::dec << "\n"
+        << "  CPU frame bridge: NONE\n"
+        << "  LSFG backend execution: NONE\n"
+        << "  Generated frame: NONE\n"
+        << "  Presentation from B: NONE\n"
+        << "  Frame transport connected: NO\n"
+        << "DG2X_P4C_C_REAL_FRAME_A_TO_B_PASS\n"
+        << "cross-device real frame reached generation GPU, but LSFG frame processing is not connected yet\n";
+}
+
 RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoint& source,
         ls::OwnedFd fd, const RuntimeImageBackingInfo& backing) {
     if (!source.CreateImage || !source.DestroyImage || !source.GetImageMemoryRequirements2
@@ -658,8 +801,10 @@ RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoin
     modifier.drmFormatModifierPlaneCount = backing.planeCount;
     modifier.pPlaneLayouts = &backing.plane;
     modifier.pNext = &external;
+    result.extent = backing.extent;
     const VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &modifier, 0,
-        VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, {256,256,1}, 1, 1,
+        VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
+        {backing.extent.width, backing.extent.height, 1}, 1, 1,
         VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, VK_IMAGE_LAYOUT_UNDEFINED};
@@ -673,10 +818,12 @@ RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoin
     requirements.pNext = &dedicated;
     source.GetImageMemoryRequirements2(source.bufferDevice.device, &query, &requirements);
     result.memoryRequirements = requirements;
+    if (backing.backingSize < requirements.memoryRequirements.size)
+        throw std::invalid_argument("external image backing is smaller than Vulkan requirements");
     ExternalMemoryImportPlan plan{
         source.bufferDevice.device, source.AllocateMemory, source.FreeMemory,
         source.GetMemoryFdPropertiesKHR, source.bufferDevice.memoryProperties,
-        requirements.memoryRequirements.size, requirements.memoryRequirements.memoryTypeBits,
+        backing.backingSize, requirements.memoryRequirements.memoryTypeBits,
         result.imageHandle, false, dedicated.requiresDedicatedAllocation == VK_TRUE, false};
     try {
         result.memory = ImportedExternalMemory::import(plan, std::move(fd), &result.importDiagnostics);

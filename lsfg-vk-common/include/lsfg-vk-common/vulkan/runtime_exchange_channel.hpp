@@ -55,6 +55,7 @@ namespace vk {
         PFN_vkBindImageMemory BindImageMemory{};
         PFN_vkCmdClearColorImage CmdClearColorImage{};
         PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer{};
+        PFN_vkCmdBlitImage CmdBlitImage{};
         PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR{};
         PFN_vkAllocateMemory AllocateMemory{};
         PFN_vkFreeMemory FreeMemory{};
@@ -71,6 +72,8 @@ namespace vk {
     };
 
     struct RuntimeImageBackingInfo {
+        VkExtent2D extent{256, 256};
+        VkDeviceSize backingSize{};
         uint32_t fourcc{};
         uint64_t modifier{};
         uint32_t planeCount{};
@@ -98,6 +101,9 @@ namespace vk {
             RuntimeImageEndpoint& imageB);
         static void executeCompleteRoundTrip(RuntimeImageEndpoint& imageA,
             RuntimeImageEndpoint& imageB);
+        static void executeRealFrameTransport(RuntimeImageEndpoint& imageA,
+            RuntimeImageEndpoint& imageB, VkImage sourceImage,
+            VkExtent2D sourceExtent, VkSemaphore bridgeWait);
     private:
         friend RuntimeImageEndpoint createRuntimeImageEndpoint(
             const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);
@@ -114,6 +120,7 @@ namespace vk {
         bool stagingHostCoherent{};
         VkDeviceSize stagingSize{};
         VkFence finalFence{};
+        VkExtent2D extent{256, 256};
     };
 
     [[nodiscard]] RuntimeImageEndpoint createRuntimeImageEndpoint(

@@ -14,6 +14,8 @@
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
+#include "runtime_dma_buf_backing.hpp"
+#include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
 #include <chrono>
 #include <array>
@@ -138,6 +140,10 @@ namespace lsfgvk::layer {
 
         CrossDeviceRuntimeMode crossDeviceMode{CrossDeviceRuntimeMode::BLOCKED};
         bool captureOnlyPresentSeen{};
+        RuntimeDmaBufBacking frameTransportBacking;
+        vk::RuntimeImageEndpoint frameTransportA;
+        vk::RuntimeImageEndpoint frameTransportB;
+        bool frameTransportReady{};
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);
