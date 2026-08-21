@@ -52,8 +52,20 @@ namespace lsfgvk::backend {
 
         void recordFailure() { failed = true; }
 
+        void issueCompletionResult() {
+            if (!finalPassReady())
+                throw std::logic_error("D2 completion result unavailable");
+            if (completionResultIssued)
+                throw std::logic_error("D2 completion result was already issued");
+            completionResultIssued = true;
+        }
+
+        [[nodiscard]] bool completionResultAvailable() const {
+            return finalPassReady() && !completionResultIssued;
+        }
+
         [[nodiscard]] bool finalPassReady() const {
-            return directFrames == 3 && rotations == 2
+            return !failed && directFrames == 3 && rotations == 2
                 && generateExecutions == 1 && outputValidated;
         }
 
@@ -65,5 +77,6 @@ namespace lsfgvk::backend {
         size_t generateExecutions{};
         bool outputValidated{};
         bool failed{};
+        bool completionResultIssued{};
     };
 }

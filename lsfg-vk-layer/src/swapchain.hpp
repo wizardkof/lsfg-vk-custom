@@ -15,6 +15,7 @@
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "runtime_dma_buf_backing.hpp"
+#include "generated_output_return_diagnostic.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
 #include <chrono>
@@ -147,6 +148,8 @@ namespace lsfgvk::layer {
         ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;
         ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>
             runtimeGenerateDiagnosticSession;
+        std::unique_ptr<GeneratedOutputReturnDiagnosticSession>
+            generatedOutputReturnDiagnosticSession;
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);

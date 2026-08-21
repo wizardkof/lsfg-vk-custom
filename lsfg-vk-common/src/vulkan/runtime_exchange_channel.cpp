@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
+#include "lsfg-vk-common/vulkan/external_image_transport.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/fnv1a.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -750,9 +752,8 @@ void RuntimeImageEndpoint::executeRealFrameTransport(RuntimeImageEndpoint& image
         if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-C B readback invalidate");
     }
     const auto* bytes = static_cast<const uint8_t*>(imageB.stagingMapped);
-    uint64_t checksum = 1469598103934665603ULL; VkDeviceSize nonZero{};
+    uint64_t checksum = ::lsfgvk::common::fnv1a64(bytes, imageB.stagingSize); VkDeviceSize nonZero{};
     for (VkDeviceSize i = 0; i < imageB.stagingSize; ++i) {
-        checksum ^= bytes[i]; checksum *= 1099511628211ULL;
         nonZero += bytes[i] != 0;
     }
     if (nonZero == 0) throw std::runtime_error("P4C-C B readback is entirely zero");
@@ -843,29 +844,103 @@ SyncFdPayload RuntimeImageEndpoint::submitRealFrameTransportA(
     return exportSyncFd(imageA.endpoint.semaphoreDevice, signal.handle());
 }
 
+std::vector<uint8_t> RuntimeImageEndpoint::readForeignImage(
+        RuntimeImageEndpoint& imageA, SyncFdPayload payload) {
+    if (imageA.commandBuffers.empty() || !imageA.endpoint.CmdCopyImageToBuffer
+            || !imageA.endpoint.QueueSubmit || !imageA.endpoint.WaitForFences)
+        throw std::runtime_error("D3A1 A readback dispatch/resources incomplete");
+    bool aSubmitted = false;
+    bool aCompleted = false;
+    try {
+    auto imported = createSyncFdImportSemaphore(imageA.endpoint.semaphoreDevice);
+    importSyncFdTemporary(imageA.endpoint.semaphoreDevice, imported.handle(), payload);
+    const VkCommandBuffer command = imageA.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = imageA.endpoint.BeginCommandBuffer(command, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkBeginCommandBuffer A");
+    const VkImageMemoryBarrier acquire{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        imageA.endpoint.queueFamilyIndex, imageA.imageHandle,
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &acquire);
+    const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {0, 0, 0}, {imageA.extent.width, imageA.extent.height, 1}};
+    imageA.endpoint.CmdCopyImageToBuffer(command, imageA.imageHandle,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageA.stagingBuffer, 1, &copy);
+    const VkBufferMemoryBarrier hostRead{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, imageA.stagingBuffer, 0, imageA.stagingSize};
+    imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+    result = imageA.endpoint.EndCommandBuffer(command);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkEndCommandBuffer A");
+    if (!imageA.finalFence) {
+        VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        result = imageA.endpoint.CreateFence(imageA.endpoint.bufferDevice.device,
+            &info, nullptr, &imageA.finalFence);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence creation");
+    }
+    const VkSemaphore wait = imported.handle();
+    constexpr VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &wait;
+    submit.pWaitDstStageMask = &stage; submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command;
+    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submit, imageA.finalFence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkQueueSubmit A");
+    aSubmitted = true;
+    result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
+        &imageA.finalFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence wait");
+    aCompleted = true;
+    if (!imageA.stagingHostCoherent) {
+        VkMappedMemoryRange invalidate{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+        invalidate.memory = imageA.stagingMemory; invalidate.size = VK_WHOLE_SIZE;
+        result = imageA.endpoint.InvalidateMappedMemoryRanges(
+            imageA.endpoint.bufferDevice.device, 1, &invalidate);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 A readback invalidate");
+    }
+    const auto* first = static_cast<const uint8_t*>(imageA.stagingMapped);
+    return {first, first + imageA.stagingSize};
+    } catch (...) {
+        if (aSubmitted && !aCompleted && imageA.endpoint.DeviceWaitIdle)
+            static_cast<void>(imageA.endpoint.DeviceWaitIdle(imageA.endpoint.bufferDevice.device));
+        throw;
+    }
+}
+
 RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoint& source,
         ls::OwnedFd fd, const RuntimeImageBackingInfo& backing) {
     if (!source.CreateImage || !source.DestroyImage || !source.GetImageMemoryRequirements2
             || !source.BindImageMemory || !source.GetMemoryFdPropertiesKHR)
         throw std::invalid_argument("image-capable runtime endpoint is incomplete");
-    if (backing.fourcc != DRM_FORMAT_ARGB8888 || backing.planeCount != 1)
+    const auto expectedFourcc = drmFourccForVkFormat(backing.format);
+    if (!expectedFourcc || backing.fourcc != *expectedFourcc || backing.planeCount == 0)
         throw std::invalid_argument("runtime image backing format/plane mismatch");
     RuntimeImageEndpoint result;
     result.endpoint = source;
+    const std::vector<VkSubresourceLayout> queriedPlaneLayouts = backing.planes.empty()
+        ? std::vector<VkSubresourceLayout>{backing.plane} : backing.planes;
+    if (queriedPlaneLayouts.size() != backing.planeCount)
+        throw std::invalid_argument("runtime image backing plane layout count mismatch");
+    const auto planeLayouts = normalizeExplicitImagePlaneLayouts(
+        queriedPlaneLayouts, 1, 1);
     VkExternalMemoryImageCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     VkImageDrmFormatModifierExplicitCreateInfoEXT modifier{
         VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
     modifier.drmFormatModifier = backing.modifier;
     modifier.drmFormatModifierPlaneCount = backing.planeCount;
-    modifier.pPlaneLayouts = &backing.plane;
+    modifier.pPlaneLayouts = planeLayouts.data();
     modifier.pNext = &external;
     result.extent = backing.extent;
     const VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &modifier, 0,
-        VK_IMAGE_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM,
+        VK_IMAGE_TYPE_2D, backing.format,
         {backing.extent.width, backing.extent.height, 1}, 1, 1,
         VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        backing.usage,
         VK_SHARING_MODE_EXCLUSIVE, 0, nullptr, VK_IMAGE_LAYOUT_UNDEFINED};
     auto r = source.CreateImage(source.bufferDevice.device, &create, nullptr, &result.imageHandle);
     if (r != VK_SUCCESS) throw ls::vulkan_error(r, "vkCreateImage runtime image failed");
@@ -889,6 +964,18 @@ RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoin
     } catch (const ls::vulkan_error& error) {
         throw ls::vulkan_error(error.error(), "runtime image external import failed");
     }
+    std::cerr << "[DG2X-P4C-D3A1] AMD import memory\n"
+        << "  Requirements size: " << requirements.memoryRequirements.size << "\n"
+        << "  Requirements alignment: " << requirements.memoryRequirements.alignment << "\n"
+        << "  Requirements memoryTypeBits: 0x" << std::hex
+        << requirements.memoryRequirements.memoryTypeBits << "\n"
+        << "  FD memoryTypeBits: 0x" << result.importDiagnostics.fdMemoryTypeBits << "\n"
+        << "  Intersection: 0x" << result.importDiagnostics.intersectionMemoryTypeBits
+        << std::dec << "\n"
+        << "  Selected memory type: " << result.importDiagnostics.memoryTypeIndex << "\n"
+        << "  Dedicated required: " << dedicated.requiresDedicatedAllocation << "\n"
+        << "  Dedicated preferred: " << dedicated.prefersDedicatedAllocation << "\n"
+        << "  Dedicated allocation: " << result.importDiagnostics.dedicated << "\n";
     r = source.BindImageMemory(source.bufferDevice.device, result.imageHandle,
         result.memory.memory(), 0);
     if (r != VK_SUCCESS) throw ls::vulkan_error(r, "vkBindImageMemory runtime image failed");

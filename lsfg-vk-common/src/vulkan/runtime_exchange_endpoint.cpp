@@ -13,6 +13,14 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
     vk.fi().GetPhysicalDeviceMemoryProperties(vk.physdev(), &memoryProperties);
     const auto getMemoryFdProperties = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
         vk.fi().GetDeviceProcAddr(vk.dev(), "vkGetMemoryFdPropertiesKHR"));
+    const auto getImageModifier = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
+        vk.fi().GetDeviceProcAddr(vk.dev(), "vkGetImageDrmFormatModifierPropertiesEXT"));
+    const auto getMemoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+        vk.fi().GetDeviceProcAddr(vk.dev(), "vkGetMemoryFdKHR"));
+    const auto copyImage = reinterpret_cast<PFN_vkCmdCopyImage>(
+        vk.fi().GetDeviceProcAddr(vk.dev(), "vkCmdCopyImage"));
+    const auto getSubresourceLayout = reinterpret_cast<PFN_vkGetImageSubresourceLayout>(
+        vk.fi().GetDeviceProcAddr(vk.dev(), "vkGetImageSubresourceLayout"));
     if (!getMemoryFdProperties)
         throw ls::vulkan_error("vkGetMemoryFdPropertiesKHR unavailable for runtime exchange endpoint");
 
@@ -60,6 +68,7 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         .UnmapMemory = vk.df().UnmapMemory,
         .InvalidateMappedMemoryRanges = vk.df().InvalidateMappedMemoryRanges
         ,.physicalDevice = vk.physdev()
+        ,.identity = getPhysicalDeviceIdentity(vk.fi(), vk.physdev())
         ,.GetPhysicalDeviceFormatProperties2 = vk.fi().GetPhysicalDeviceFormatProperties2
         ,.GetPhysicalDeviceImageFormatProperties2 = vk.fi().GetPhysicalDeviceImageFormatProperties2
         ,.CreateImage = vk.df().CreateImage
@@ -69,6 +78,10 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         ,.CmdClearColorImage = vk.df().CmdClearColorImage
         ,.CmdCopyImageToBuffer = vk.df().CmdCopyImageToBuffer
         ,.CmdBlitImage = vk.df().CmdBlitImage
+        ,.CmdCopyImage = copyImage
+        ,.GetImageSubresourceLayout = getSubresourceLayout
+        ,.GetImageDrmFormatModifierPropertiesEXT = getImageModifier
+        ,.GetMemoryFdKHR = getMemoryFd
         ,.GetMemoryFdPropertiesKHR = getMemoryFdProperties
         ,.AllocateMemory = vk.df().AllocateMemory
         ,.FreeMemory = vk.df().FreeMemory

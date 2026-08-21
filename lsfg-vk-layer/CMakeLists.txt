@@ -3,6 +3,7 @@ set(LAYER_SOURCES
     "src/fixed_frame_scheduler.cpp"
     "src/fixed_output_pacer.cpp"
     "src/fixed_present_mode.cpp"
+    "src/generated_output_return_diagnostic.cpp"
     "src/instance.cpp"
     "src/runtime_dma_buf_backing.cpp"
     "src/swapchain.cpp"

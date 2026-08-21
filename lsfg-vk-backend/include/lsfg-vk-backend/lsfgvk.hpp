@@ -14,6 +14,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdint>
 
 namespace lsfgvk::backend {
 
@@ -21,10 +22,60 @@ namespace lsfgvk::backend {
     class [[gnu::visibility("default")]] InstanceImpl;
     class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
     class [[gnu::visibility("default")]] RuntimeGenerateDiagnosticSessionImpl;
+    struct RuntimeGeneratedFrameTokenTestAccess;
 
     using Context = ContextImpl;
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
     using RuntimeGenerateDiagnosticSession = RuntimeGenerateDiagnosticSessionImpl;
+
+    using RuntimeGenerationId = uint64_t;
+
+    class [[gnu::visibility("default")]] RuntimeGeneratedFrameToken {
+    public:
+        RuntimeGeneratedFrameToken() noexcept = default;
+        RuntimeGeneratedFrameToken(const RuntimeGeneratedFrameToken&) = delete;
+        RuntimeGeneratedFrameToken& operator=(const RuntimeGeneratedFrameToken&) = delete;
+        RuntimeGeneratedFrameToken(RuntimeGeneratedFrameToken&&) noexcept;
+        RuntimeGeneratedFrameToken& operator=(RuntimeGeneratedFrameToken&&) noexcept;
+        ~RuntimeGeneratedFrameToken() = default;
+        [[nodiscard]] bool valid() const noexcept {
+            return generation != 0 && image != VK_NULL_HANDLE && !sessionLifetime.expired();
+        }
+        [[nodiscard]] RuntimeGenerationId identity() const noexcept { return generation; }
+        [[nodiscard]] VkImage imageHandle() const noexcept { return image; }
+        [[nodiscard]] VkExtent2D extentValue() const noexcept { return extent; }
+        [[nodiscard]] VkFormat formatValue() const noexcept { return format; }
+        [[nodiscard]] VkImageLayout layoutValue() const noexcept { return layout; }
+        [[nodiscard]] uint32_t queueFamily() const noexcept { return family; }
+        void consume();
+    private:
+        friend class RuntimeGenerateDiagnosticSessionImpl;
+        friend struct RuntimeGeneratedFrameTokenTestAccess;
+        RuntimeGeneratedFrameToken(RuntimeGenerationId id, VkImage image, VkExtent2D extent,
+            VkFormat format, VkImageLayout layout, uint32_t family,
+            std::weak_ptr<const uint8_t> sessionLifetime) noexcept;
+        RuntimeGenerationId generation{};
+        VkImage image{};
+        VkExtent2D extent{};
+        VkFormat format{VK_FORMAT_UNDEFINED};
+        VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+        uint32_t family{};
+        std::weak_ptr<const uint8_t> sessionLifetime;
+    };
+
+    struct [[gnu::visibility("default")]] RuntimeGeneratedFrameMetadata {
+        RuntimeGenerationId generation{};
+        VkExtent2D extent{};
+        VkFormat format{VK_FORMAT_UNDEFINED};
+        size_t byteCount{};
+        size_t nonzeroByteCount{};
+        uint64_t checksum{};
+    };
+
+    struct [[gnu::visibility("default")]] RuntimeGenerateDiagnosticResult {
+        RuntimeGeneratedFrameMetadata metadata;
+        RuntimeGeneratedFrameToken frame;
+    };
 
     ///
     /// Primitive exception class that deliveres a detailed error message
@@ -102,7 +153,8 @@ namespace lsfgvk::backend {
         RuntimeGenerateDiagnosticSession& openRuntimeGenerateDiagnosticSession(
             VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
             float flow, bool perf);
-        void processRuntimeGenerateDiagnostic(RuntimeGenerateDiagnosticSession& session,
+        std::optional<RuntimeGenerateDiagnosticResult> processRuntimeGenerateDiagnostic(
+            RuntimeGenerateDiagnosticSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
         void closeRuntimeGenerateDiagnosticSession(
             const RuntimeGenerateDiagnosticSession& session);

@@ -32,6 +32,35 @@ int main() {
     assert(intersectImageModifiers({{0x1, 1, 0x7}}, {{0x1, 2, 0x7}}).empty());
     assert(drmFourccForVkFormat(VK_FORMAT_R8G8B8A8_UNORM).value() == DRM_FORMAT_ABGR8888);
     assert(!drmFourccForVkFormat(VK_FORMAT_R32_SFLOAT).has_value());
+    const auto normalized = normalizeExplicitImagePlaneLayouts(
+        {{.offset = 17, .size = 4096, .rowPitch = 256,
+            .arrayPitch = 8192, .depthPitch = 16384}}, 1, 1);
+    assert(normalized.size() == 1);
+    assert(normalized[0].offset == 17 && normalized[0].rowPitch == 256);
+    assert(normalized[0].size == 0 && normalized[0].arrayPitch == 0
+        && normalized[0].depthPitch == 0);
+    const auto normalizedPlanes = normalizeExplicitImagePlaneLayouts(
+        {{.offset = 1, .size = 2, .rowPitch = 3, .arrayPitch = 4, .depthPitch = 5},
+         {.offset = 6, .size = 7, .rowPitch = 8, .arrayPitch = 9, .depthPitch = 10}}, 2, 3);
+    assert(normalizedPlanes.size() == 2);
+    assert(normalizedPlanes[0].offset == 1 && normalizedPlanes[0].rowPitch == 3
+        && normalizedPlanes[0].size == 0 && normalizedPlanes[0].arrayPitch == 4
+        && normalizedPlanes[0].depthPitch == 5);
+    assert(normalizedPlanes[1].offset == 6 && normalizedPlanes[1].rowPitch == 8
+        && normalizedPlanes[1].size == 0 && normalizedPlanes[1].arrayPitch == 9
+        && normalizedPlanes[1].depthPitch == 10);
+    const ExplicitDrmImageLayout negotiated{0,
+        {{.offset = 0, .rowPitch = 2048}}};
+    assert(explicitDrmImageLayoutMatches(negotiated, 0,
+        {{.offset = 0, .size = 1024000, .rowPitch = 2048,
+          .arrayPitch = 1024000, .depthPitch = 1024000}}));
+    assert(!explicitDrmImageLayoutMatches(negotiated, 0,
+        {{.offset = 0, .rowPitch = 2016}}));
+    assert(!explicitDrmImageLayoutMatches(negotiated, 0,
+        {{.offset = 256, .rowPitch = 2048}}));
+    assert(!explicitDrmImageLayoutMatches(negotiated, 1,
+        {{.offset = 0, .rowPitch = 2048}}));
+    assert(!explicitDrmImageLayoutMatches(negotiated, 0, {}));
     assert(validateImagePlaneMetadata(DRM_FORMAT_ABGR8888, 0, 1,
         DRM_FORMAT_ABGR8888, 0, 1, {{.offset = 0, .size = 16 * 256,
             .rowPitch = 16 * 256}}));

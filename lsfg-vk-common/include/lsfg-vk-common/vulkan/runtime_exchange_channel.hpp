@@ -47,8 +47,10 @@ namespace vk {
         // Borrowed physical-device/image dispatch. The endpoint never destroys
         // the instance, physical device, logical device, or queue.
         VkPhysicalDevice physicalDevice{};
+        PhysicalDeviceIdentity identity{};
         PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2{};
         PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2{};
+        PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2KHR{};
         PFN_vkCreateImage CreateImage{};
         PFN_vkDestroyImage DestroyImage{};
         PFN_vkGetImageMemoryRequirements2 GetImageMemoryRequirements2{};
@@ -56,6 +58,10 @@ namespace vk {
         PFN_vkCmdClearColorImage CmdClearColorImage{};
         PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer{};
         PFN_vkCmdBlitImage CmdBlitImage{};
+        PFN_vkCmdCopyImage CmdCopyImage{};
+        PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout{};
+        PFN_vkGetImageDrmFormatModifierPropertiesEXT GetImageDrmFormatModifierPropertiesEXT{};
+        PFN_vkGetMemoryFdKHR GetMemoryFdKHR{};
         PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR{};
         PFN_vkAllocateMemory AllocateMemory{};
         PFN_vkFreeMemory FreeMemory{};
@@ -73,11 +79,14 @@ namespace vk {
 
     struct RuntimeImageBackingInfo {
         VkExtent2D extent{256, 256};
+        VkFormat format{VK_FORMAT_B8G8R8A8_UNORM};
+        VkImageUsageFlags usage{VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         VkDeviceSize backingSize{};
         uint32_t fourcc{};
         uint64_t modifier{};
         uint32_t planeCount{};
         VkSubresourceLayout plane{};
+        std::vector<VkSubresourceLayout> planes;
     };
 
 
@@ -107,6 +116,8 @@ namespace vk {
         [[nodiscard]] static SyncFdPayload submitRealFrameTransportA(
             RuntimeImageEndpoint& imageA, VkImage sourceImage,
             VkExtent2D sourceExtent, VkSemaphore bridgeWait);
+        [[nodiscard]] static std::vector<uint8_t> readForeignImage(
+            RuntimeImageEndpoint& imageA, SyncFdPayload payload);
     private:
         friend RuntimeImageEndpoint createRuntimeImageEndpoint(
             const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);

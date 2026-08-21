@@ -8,6 +8,7 @@
 #include "runtime_generate_diagnostic_state.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
+#include "lsfg-vk-common/fnv1a.hpp"
 #include "lsfg-vk-common/vulkan/buffer.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
@@ -28,6 +29,7 @@
 #include "shaderchains/mipmaps.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +55,38 @@
 
 using namespace lsfgvk;
 using namespace lsfgvk::backend;
+
+namespace lsfgvk::backend {
+
+RuntimeGeneratedFrameToken::RuntimeGeneratedFrameToken(RuntimeGenerationId id,
+        VkImage imageHandle, VkExtent2D imageExtent, VkFormat imageFormat,
+        VkImageLayout imageLayout, uint32_t imageFamily,
+        std::weak_ptr<const uint8_t> lifetime) noexcept :
+    generation(id), image(imageHandle), extent(imageExtent), format(imageFormat),
+    layout(imageLayout), family(imageFamily), sessionLifetime(std::move(lifetime)) {}
+
+RuntimeGeneratedFrameToken::RuntimeGeneratedFrameToken(RuntimeGeneratedFrameToken&& other) noexcept :
+    generation(std::exchange(other.generation, 0)), image(std::exchange(other.image, VK_NULL_HANDLE)),
+    extent(other.extent), format(other.format), layout(other.layout), family(other.family),
+    sessionLifetime(std::move(other.sessionLifetime)) {}
+
+RuntimeGeneratedFrameToken& RuntimeGeneratedFrameToken::operator=(RuntimeGeneratedFrameToken&& other) noexcept {
+    if (this != &other) {
+        generation = std::exchange(other.generation, 0);
+        image = std::exchange(other.image, VK_NULL_HANDLE);
+        extent = other.extent; format = other.format; layout = other.layout; family = other.family;
+        sessionLifetime = std::move(other.sessionLifetime);
+    }
+    return *this;
+}
+
+void RuntimeGeneratedFrameToken::consume() {
+    if (!valid()) throw std::logic_error("invalid or consumed generated frame token");
+    generation = 0;
+    image = VK_NULL_HANDLE;
+}
+
+}
 
 namespace {
     void validateRuntimeGenerateFormats(const lsfgvk::backend::InstanceImpl& instance,
@@ -183,7 +217,8 @@ namespace lsfgvk::backend {
     public:
         RuntimeGenerateDiagnosticSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
             VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
-        void process(VkImage transportImage, vk::SyncFdPayload payload);
+        std::optional<RuntimeGenerateDiagnosticResult> process(
+            VkImage transportImage, vk::SyncFdPayload payload);
     private:
         struct Pass {
             std::vector<Gamma0> gamma0;
@@ -210,6 +245,8 @@ namespace lsfgvk::backend {
         Beta1 beta1;
         Pass pass;
         RuntimeGenerateDiagnosticState state;
+        RuntimeGenerationId generation{};
+        std::shared_ptr<const uint8_t> sessionLifetime{std::make_shared<const uint8_t>(0)};
     };
 }
 
@@ -497,9 +534,10 @@ RuntimeGenerateDiagnosticSession& Instance::openRuntimeGenerateDiagnosticSession
             transportFormat, transportModifier, flow, perf));
 }
 
-void Instance::processRuntimeGenerateDiagnostic(RuntimeGenerateDiagnosticSession& session,
+std::optional<RuntimeGenerateDiagnosticResult> Instance::processRuntimeGenerateDiagnostic(
+        RuntimeGenerateDiagnosticSession& session,
         VkImage transportImage, vk::SyncFdPayload payload) {
-    session.process(transportImage, std::move(payload));
+    return session.process(transportImage, std::move(payload));
 }
 
 void Instance::closeRuntimeGenerateDiagnosticSession(
@@ -864,6 +902,11 @@ RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
         uint64_t transportModifier, float flow, bool perf) :
     instance(instance), extent(extent), transportFormat(transportFormat),
     transportModifier(transportModifier),
+    generation([] {
+        static std::atomic<RuntimeGenerationId> next{1};
+        auto id = next.fetch_add(1, std::memory_order_relaxed);
+        return id == 0 ? next.fetch_add(1, std::memory_order_relaxed) : id;
+    }()),
     capturedBytes(static_cast<size_t>(extent.width) * extent.height * 4U),
     sources(vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
@@ -972,7 +1015,7 @@ RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
     std::cerr << "Black image zero initialization: PASS\n";
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::process(
+std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionImpl::process(
         VkImage transportImage, vk::SyncFdPayload payload) {
     const auto step = state.advance();
     try {
@@ -1121,7 +1164,7 @@ void RuntimeGenerateDiagnosticSessionImpl::process(
         std::cerr << "[DG2X-P4C-D2] Diagnostic temporal seed\n"
             << "  D2 direct real frames: 1\n  Seed duplication: YES\n"
             << "  Generate: NOT RUN\n  Host wait A->B: NONE\n";
-        return;
+        return std::nullopt;
     }
     if (step.action == RuntimeGenerateDiagnosticAction::GAMMA_DELTA) {
         std::cerr << "[DG2X-P4C-D2A] Gamma/Delta prerequisites\n"
@@ -1134,17 +1177,15 @@ void RuntimeGenerateDiagnosticSessionImpl::process(
             << "  Generate: NOT RUN\n  Generated frame: NONE\n"
             << "  Backend fence completion: PASS\n  Host wait A->B: NONE\n"
             << "DG2X_P4C_D2A_GAMMA_DELTA_B_PASS\n";
-        return;
+        return std::nullopt;
     }
 
     const auto bytes = readback.read(vk, capturedBytes);
     if (bytes.size() != capturedBytes)
         throw backend::error("P4C-D2 generated readback byte count mismatch");
-    uint64_t checksum = 1469598103934665603ULL;
+    uint64_t checksum = lsfgvk::common::fnv1a64(bytes.data(), bytes.size());
     size_t nonzero{};
     for (const auto byte : bytes) {
-        checksum ^= byte;
-        checksum *= 1099511628211ULL;
         nonzero += byte != 0;
     }
     if (nonzero == 0)
@@ -1176,6 +1217,14 @@ void RuntimeGenerateDiagnosticSessionImpl::process(
         << "  Presentation from B: NONE\n  Output transport B->A: NONE\n"
         << "  CPU frame bridge: NONE\n  Host wait A->B: NONE\n"
         << "DG2X_P4C_D2_GENERATED_FRAME_B_PASS\n";
+    state.issueCompletionResult();
+    return RuntimeGenerateDiagnosticResult{
+        .metadata = {generation, extent, VK_FORMAT_R8G8B8A8_UNORM,
+            bytes.size(), nonzero, checksum},
+        .frame = RuntimeGeneratedFrameToken(generation, destination.handle(), extent,
+            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, family,
+            sessionLifetime)
+    };
     } catch (...) {
         state.recordFailure();
         throw;

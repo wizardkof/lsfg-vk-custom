@@ -1,0 +1,171 @@
+#include "generated_output_return_diagnostic.hpp"
+#include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/fnv1a.hpp"
+
+#include <iostream>
+#include <stdexcept>
+
+using namespace lsfgvk::layer;
+
+bool lsfgvk::layer::generatedOutputIntegrityMatches(
+        const GeneratedOutputIntegrity& a, const GeneratedOutputIntegrity& b) noexcept {
+    return a.generation != 0 && a.generation == b.generation
+        && a.extent.width == b.extent.width && a.extent.height == b.extent.height
+        && a.format == b.format && a.byteCount == b.byteCount
+        && a.nonzeroByteCount == b.nonzeroByteCount && a.checksum == b.checksum
+        && a.byteCount == static_cast<size_t>(a.extent.width) * a.extent.height * 4U
+        && a.nonzeroByteCount > 0;
+}
+
+void GeneratedOutputReturnStateMachine::advance(
+        GeneratedOutputReturnState expected, GeneratedOutputReturnState next) {
+    if (current != expected || current == GeneratedOutputReturnState::FAILED
+            || current == GeneratedOutputReturnState::PASS
+            || static_cast<int>(next) != static_cast<int>(expected) + 1)
+        throw std::logic_error("invalid D3A1 state transition");
+    current = next;
+}
+
+GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+        backend::RuntimeGenerateDiagnosticResult&& result, const vk::RuntimeDevicePair& pair,
+        vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
+        bool captureOnly) : generationEndpoint(std::move(generation)),
+    renderEndpoint(std::move(render)) {
+    if (!generatedOutputRoleBindingEligible(pair, generationEndpoint.identity,
+            renderEndpoint.identity, captureOnly))
+        throw std::invalid_argument("D3A1 requires CROSS_PHYSICAL_DEVICE + CAPTURE_ONLY");
+    if (generationEndpoint.bufferDevice.device == renderEndpoint.bufferDevice.device)
+        throw std::invalid_argument("D3A1 endpoint role mismatch");
+    execute(std::move(result));
+}
+
+GeneratedOutputReturnDiagnosticSession::~GeneratedOutputReturnDiagnosticSession() {
+    resetBCommands();
+}
+
+void GeneratedOutputReturnDiagnosticSession::resetBCommands() noexcept {
+    if (bCommand && bCommandPool && generationEndpoint.FreeCommandBuffers)
+        generationEndpoint.FreeCommandBuffers(generationEndpoint.bufferDevice.device,
+            bCommandPool, 1, &bCommand);
+    if (bCommandPool && generationEndpoint.DestroyCommandPool)
+        generationEndpoint.DestroyCommandPool(generationEndpoint.bufferDevice.device,
+            bCommandPool, nullptr);
+    bCommand = VK_NULL_HANDLE; bCommandPool = VK_NULL_HANDLE;
+}
+
+void GeneratedOutputReturnDiagnosticSession::advance(
+        GeneratedOutputReturnState expected, GeneratedOutputReturnState next) {
+    states.advance(expected, next);
+}
+
+void GeneratedOutputReturnDiagnosticSession::execute(
+        backend::RuntimeGenerateDiagnosticResult&& result) {
+    try {
+        if (!result.frame.valid() || result.metadata.generation != result.frame.identity()
+                || result.metadata.extent.width != result.frame.extentValue().width
+                || result.metadata.extent.height != result.frame.extentValue().height
+                || result.metadata.format != result.frame.formatValue()
+                || result.frame.layoutValue() != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                || result.frame.queueFamily() != generationEndpoint.queueFamilyIndex)
+            throw std::invalid_argument("invalid or stale D3A1 generated-frame capability");
+        authoritative = {result.metadata.generation, result.metadata.extent,
+            result.metadata.format, result.metadata.byteCount,
+            result.metadata.nonzeroByteCount, result.metadata.checksum};
+        const VkImage sourceImage = result.frame.imageHandle();
+        advance(GeneratedOutputReturnState::EMPTY, GeneratedOutputReturnState::D2_VALIDATED);
+        result.frame.consume();
+        advance(GeneratedOutputReturnState::D2_VALIDATED, GeneratedOutputReturnState::TOKEN_CONSUMED);
+
+        backing = vk::VulkanNativeExternalImageBacking::create(
+            generationEndpoint, renderEndpoint,
+            authoritative.extent, authoritative.format);
+        advance(GeneratedOutputReturnState::TOKEN_CONSUMED, GeneratedOutputReturnState::B_BACKING_READY);
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.queueFamilyIndex = generationEndpoint.queueFamilyIndex;
+        auto vr = generationEndpoint.CreateCommandPool(generationEndpoint.bufferDevice.device,
+            &pool, nullptr, &bCommandPool);
+        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 B command pool creation");
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = bCommandPool; allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        vr = generationEndpoint.AllocateCommandBuffers(generationEndpoint.bufferDevice.device,
+            &allocate, &bCommand);
+        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 B command allocation");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vr = generationEndpoint.BeginCommandBuffer(bCommand, &begin);
+        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 vkBeginCommandBuffer B");
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+            generationEndpoint.queueFamilyIndex, backing.image(), range};
+        generationEndpoint.CmdPipelineBarrier(bCommand, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDst);
+        const VkImageCopy copy{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+            {authoritative.extent.width, authoritative.extent.height, 1}};
+        generationEndpoint.CmdCopyImage(bCommand, sourceImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, backing.image(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        const VkImageMemoryBarrier release{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, generationEndpoint.queueFamilyIndex,
+            VK_QUEUE_FAMILY_FOREIGN_EXT, backing.image(), range};
+        generationEndpoint.CmdPipelineBarrier(bCommand, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+        vr = generationEndpoint.EndCommandBuffer(bCommand);
+        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 vkEndCommandBuffer B");
+        signalB = vk::createExportableSyncFdSemaphore(generationEndpoint.semaphoreDevice);
+        const VkSemaphore signal = signalB.handle();
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &bCommand; submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &signal;
+        vr = generationEndpoint.QueueSubmit(generationEndpoint.queue, 1, &submit, VK_NULL_HANDLE);
+        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 vkQueueSubmit B");
+        bSubmitted = true;
+        advance(GeneratedOutputReturnState::B_BACKING_READY, GeneratedOutputReturnState::B_COPY_SUBMITTED);
+        auto sync = vk::exportSyncFd(generationEndpoint.semaphoreDevice, signalB.handle());
+        advance(GeneratedOutputReturnState::B_COPY_SUBMITTED, GeneratedOutputReturnState::B_SYNC_EXPORTED);
+        auto descriptor = backing.exportDescriptor();
+        const vk::RuntimeImageBackingInfo info{.extent = descriptor.extent,
+            .format = descriptor.format,
+            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .backingSize = descriptor.allocationSize, .fourcc = descriptor.fourcc,
+            .modifier = descriptor.modifier,
+            .planeCount = static_cast<uint32_t>(descriptor.planes.size()),
+            .plane = descriptor.planes.front(), .planes = descriptor.planes};
+        importedA = vk::createRuntimeImageEndpoint(renderEndpoint,
+            std::move(descriptor.dmaBuf), info);
+        importedA = vk::RuntimeImageEndpoint::createExecutionResources(std::move(importedA), 1);
+        advance(GeneratedOutputReturnState::B_SYNC_EXPORTED, GeneratedOutputReturnState::A_IMPORTED);
+        advance(GeneratedOutputReturnState::A_IMPORTED, GeneratedOutputReturnState::A_COPY_SUBMITTED);
+        const auto bytes = vk::RuntimeImageEndpoint::readForeignImage(importedA, std::move(sync));
+        aCompleted = true;
+        GeneratedOutputIntegrity observed{authoritative.generation, authoritative.extent,
+            authoritative.format, bytes.size(), 0,
+            lsfgvk::common::fnv1a64(bytes.data(), bytes.size())};
+        for (const uint8_t byte : bytes) {
+            observed.nonzeroByteCount += byte != 0;
+        }
+        if (!generatedOutputIntegrityMatches(authoritative, observed))
+            throw std::runtime_error("D3A1 same-generation B/A integrity mismatch");
+        advance(GeneratedOutputReturnState::A_COPY_SUBMITTED, GeneratedOutputReturnState::A_VALIDATED);
+        advance(GeneratedOutputReturnState::A_VALIDATED, GeneratedOutputReturnState::PASS);
+        std::cerr << "[DG2X-P4C-D3A1] Generated output B->A diagnostic\n"
+            << "  Generation identity: " << authoritative.generation << "\n"
+            << "  Intermediate host wait Generate->return: PRESENT — D2 diagnostic completion\n"
+            << "  Host wait B->A: NONE\n  CPU frame bridge: NONE\n  Presentation: NONE\n"
+            << "  B/A byte count: " << authoritative.byteCount << "\n"
+            << "  B/A non-zero bytes: " << authoritative.nonzeroByteCount << "\n"
+            << "  B/A checksum: 0x" << std::hex << authoritative.checksum << std::dec << "\n"
+            << "DG2X_P4C_D3A1_GENERATED_OUTPUT_B_TO_A_PASS\n";
+    } catch (...) {
+        // Failure cleanup only: success never waits on B. If import/submission on A
+        // fails after B was submitted, complete B before destroying in-use resources.
+        if (bSubmitted && !aCompleted && generationEndpoint.DeviceWaitIdle)
+            static_cast<void>(generationEndpoint.DeviceWaitIdle(
+                generationEndpoint.bufferDevice.device));
+        states.fail();
+        throw;
+    }
+}

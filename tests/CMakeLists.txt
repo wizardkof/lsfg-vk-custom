@@ -59,6 +59,18 @@ add_test(
     NAME lsfg-vk-test-runtime-generate-diagnostic-state
     COMMAND lsfg-vk-test-runtime-generate-diagnostic-state)
 
+add_executable(lsfg-vk-test-generated-output-return-diagnostic
+    generated_output_return_diagnostic_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp")
+target_include_directories(lsfg-vk-test-generated-output-return-diagnostic PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-generated-output-return-diagnostic PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-generated-output-return-diagnostic PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-generated-output-return-diagnostic
+    COMMAND lsfg-vk-test-generated-output-return-diagnostic)
+
 add_executable(lsfg-vk-test-config-frame-generation-mode
     config_frame_generation_mode_test.cpp)
 

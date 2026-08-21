@@ -4,6 +4,7 @@
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/fnv1a.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
@@ -206,10 +207,9 @@ void Swapchain::captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
         }
     }
     const auto* bytes = static_cast<const uint8_t*>(mapped);
-    uint64_t checksum = 1469598103934665603ULL;
+    uint64_t checksum = ::lsfgvk::common::fnv1a64(bytes, byteSize);
     VkDeviceSize nonZero{};
     for (VkDeviceSize i = 0; i < byteSize; ++i) {
-        checksum ^= bytes[i]; checksum *= 1099511628211ULL;
         nonZero += bytes[i] != 0;
     }
     vk.df().UnmapMemory(vk.dev(), resources.memory);
@@ -486,9 +486,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
                 this->frameTransportA, sourceImage, this->info.extent,
                 semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
-            this->instance.get().processRuntimeGenerateDiagnostic(
+            auto generated = this->instance.get().processRuntimeGenerateDiagnostic(
                 this->runtimeGenerateDiagnosticSession.get(), this->frameTransportB.image(),
                 std::move(payload));
+            if (generated) {
+                this->generatedOutputReturnDiagnosticSession =
+                    std::make_unique<GeneratedOutputReturnDiagnosticSession>(
+                        std::move(*generated), this->devicePair,
+                        this->instance.get().runtimeExchangeEndpoint(),
+                        vk::makeRuntimeExchangeEndpoint(vk), true);
+            }
             this->captureOnlyPhase++;
             if (this->captureOnlyPhase <= 5) return VK_SUCCESS;
         }

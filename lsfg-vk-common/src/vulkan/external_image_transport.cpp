@@ -4,6 +4,19 @@
 #include <algorithm>
 #include <libdrm/drm_fourcc.h>
 
+bool vk::explicitDrmImageLayoutMatches(const ExplicitDrmImageLayout& requested,
+        uint64_t actualModifier,
+        const std::vector<VkSubresourceLayout>& actualPlanes) noexcept {
+    if (requested.modifier != actualModifier
+            || requested.planes.size() != actualPlanes.size())
+        return false;
+    for (size_t i = 0; i < requested.planes.size(); ++i)
+        if (requested.planes[i].offset != actualPlanes[i].offset
+                || requested.planes[i].rowPitch != actualPlanes[i].rowPitch)
+            return false;
+    return true;
+}
+
 std::optional<uint32_t> vk::drmFourccForVkFormat(VkFormat format) noexcept {
     switch (format) {
     case VK_FORMAT_R8G8B8A8_UNORM:
@@ -26,6 +39,23 @@ bool vk::validateImagePlaneMetadata(uint32_t requestedFourcc, uint64_t requested
     return std::all_of(layouts.begin(), layouts.end(), [](const auto& layout) {
         return layout.rowPitch > 0;
     });
+}
+
+std::vector<VkSubresourceLayout> vk::normalizeExplicitImagePlaneLayouts(
+        const std::vector<VkSubresourceLayout>& queriedLayouts,
+        uint32_t arrayLayers, uint32_t depth) {
+    std::vector<VkSubresourceLayout> result;
+    result.reserve(queriedLayouts.size());
+    for (const auto& queried : queriedLayouts) {
+        result.push_back({
+            .offset = queried.offset,
+            .size = 0,
+            .rowPitch = queried.rowPitch,
+            .arrayPitch = arrayLayers == 1 ? 0 : queried.arrayPitch,
+            .depthPitch = depth == 1 ? 0 : queried.depthPitch
+        });
+    }
+    return result;
 }
 
 std::vector<vk::ImageModifierInfo> vk::intersectImageModifiers(

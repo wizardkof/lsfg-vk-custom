@@ -1,0 +1,160 @@
+#include "generated_output_return_diagnostic.hpp"
+#include "lsfg-vk-common/fnv1a.hpp"
+
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace lsfgvk::backend {
+struct RuntimeGeneratedFrameTokenTestAccess {
+    static RuntimeGeneratedFrameToken issue(RuntimeGenerationId generation, VkImage image,
+            const std::shared_ptr<const uint8_t>& lifetime) {
+        return RuntimeGeneratedFrameToken(generation, image, {8, 8},
+            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 3, lifetime);
+    }
+};
+}
+
+namespace {
+vk::PhysicalDeviceIdentity identity(uint8_t id) {
+    vk::PhysicalDeviceIdentity result;
+    result.name = id == 1 ? "render" : "generation";
+    result.deviceUuid.back() = id;
+    result.driverUuid.back() = static_cast<uint8_t>(id + 10);
+    return result;
+}
+}
+#include <type_traits>
+
+using namespace lsfgvk::layer;
+
+int main() {
+    std::vector<uint8_t> known(256U * 256U * 4U);
+    for (size_t i = 0; i < known.size(); i += 4) {
+        known[i] = 0xff; known[i + 1] = 0; known[i + 2] = 0xff; known[i + 3] = 0xff;
+    }
+    assert(lsfgvk::common::fnv1a64(known.data(), known.size()) == 0x4674de733bca2325ULL);
+    assert(!generatedOutputNeedsDeviceIdle(GeneratedOutputCleanupState::NO_SUBMIT));
+    assert(generatedOutputNeedsDeviceIdle(GeneratedOutputCleanupState::B_SUBMITTED));
+    assert(generatedOutputNeedsDeviceIdle(GeneratedOutputCleanupState::A_SUBMITTED));
+    assert(!generatedOutputNeedsDeviceIdle(GeneratedOutputCleanupState::A_COMPLETED));
+
+    auto render = identity(1); auto generation = identity(2);
+    auto pair = vk::bindRuntimeDevicePair(render, generation, "generation");
+    assert(pair.has_value());
+    assert(generatedOutputRoleBindingEligible(*pair, generation, render, true));
+    assert(!generatedOutputRoleBindingEligible(*pair, generation, render, false));
+    assert(!generatedOutputRoleBindingEligible(*pair, render, generation, true));
+    auto same = vk::bindRuntimeDevicePair(render, render, std::nullopt);
+    assert(same.has_value());
+    assert(!generatedOutputRoleBindingEligible(*same, render, render, true));
+    static_assert(!std::is_copy_constructible_v<lsfgvk::backend::RuntimeGeneratedFrameToken>);
+    static_assert(std::is_move_constructible_v<lsfgvk::backend::RuntimeGeneratedFrameToken>);
+
+    auto lifetime1 = std::make_shared<const uint8_t>(0);
+    const auto reusedImage = reinterpret_cast<VkImage>(uintptr_t{0x1234});
+    auto stale = lsfgvk::backend::RuntimeGeneratedFrameTokenTestAccess::issue(
+        41, reusedImage, lifetime1);
+    assert(stale.valid());
+    lifetime1.reset();
+    assert(!stale.valid());
+    bool staleConsumeRejected = false;
+    try { stale.consume(); }
+    catch (const std::logic_error&) { staleConsumeRejected = true; }
+    assert(staleConsumeRejected);
+
+    auto lifetime2 = std::make_shared<const uint8_t>(0);
+    auto recreated = lsfgvk::backend::RuntimeGeneratedFrameTokenTestAccess::issue(
+        42, reusedImage, lifetime2);
+    assert(!stale.valid() && recreated.valid());
+
+    auto moved = std::move(recreated);
+    assert(!recreated.valid() && moved.valid());
+    moved.consume();
+    assert(!moved.valid());
+    bool secondConsumeRejected = false;
+    try { moved.consume(); }
+    catch (const std::logic_error&) { secondConsumeRejected = true; }
+    assert(secondConsumeRejected);
+
+    auto failedAttempt = lsfgvk::backend::RuntimeGeneratedFrameTokenTestAccess::issue(
+        43, reusedImage, lifetime2);
+    GeneratedOutputReturnStateMachine failedReturn;
+    failedReturn.advance(GeneratedOutputReturnState::EMPTY,
+        GeneratedOutputReturnState::D2_VALIDATED);
+    failedAttempt.consume();
+    failedReturn.advance(GeneratedOutputReturnState::D2_VALIDATED,
+        GeneratedOutputReturnState::TOKEN_CONSUMED);
+    failedReturn.fail();
+    assert(!failedAttempt.valid() && !failedReturn.markerReady());
+    bool retryRejected = false;
+    try { failedAttempt.consume(); }
+    catch (const std::logic_error&) { retryRejected = true; }
+    assert(retryRejected);
+
+    GeneratedOutputReturnStateMachine states;
+    assert(!states.markerReady());
+    const GeneratedOutputReturnState order[]{GeneratedOutputReturnState::D2_VALIDATED,
+        GeneratedOutputReturnState::TOKEN_CONSUMED,
+        GeneratedOutputReturnState::B_BACKING_READY,
+        GeneratedOutputReturnState::B_COPY_SUBMITTED,
+        GeneratedOutputReturnState::B_SYNC_EXPORTED,
+        GeneratedOutputReturnState::A_IMPORTED,
+        GeneratedOutputReturnState::A_COPY_SUBMITTED,
+        GeneratedOutputReturnState::A_VALIDATED,
+        GeneratedOutputReturnState::PASS};
+    auto previous = GeneratedOutputReturnState::EMPTY;
+    for (const auto next : order) { states.advance(previous, next); previous = next; }
+    assert(states.markerReady());
+    bool secondPassRejected = false;
+    try { states.advance(GeneratedOutputReturnState::PASS, GeneratedOutputReturnState::PASS); }
+    catch (const std::logic_error&) { secondPassRejected = true; }
+    assert(secondPassRejected);
+
+    const GeneratedOutputReturnState allPrePass[] = {
+        GeneratedOutputReturnState::EMPTY, GeneratedOutputReturnState::D2_VALIDATED,
+        GeneratedOutputReturnState::TOKEN_CONSUMED, GeneratedOutputReturnState::B_BACKING_READY,
+        GeneratedOutputReturnState::B_COPY_SUBMITTED, GeneratedOutputReturnState::B_SYNC_EXPORTED,
+        GeneratedOutputReturnState::A_IMPORTED, GeneratedOutputReturnState::A_COPY_SUBMITTED};
+    for (const auto state : allPrePass) {
+        GeneratedOutputReturnStateMachine probe;
+        if (state != GeneratedOutputReturnState::EMPTY) {
+            auto prior = GeneratedOutputReturnState::EMPTY;
+            for (int next = 1; next <= static_cast<int>(state); ++next) {
+                auto current = static_cast<GeneratedOutputReturnState>(next);
+                probe.advance(prior, current); prior = current;
+            }
+        }
+        assert(!probe.markerReady());
+    }
+
+    GeneratedOutputReturnStateMachine skipped;
+    bool skipRejected = false;
+    try { skipped.advance(GeneratedOutputReturnState::EMPTY,
+        GeneratedOutputReturnState::B_BACKING_READY); }
+    catch (const std::logic_error&) { skipRejected = true; }
+    assert(skipRejected);
+    skipped.fail();
+    bool failedTerminal = false;
+    try { skipped.advance(GeneratedOutputReturnState::FAILED,
+        GeneratedOutputReturnState::D2_VALIDATED); }
+    catch (const std::logic_error&) { failedTerminal = true; }
+    assert(failedTerminal && !skipped.markerReady());
+
+    const GeneratedOutputIntegrity expected{7, {8, 4}, VK_FORMAT_R8G8B8A8_UNORM,
+        128, 95, 0x1234};
+    assert(generatedOutputIntegrityMatches(expected, expected));
+    auto mismatch = expected; mismatch.generation = 8;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+    mismatch = expected; mismatch.byteCount = 127;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+    mismatch = expected; mismatch.nonzeroByteCount = 94;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+    mismatch = expected; mismatch.checksum = 0x1235;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+    mismatch = expected; mismatch.format = VK_FORMAT_B8G8R8A8_UNORM;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+    mismatch = expected; mismatch.extent.width = 9;
+    assert(!generatedOutputIntegrityMatches(expected, mismatch));
+}

@@ -8,12 +8,25 @@
 #include <vulkan/vulkan_core.h>
 
 namespace vk {
+    struct ExplicitDrmImageLayout {
+        uint64_t modifier{};
+        std::vector<VkSubresourceLayout> planes;
+    };
+
+    [[nodiscard]] bool explicitDrmImageLayoutMatches(
+        const ExplicitDrmImageLayout& requested,
+        uint64_t actualModifier,
+        const std::vector<VkSubresourceLayout>& actualPlanes) noexcept;
+
     [[nodiscard]] std::optional<uint32_t> drmFourccForVkFormat(VkFormat format) noexcept;
     [[nodiscard]] bool validateImagePlaneMetadata(
         uint32_t requestedFourcc, uint64_t requestedModifier,
         uint32_t requestedPlanes, uint32_t actualFourcc,
         uint64_t actualModifier, uint32_t actualPlanes,
         const std::vector<VkSubresourceLayout>& layouts) noexcept;
+    [[nodiscard]] std::vector<VkSubresourceLayout> normalizeExplicitImagePlaneLayouts(
+        const std::vector<VkSubresourceLayout>& queriedLayouts,
+        uint32_t arrayLayers, uint32_t depth);
     struct ImageModifierInfo {
         uint64_t modifier{};
         uint32_t planeCount{};

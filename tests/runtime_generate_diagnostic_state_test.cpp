@@ -17,6 +17,7 @@ int main() {
     assert(seed.olderSlot == 0 && seed.newerSlot == 0);
     assert(state.generatedFrames() == 0);
     assert(!state.finalPassReady());
+    assert(!state.completionResultAvailable());
 
     const auto d2a = state.advance();
     assert(d2a.action == RuntimeGenerateDiagnosticAction::GAMMA_DELTA);
@@ -24,6 +25,7 @@ int main() {
     assert(d2a.olderSlot == 0 && d2a.newerSlot == 1);
     assert(state.generatedFrames() == 0);
     assert(!state.finalPassReady());
+    assert(!state.completionResultAvailable());
 
     const auto d2b = state.advance();
     assert(d2b.action == RuntimeGenerateDiagnosticAction::GENERATE);
@@ -32,9 +34,17 @@ int main() {
     assert(d2b.generateDescriptorSet == 0);
     assert(state.generatedFrames() == 1);
     assert(!state.finalPassReady());
+    assert(!state.completionResultAvailable());
 
     state.recordValidatedOutput();
     assert(state.finalPassReady());
+    assert(state.completionResultAvailable());
+    state.issueCompletionResult();
+    assert(!state.completionResultAvailable());
+    bool rejectedSecondResult = false;
+    try { state.issueCompletionResult(); }
+    catch (const std::logic_error&) { rejectedSecondResult = true; }
+    assert(rejectedSecondResult);
 
     bool rejectedExtraGenerate = false;
     try { static_cast<void>(state.advance()); }
@@ -49,4 +59,9 @@ int main() {
     catch (const std::logic_error&) { rejectedAfterFailure = true; }
     assert(rejectedAfterFailure);
     assert(!failed.finalPassReady());
+    assert(!failed.completionResultAvailable());
+    bool rejectedFailedResult = false;
+    try { failed.issueCompletionResult(); }
+    catch (const std::logic_error&) { rejectedFailedResult = true; }
+    assert(rejectedFailedResult);
 }
