@@ -104,6 +104,9 @@ namespace vk {
         static void executeRealFrameTransport(RuntimeImageEndpoint& imageA,
             RuntimeImageEndpoint& imageB, VkImage sourceImage,
             VkExtent2D sourceExtent, VkSemaphore bridgeWait);
+        [[nodiscard]] static SyncFdPayload submitRealFrameTransportA(
+            RuntimeImageEndpoint& imageA, VkImage sourceImage,
+            VkExtent2D sourceExtent, VkSemaphore bridgeWait);
     private:
         friend RuntimeImageEndpoint createRuntimeImageEndpoint(
             const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);

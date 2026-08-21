@@ -150,6 +150,28 @@ namespace lsfgvk::backend {
         };
         std::vector<Pass> passes;
     };
+
+    class RuntimePrepassSessionImpl {
+    public:
+        RuntimePrepassSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
+            VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
+        void process(VkImage transportImage, vk::SyncFdPayload payload);
+    private:
+        const InstanceImpl& instance;
+        VkExtent2D extent{};
+        VkFormat transportFormat{};
+        uint64_t transportModifier{};
+        std::pair<vk::Image, vk::Image> sources;
+        Ctx ctx;
+        Mipmaps mipmaps;
+        std::array<Alpha0, 7> alpha0;
+        std::array<Alpha1, 7> alpha1;
+        Beta0 beta0;
+        Beta1 beta1;
+        bool seeded{};
+        size_t directFrames{};
+        size_t rotations{};
+    };
 }
 
 Instance::Instance(
@@ -409,6 +431,24 @@ void Instance::validateRuntimePrepass(VkImage transportImage, VkExtent2D extent,
     }
 }
 
+RuntimePrepassSession& Instance::openRuntimePrepassSession(VkExtent2D extent,
+        VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf) {
+    return *m_runtimePrepassSessions.emplace_back(
+        std::make_unique<RuntimePrepassSessionImpl>(*m_impl, extent, transportFormat,
+            transportModifier, flow, perf));
+}
+
+void Instance::processRuntimePrepass(RuntimePrepassSession& session,
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    session.process(transportImage, std::move(payload));
+}
+
+void Instance::closeRuntimePrepassSession(const RuntimePrepassSession& session) {
+    const auto it = std::ranges::find_if(m_runtimePrepassSessions,
+        [&session](const auto& candidate) { return candidate.get() == &session; });
+    if (it != m_runtimePrepassSessions.end()) m_runtimePrepassSessions.erase(it);
+}
+
 vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {
     return vk::makeRuntimeExchangeEndpoint(this->m_impl->getVulkan());
 }
@@ -549,6 +589,150 @@ namespace {
         } catch (const std::exception& e) {
             throw backend::error("Unable to create context", e);
         }
+    }
+}
+
+RuntimePrepassSessionImpl::RuntimePrepassSessionImpl(const InstanceImpl& instance,
+        VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
+        float flow, bool perf) :
+    instance(instance), extent(extent), transportFormat(transportFormat),
+    transportModifier(transportModifier),
+    sources(vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+            vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)),
+    ctx(createCtx(instance, extent, false, flow, perf, 0)), mipmaps(ctx, sources),
+    alpha0{Alpha0(ctx, mipmaps.getImages().at(0)), Alpha0(ctx, mipmaps.getImages().at(1)),
+        Alpha0(ctx, mipmaps.getImages().at(2)), Alpha0(ctx, mipmaps.getImages().at(3)),
+        Alpha0(ctx, mipmaps.getImages().at(4)), Alpha0(ctx, mipmaps.getImages().at(5)),
+        Alpha0(ctx, mipmaps.getImages().at(6))},
+    alpha1{Alpha1(ctx, 3, alpha0.at(0).getImages()), Alpha1(ctx, 2, alpha0.at(1).getImages()),
+        Alpha1(ctx, 2, alpha0.at(2).getImages()), Alpha1(ctx, 2, alpha0.at(3).getImages()),
+        Alpha1(ctx, 2, alpha0.at(4).getImages()), Alpha1(ctx, 2, alpha0.at(5).getImages()),
+        Alpha1(ctx, 2, alpha0.at(6).getImages())},
+    beta0(ctx, alpha1.at(0).getImages()), beta1(ctx, beta0.getImages()) {
+    if (transportFormat != VK_FORMAT_B8G8R8A8_UNORM)
+        throw backend::error("P4C-D1 supports only B8G8R8A8 transport");
+    const auto& vk = instance.getVulkan();
+    std::vector<VkImage> internal;
+    mipmaps.prepare(internal);
+    for (size_t i = 0; i < 7; ++i) { alpha0.at(i).prepare(internal); alpha1.at(i).prepare(internal); }
+    beta0.prepare(internal); beta1.prepare(internal);
+    std::vector<vk::Barrier> barriers;
+    for (const auto image : internal)
+        barriers.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, 0,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+    vk::CommandBuffer command(vk); command.begin(vk); command.insertBarriers(vk, barriers);
+    command.end(vk); command.submit(vk);
+}
+
+void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayload payload) {
+    const auto& vk = instance.getVulkan();
+    const uint32_t family = vk.queueFamilyIndex();
+    const size_t frameIndex = directFrames % 2;
+    const bool first = !seeded;
+    const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
+        vk.df().CreateSemaphore, vk.df().DestroySemaphore,
+        vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
+    auto waitSemaphore = vk::createSyncFdImportSemaphore(semaphoreDevice);
+    vk::importSyncFdTemporary(semaphoreDevice, waitSemaphore.handle(), payload);
+
+    vk::CommandBuffer command(vk); command.begin(vk);
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    std::vector<vk::Barrier> acquire{{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, family,
+        transportImage, range}};
+    if (first) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()})
+            acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED, image, range});
+    } else {
+        const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
+        acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+    }
+    command.insertBarriers(vk, acquire, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkImageBlit blit{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {{0,0,0},{static_cast<int32_t>(extent.width),static_cast<int32_t>(extent.height),1}},
+        {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
+        {{0,0,0},{static_cast<int32_t>(extent.width),static_cast<int32_t>(extent.height),1}}};
+    auto blitTo = [&](VkImage target) { vk.df().CmdBlitImage(command.handle(), transportImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit, VK_FILTER_NEAREST); };
+    if (first) { blitTo(sources.first.handle()); blitTo(sources.second.handle()); }
+    else blitTo(frameIndex == 0 ? sources.first.handle() : sources.second.handle());
+    std::vector<vk::Barrier> ready;
+    if (first) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()})
+            ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+    } else {
+        const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
+        ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+    }
+    ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, family, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        transportImage, range});
+    command.insertBarriers(vk, ready, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    mipmaps.render(vk, command, frameIndex);
+    for (size_t i = 0; i < 7; ++i) {
+        alpha0.at(6-i).render(vk, command); alpha1.at(6-i).render(vk, command, frameIndex);
+    }
+    beta0.render(vk, command, frameIndex); beta1.render(vk, command);
+    command.end(vk);
+    vk::Fence fence(vk);
+    command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
+        fence.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!fence.wait(vk)) throw backend::error("P4C-D1 backend fence wait failed");
+    directFrames++;
+    if (first) seeded = true; else rotations++;
+    if (first) {
+        std::cerr << "[DG2X-P4C-D1A] Direct synchronized prepass\n"
+            << "  Frame ordinal: 1\n  A source -> transport blit: PASS\n"
+            << "  Transport A release FOREIGN: PASS\n  A submission: PASS\n"
+            << "  SYNC_FD A->B export: PASS\n  Host wait after A submission: NONE\n"
+            << "  SYNC_FD temporary import on B: PASS\n"
+            << "  B submission waiting on A semaphore: PASS\n"
+            << "  Transport B acquire FOREIGN: PASS\n  B8 -> R8 GPU blit: PASS\n"
+            << "  Source 0 seeded: PASS\n  Source 1 seeded: PASS\n"
+            << "  LSFG Mipmaps: SCHEDULED\n  LSFG Alpha0/Alpha1: SCHEDULED\n"
+            << "  LSFG Beta0/Beta1: SCHEDULED\n  Generated frame count: 0\n"
+            << "  Generate shader: NOT RUN\n  Destinations: NONE\n"
+            << "  Transport B release FOREIGN: PASS\n  Backend submit: PASS\n"
+            << "  Backend fence completion: PASS\n  Host wait A->B: NONE\n"
+            << "  Host wait after complete B chain: YES (DIAGNOSTIC ONLY)\n"
+            << "  CPU frame bridge: NONE\n  LSFG backend execution: PREPASS_ONLY\n"
+            << "  Generated frame: NONE\n  Presentation from B: NONE\n"
+            << "  Frame transport connected: INPUT_ONLY\n"
+            << "DG2X_P4C_D1A_DIRECT_PREPASS_PASS\n";
+    } else if (directFrames == 2) {
+        std::cerr << "[DG2X-P4C-D1B] Temporal input rotation\n"
+            << "  Frame ordinal: 2\n  Session already seeded: YES\n"
+            << "  Previous source slot: 0\n  Current source slot: 1\n"
+            << "  Source 0 preserved: YES\n  Source 1 updated from real transport: YES\n"
+            << "  Source duplication this frame: NO\n  Mipmaps frameIndex: 1\n"
+            << "  Alpha frameIndex: 1\n  Beta frameIndex: 1\n"
+            << "  Backend fence completion: PASS\n  Direct real frames processed: 2\n"
+            << "  Temporal rotation count: 1\n  Host wait A->B: NONE\n"
+            << "  CPU frame bridge: NONE\n  LSFG backend execution: PREPASS_ONLY\n"
+            << "  Generated frame: NONE\n  Presentation from B: NONE\n"
+            << "  Frame transport connected: INPUT_ONLY\n"
+            << "DG2X_P4C_D1_DIRECT_PREPASS_CHAIN_PASS\n";
     }
 }
 

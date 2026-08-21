@@ -19,8 +19,10 @@ namespace lsfgvk::backend {
 
     class [[gnu::visibility("default")]] ContextImpl;
     class [[gnu::visibility("default")]] InstanceImpl;
+    class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
 
     using Context = ContextImpl;
+    using RuntimePrepassSession = RuntimePrepassSessionImpl;
 
     ///
     /// Primitive exception class that deliveres a detailed error message
@@ -89,6 +91,12 @@ namespace lsfgvk::backend {
         void validateRuntimePrepass(VkImage transportImage, VkExtent2D extent,
             VkFormat transportFormat, uint64_t transportModifier,
             float flow, bool perf);
+        RuntimePrepassSession& openRuntimePrepassSession(VkExtent2D extent,
+            VkFormat transportFormat, uint64_t transportModifier,
+            float flow, bool perf);
+        void processRuntimePrepass(RuntimePrepassSession& session,
+            VkImage transportImage, vk::SyncFdPayload payload);
+        void closeRuntimePrepassSession(const RuntimePrepassSession& session);
 
         ///
         /// Open a frame generation context.
@@ -160,6 +168,7 @@ namespace lsfgvk::backend {
         std::unique_ptr<InstanceImpl> m_impl;
 
         std::vector<std::unique_ptr<Context>> m_contexts;
+        std::vector<std::unique_ptr<RuntimePrepassSession>> m_runtimePrepassSessions;
     };
 
     ///

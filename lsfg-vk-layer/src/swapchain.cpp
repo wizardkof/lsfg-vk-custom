@@ -407,8 +407,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         std::stop_token stopToken,
         std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
     if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY) {
-        if (!this->captureOnlyPresentSeen) {
-            this->captureOnlyPresentSeen = true;
+        if (this->captureOnlyPhase == 0) {
             const auto sourceImage = this->info.images.at(imageIdx);
             std::cerr << "[DG2X-P4C-B0] Cross-device capture-only runtime\n"
                 << "  RuntimeDevicePair: CROSS_PHYSICAL_DEVICE\n"
@@ -444,9 +443,33 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             this->captureRealFrameOnce(vk, sourceImage, imageIdx, {});
             std::cerr << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
                 << "cross-device capture hook reached, but real frame transport is not connected yet\n";
+            this->captureOnlyPhase = 1;
+            return VK_SUCCESS;
+        }
+        if (this->captureOnlyPhase <= 2) {
+            if (this->captureOnlyPhase == 1) {
+                auto& session = this->instance.get().openRuntimePrepassSession(
+                    this->info.extent, VK_FORMAT_B8G8R8A8_UNORM,
+                    this->frameTransportBacking.modifier(),
+                    1.0F / this->profile.flow_scale, this->profile.performance_mode);
+                this->runtimePrepassSession = ls::owned_ptr<ls::R<backend::RuntimePrepassSession>>(
+                    new ls::R<backend::RuntimePrepassSession>(session),
+                    [backend = &this->instance.get()](ls::R<backend::RuntimePrepassSession>& value) {
+                        backend->closeRuntimePrepassSession(value);
+                    });
+            }
+            const auto sourceImage = this->info.images.at(imageIdx);
+            auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
+                this->frameTransportA, sourceImage, this->info.extent,
+                semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
+            this->instance.get().processRuntimePrepass(
+                this->runtimePrepassSession.get(), this->frameTransportB.image(),
+                std::move(payload));
+            this->captureOnlyPhase++;
+            if (this->captureOnlyPhase <= 2) return VK_SUCCESS;
         }
         throw ls::error(
-            "cross-device capture hook reached, but real frame transport is not connected yet");
+            "cross-device direct prepass diagnostic completed; generated output remains disconnected");
     }
     const bool adaptiveBypass = isAdaptiveBypass(this->profile);
 

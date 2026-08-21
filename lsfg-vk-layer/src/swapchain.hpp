@@ -139,11 +139,12 @@ namespace lsfgvk::layer {
         std::optional<std::chrono::steady_clock::time_point> lastSourcePresent;
 
         CrossDeviceRuntimeMode crossDeviceMode{CrossDeviceRuntimeMode::BLOCKED};
-        bool captureOnlyPresentSeen{};
+        uint32_t captureOnlyPhase{};
         RuntimeDmaBufBacking frameTransportBacking;
         vk::RuntimeImageEndpoint frameTransportA;
         vk::RuntimeImageEndpoint frameTransportB;
         bool frameTransportReady{};
+        ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);

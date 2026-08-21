@@ -784,6 +784,65 @@ void RuntimeImageEndpoint::executeRealFrameTransport(RuntimeImageEndpoint& image
         << "cross-device real frame reached generation GPU, but LSFG frame processing is not connected yet\n";
 }
 
+SyncFdPayload RuntimeImageEndpoint::submitRealFrameTransportA(
+        RuntimeImageEndpoint& imageA, VkImage sourceImage, VkExtent2D sourceExtent,
+        VkSemaphore bridgeWait) {
+    if (sourceExtent.width != imageA.extent.width || sourceExtent.height != imageA.extent.height)
+        throw std::runtime_error("P4C-D1 source/transport extent mismatch");
+    if (!imageA.endpoint.CmdBlitImage)
+        throw std::runtime_error("P4C-D1 A image transfer dispatch incomplete");
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkCommandBuffer command = imageA.commandBuffers.front();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    auto result = imageA.endpoint.BeginCommandBuffer(command, &begin);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-D1 vkBeginCommandBuffer A");
+    const std::array acquire{
+        VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED, sourceImage, range},
+        VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT,
+            imageA.endpoint.queueFamilyIndex, imageA.imageHandle, range}};
+    imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, acquire.size(), acquire.data());
+    const VkImageBlit blit{
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{0, 0, 0}, {static_cast<int32_t>(sourceExtent.width),
+            static_cast<int32_t>(sourceExtent.height), 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffsets = {{0, 0, 0}, {static_cast<int32_t>(imageA.extent.width),
+            static_cast<int32_t>(imageA.extent.height), 1}}};
+    imageA.endpoint.CmdBlitImage(command, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        imageA.imageHandle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    const std::array release{
+        VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED, sourceImage, range},
+        VkImageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageA.endpoint.queueFamilyIndex,
+            VK_QUEUE_FAMILY_FOREIGN_EXT, imageA.imageHandle, range}};
+    imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, release.size(), release.data());
+    result = imageA.endpoint.EndCommandBuffer(command);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-D1 vkEndCommandBuffer A");
+    auto signal = createExportableSyncFdSemaphore(imageA.endpoint.semaphoreDevice);
+    const VkSemaphore signalHandle = signal.handle();
+    constexpr VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.waitSemaphoreCount = bridgeWait ? 1U : 0U;
+    submit.pWaitSemaphores = bridgeWait ? &bridgeWait : nullptr;
+    submit.pWaitDstStageMask = bridgeWait ? &stage : nullptr;
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &command;
+    submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &signalHandle;
+    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submit, VK_NULL_HANDLE);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "P4C-D1 vkQueueSubmit A");
+    return exportSyncFd(imageA.endpoint.semaphoreDevice, signal.handle());
+}
+
 RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoint& source,
         ls::OwnedFd fd, const RuntimeImageBackingInfo& backing) {
     if (!source.CreateImage || !source.DestroyImage || !source.GetImageMemoryRequirements2
