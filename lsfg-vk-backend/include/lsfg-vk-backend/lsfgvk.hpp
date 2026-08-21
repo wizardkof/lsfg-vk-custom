@@ -20,9 +20,11 @@ namespace lsfgvk::backend {
     class [[gnu::visibility("default")]] ContextImpl;
     class [[gnu::visibility("default")]] InstanceImpl;
     class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
+    class [[gnu::visibility("default")]] RuntimeGenerateDiagnosticSessionImpl;
 
     using Context = ContextImpl;
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
+    using RuntimeGenerateDiagnosticSession = RuntimeGenerateDiagnosticSessionImpl;
 
     ///
     /// Primitive exception class that deliveres a detailed error message
@@ -97,6 +99,13 @@ namespace lsfgvk::backend {
         void processRuntimePrepass(RuntimePrepassSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
         void closeRuntimePrepassSession(const RuntimePrepassSession& session);
+        RuntimeGenerateDiagnosticSession& openRuntimeGenerateDiagnosticSession(
+            VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
+            float flow, bool perf);
+        void processRuntimeGenerateDiagnostic(RuntimeGenerateDiagnosticSession& session,
+            VkImage transportImage, vk::SyncFdPayload payload);
+        void closeRuntimeGenerateDiagnosticSession(
+            const RuntimeGenerateDiagnosticSession& session);
 
         ///
         /// Open a frame generation context.
@@ -169,6 +178,8 @@ namespace lsfgvk::backend {
 
         std::vector<std::unique_ptr<Context>> m_contexts;
         std::vector<std::unique_ptr<RuntimePrepassSession>> m_runtimePrepassSessions;
+        std::vector<std::unique_ptr<RuntimeGenerateDiagnosticSession>>
+            m_runtimeGenerateDiagnosticSessions;
     };
 
     ///

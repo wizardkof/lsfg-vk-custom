@@ -466,10 +466,34 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 this->runtimePrepassSession.get(), this->frameTransportB.image(),
                 std::move(payload));
             this->captureOnlyPhase++;
-            if (this->captureOnlyPhase <= 2) return VK_SUCCESS;
+            return VK_SUCCESS;
+        }
+        if (this->captureOnlyPhase <= 5) {
+            if (this->captureOnlyPhase == 3) {
+                auto& session = this->instance.get().openRuntimeGenerateDiagnosticSession(
+                    this->info.extent, VK_FORMAT_B8G8R8A8_UNORM,
+                    this->frameTransportBacking.modifier(),
+                    1.0F / this->profile.flow_scale, this->profile.performance_mode);
+                this->runtimeGenerateDiagnosticSession =
+                    ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>(
+                        new ls::R<backend::RuntimeGenerateDiagnosticSession>(session),
+                        [backend = &this->instance.get()](
+                                ls::R<backend::RuntimeGenerateDiagnosticSession>& value) {
+                            backend->closeRuntimeGenerateDiagnosticSession(value);
+                        });
+            }
+            const auto sourceImage = this->info.images.at(imageIdx);
+            auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
+                this->frameTransportA, sourceImage, this->info.extent,
+                semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
+            this->instance.get().processRuntimeGenerateDiagnostic(
+                this->runtimeGenerateDiagnosticSession.get(), this->frameTransportB.image(),
+                std::move(payload));
+            this->captureOnlyPhase++;
+            if (this->captureOnlyPhase <= 5) return VK_SUCCESS;
         }
         throw ls::error(
-            "cross-device direct prepass diagnostic completed; generated output remains disconnected");
+            "cross-device generated-frame diagnostic completed; output transport remains disconnected");
     }
     const bool adaptiveBypass = isAdaptiveBypass(this->profile);
 

@@ -145,6 +145,8 @@ namespace lsfgvk::layer {
         vk::RuntimeImageEndpoint frameTransportB;
         bool frameTransportReady{};
         ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;
+        ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>
+            runtimeGenerateDiagnosticSession;
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);

@@ -32,6 +32,13 @@ namespace lsfgvk::backend {
             const vk::Image& inputImage2,
             const vk::Image& inputImage3,
             const vk::Image& outputImage);
+        Generate(const Ctx& ctx, size_t idx,
+            const vk::Image& sourceImageFirst,
+            const vk::Image& sourceImageSecond,
+            const vk::Image& inputImage1,
+            const vk::Image& inputImage2,
+            const vk::Image& inputImage3,
+            const vk::Image& outputImage);
 
         /// render the generate shaderchain
         /// @param vk the vulkan instance

@@ -48,6 +48,17 @@ lsfgvk_add_layer_unit_test(
 target_link_libraries(lsfg-vk-test-virtual-swapchain-image-spec
     PRIVATE lsfg-vk-common)
 
+add_executable(lsfg-vk-test-runtime-generate-diagnostic-state
+    runtime_generate_diagnostic_state_test.cpp)
+target_include_directories(lsfg-vk-test-runtime-generate-diagnostic-state PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-backend/src")
+target_compile_options(lsfg-vk-test-runtime-generate-diagnostic-state PRIVATE
+    -UNDEBUG
+    -Wno-unknown-warning-option)
+add_test(
+    NAME lsfg-vk-test-runtime-generate-diagnostic-state
+    COMMAND lsfg-vk-test-runtime-generate-diagnostic-state)
+
 add_executable(lsfg-vk-test-config-frame-generation-mode
     config_frame_generation_mode_test.cpp)
 

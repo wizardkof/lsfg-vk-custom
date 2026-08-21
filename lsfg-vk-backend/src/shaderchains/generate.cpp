@@ -20,14 +20,25 @@ Generate::Generate(const Ctx& ctx, size_t idx,
         const vk::Image& inputImage1,
         const vk::Image& inputImage2,
         const vk::Image& inputImage3,
+        const vk::Image& outputImage) :
+    Generate(ctx, idx, sourceImages.first, sourceImages.second,
+        inputImage1, inputImage2, inputImage3, outputImage) {}
+
+Generate::Generate(const Ctx& ctx, size_t idx,
+        const vk::Image& sourceImageFirst,
+        const vk::Image& sourceImageSecond,
+        const vk::Image& inputImage1,
+        const vk::Image& inputImage2,
+        const vk::Image& inputImage3,
         const vk::Image& outputImage) {
-    // create descriptor sets
+    // create descriptor sets; the first set binds the newer second image first,
+    // matching the normal fidx=0 descriptor orientation.
     const auto& shader = ctx.hdr ?
         ctx.shaders.get().generate_hdr : ctx.shaders.get().generate;
     this->sets.reserve(2);
     this->sets.emplace_back(ManagedShaderBuilder()
-        .sampled(sourceImages.second)
-        .sampled(sourceImages.first)
+        .sampled(sourceImageSecond)
+        .sampled(sourceImageFirst)
         .sampled(inputImage1)
         .sampled(inputImage2)
         .sampled(inputImage3)
@@ -37,8 +48,8 @@ Generate::Generate(const Ctx& ctx, size_t idx,
         .buffer(ctx.constantBuffers.at(idx))
         .build(ctx.vk, ctx.pool, shader));
     this->sets.emplace_back(ManagedShaderBuilder()
-        .sampled(sourceImages.first)
-        .sampled(sourceImages.second)
+        .sampled(sourceImageFirst)
+        .sampled(sourceImageSecond)
         .sampled(inputImage1)
         .sampled(inputImage2)
         .sampled(inputImage3)

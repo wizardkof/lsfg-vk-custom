@@ -6,6 +6,8 @@
 #include "vulkan.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -46,6 +48,12 @@ namespace vk {
         /// @param size size of the data in bytes
         /// @throws ls::vulkan_error on failure or if size exceeds buffer capacity
         void update(const vk::Vulkan& vk, const void* data, size_t size);
+
+        /// Read bytes from a host-visible coherent buffer after GPU completion.
+        /// @param vk the Vulkan device that owns the buffer
+        /// @param size number of bytes to read
+        /// @throws ls::vulkan_error if the buffer cannot be mapped or size is invalid
+        [[nodiscard]] std::vector<uint8_t> read(const vk::Vulkan& vk, size_t size) const;
 
         /// get the buffer handle
         /// @return the buffer handle

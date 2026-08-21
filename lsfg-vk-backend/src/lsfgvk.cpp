@@ -5,6 +5,7 @@
 #include "extraction/shader_registry.hpp"
 #include "helpers/limits.hpp"
 #include "helpers/utils.hpp"
+#include "runtime_generate_diagnostic_state.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/buffer.hpp"
@@ -52,6 +53,11 @@
 
 using namespace lsfgvk;
 using namespace lsfgvk::backend;
+
+namespace {
+    void validateRuntimeGenerateFormats(const lsfgvk::backend::InstanceImpl& instance,
+        VkFormat transportFormat, uint64_t transportModifier);
+}
 
 namespace lsfgvk::backend {
     error::error(const std::string& msg, const std::exception& inner)
@@ -171,6 +177,39 @@ namespace lsfgvk::backend {
         bool seeded{};
         size_t directFrames{};
         size_t rotations{};
+    };
+
+    class RuntimeGenerateDiagnosticSessionImpl {
+    public:
+        RuntimeGenerateDiagnosticSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
+            VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
+        void process(VkImage transportImage, vk::SyncFdPayload payload);
+    private:
+        struct Pass {
+            std::vector<Gamma0> gamma0;
+            std::vector<Gamma1> gamma1;
+            std::vector<Delta0> delta0;
+            std::vector<Delta1> delta1;
+            ls::lazy<Generate> generate;
+        };
+
+        const InstanceImpl& instance;
+        VkExtent2D extent{};
+        VkFormat transportFormat{};
+        uint64_t transportModifier{};
+        size_t capturedBytes{};
+        std::pair<vk::Image, vk::Image> sources;
+        vk::Image blackImage;
+        vk::Image destination;
+        vk::Buffer readback;
+        Ctx ctx;
+        Mipmaps mipmaps;
+        std::array<Alpha0, 7> alpha0;
+        std::array<Alpha1, 7> alpha1;
+        Beta0 beta0;
+        Beta1 beta1;
+        Pass pass;
+        RuntimeGenerateDiagnosticState state;
     };
 }
 
@@ -449,6 +488,28 @@ void Instance::closeRuntimePrepassSession(const RuntimePrepassSession& session) 
     if (it != m_runtimePrepassSessions.end()) m_runtimePrepassSessions.erase(it);
 }
 
+RuntimeGenerateDiagnosticSession& Instance::openRuntimeGenerateDiagnosticSession(
+        VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
+        float flow, bool perf) {
+    validateRuntimeGenerateFormats(*m_impl, transportFormat, transportModifier);
+    return *m_runtimeGenerateDiagnosticSessions.emplace_back(
+        std::make_unique<RuntimeGenerateDiagnosticSessionImpl>(*m_impl, extent,
+            transportFormat, transportModifier, flow, perf));
+}
+
+void Instance::processRuntimeGenerateDiagnostic(RuntimeGenerateDiagnosticSession& session,
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    session.process(transportImage, std::move(payload));
+}
+
+void Instance::closeRuntimeGenerateDiagnosticSession(
+        const RuntimeGenerateDiagnosticSession& session) {
+    const auto it = std::ranges::find_if(m_runtimeGenerateDiagnosticSessions,
+        [&session](const auto& candidate) { return candidate.get() == &session; });
+    if (it != m_runtimeGenerateDiagnosticSessions.end())
+        m_runtimeGenerateDiagnosticSessions.erase(it);
+}
+
 vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {
     return vk::makeRuntimeExchangeEndpoint(this->m_impl->getVulkan());
 }
@@ -518,6 +579,68 @@ namespace {
             };
         } catch (const std::exception& e) {
             throw backend::error("Unable to create black image", e);
+        }
+    }
+    vk::Image createDiagnosticBlackImage(const vk::Vulkan& vk) {
+        try {
+            return{vk, { .width = 4, .height = 4 }, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+        } catch (const std::exception& e) {
+            throw backend::error("Unable to create D2 black image", e);
+        }
+    }
+    vk::Buffer createDiagnosticReadbackBuffer(const vk::Vulkan& vk, size_t byteSize) {
+        std::vector<uint8_t> zeroes(byteSize);
+        return {vk, zeroes.data(), zeroes.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    }
+    void validateRuntimeGenerateFormats(const InstanceImpl& instance,
+            VkFormat transportFormat, uint64_t transportModifier) {
+        if (transportFormat != VK_FORMAT_B8G8R8A8_UNORM)
+            throw backend::error("P4C-D2 supports only B8G8R8A8 transport");
+
+        const auto& vk = instance.getVulkan();
+        if (!vk.fi().GetPhysicalDeviceFormatProperties2)
+            throw backend::error("P4C-D2 format-properties dispatch is unavailable");
+
+        VkDrmFormatModifierProperties2EXT modifierProperties[32]{};
+        VkDrmFormatModifierPropertiesList2EXT modifierList{
+            VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT, nullptr,
+            32, modifierProperties};
+        VkFormatProperties2 transportProperties{
+            VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &modifierList, {}};
+        vk.fi().GetPhysicalDeviceFormatProperties2(
+            vk.physdev(), transportFormat, &transportProperties);
+        bool transportBlitSource{};
+        const auto modifierCount = std::min<uint32_t>(
+            modifierList.drmFormatModifierCount, std::size(modifierProperties));
+        for (uint32_t i = 0; i < modifierCount; ++i) {
+            if (modifierProperties[i].drmFormatModifier == transportModifier) {
+                transportBlitSource = (modifierProperties[i].drmFormatModifierTilingFeatures
+                    & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+            }
+        }
+
+        VkFormatProperties2 rgba8{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        vk.fi().GetPhysicalDeviceFormatProperties2(
+            vk.physdev(), VK_FORMAT_R8G8B8A8_UNORM, &rgba8);
+        const auto rgba8Required = VK_FORMAT_FEATURE_BLIT_DST_BIT
+            | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+            | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT
+            | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+            | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+
+        VkFormatProperties2 rgba16f{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+        vk.fi().GetPhysicalDeviceFormatProperties2(
+            vk.physdev(), VK_FORMAT_R16G16B16A16_SFLOAT, &rgba16f);
+        const auto rgba16fRequired = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+            | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+
+        if (!transportBlitSource
+                || (rgba8.formatProperties.optimalTilingFeatures & rgba8Required) != rgba8Required
+                || (rgba16f.formatProperties.optimalTilingFeatures & rgba16fRequired)
+                    != rgba16fRequired) {
+            throw backend::error("P4C-D2 backend format capability gate rejected required formats");
         }
     }
     /// import timeline semaphore
@@ -733,6 +856,329 @@ void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayloa
             << "  Generated frame: NONE\n  Presentation from B: NONE\n"
             << "  Frame transport connected: INPUT_ONLY\n"
             << "DG2X_P4C_D1_DIRECT_PREPASS_CHAIN_PASS\n";
+    }
+}
+
+RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
+        const InstanceImpl& instance, VkExtent2D extent, VkFormat transportFormat,
+        uint64_t transportModifier, float flow, bool perf) :
+    instance(instance), extent(extent), transportFormat(transportFormat),
+    transportModifier(transportModifier),
+    capturedBytes(static_cast<size_t>(extent.width) * extent.height * 4U),
+    sources(vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+            vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)),
+    blackImage(createDiagnosticBlackImage(instance.getVulkan())),
+    destination(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+    readback(createDiagnosticReadbackBuffer(instance.getVulkan(), capturedBytes)),
+    ctx(createCtx(instance, extent, false, flow, perf, 1)),
+    mipmaps(ctx, sources),
+    alpha0{Alpha0(ctx, mipmaps.getImages().at(0)), Alpha0(ctx, mipmaps.getImages().at(1)),
+        Alpha0(ctx, mipmaps.getImages().at(2)), Alpha0(ctx, mipmaps.getImages().at(3)),
+        Alpha0(ctx, mipmaps.getImages().at(4)), Alpha0(ctx, mipmaps.getImages().at(5)),
+        Alpha0(ctx, mipmaps.getImages().at(6))},
+    alpha1{Alpha1(ctx, 3, alpha0.at(0).getImages()), Alpha1(ctx, 2, alpha0.at(1).getImages()),
+        Alpha1(ctx, 2, alpha0.at(2).getImages()), Alpha1(ctx, 2, alpha0.at(3).getImages()),
+        Alpha1(ctx, 2, alpha0.at(4).getImages()), Alpha1(ctx, 2, alpha0.at(5).getImages()),
+        Alpha1(ctx, 2, alpha0.at(6).getImages())},
+    beta0(ctx, alpha1.at(0).getImages()), beta1(ctx, beta0.getImages()) {
+    if (capturedBytes == 0)
+        throw backend::error("P4C-D2 diagnostic destination has zero byte size");
+
+    pass.gamma0.reserve(7);
+    pass.gamma1.reserve(7);
+    pass.delta0.reserve(3);
+    pass.delta1.reserve(3);
+    for (size_t j = 0; j < 7; ++j) {
+        if (j == 0) {
+            pass.gamma0.emplace_back(ctx, 0, alpha1.at(6).getImages(), blackImage);
+            pass.gamma1.emplace_back(ctx, 0, pass.gamma0.at(j).getImages(),
+                blackImage, beta1.getImages().at(5));
+        } else {
+            pass.gamma0.emplace_back(ctx, 0, alpha1.at(6 - j).getImages(),
+                pass.gamma1.at(j - 1).getImage());
+            pass.gamma1.emplace_back(ctx, 0, pass.gamma0.at(j).getImages(),
+                pass.gamma1.at(j - 1).getImage(), beta1.getImages().at(6 - j));
+        }
+
+        if (j == 4) {
+            pass.delta0.emplace_back(ctx, 0, alpha1.at(2).getImages(),
+                blackImage, pass.gamma1.at(3).getImage());
+            pass.delta1.emplace_back(ctx, 0,
+                pass.delta0.at(0).getImages0(), pass.delta0.at(0).getImages1(),
+                blackImage, beta1.getImages().at(2), blackImage);
+        } else if (j > 4) {
+            pass.delta0.emplace_back(ctx, 0, alpha1.at(6 - j).getImages(),
+                pass.delta1.at(j - 5).getImage0(), pass.gamma1.at(j - 1).getImage());
+            pass.delta1.emplace_back(ctx, 0,
+                pass.delta0.at(j - 4).getImages0(), pass.delta0.at(j - 4).getImages1(),
+                pass.delta1.at(j - 5).getImage0(), beta1.getImages().at(6 - j),
+                pass.delta1.at(j - 5).getImage1());
+        }
+    }
+    pass.generate.emplace(ctx, 0, sources.second, sources.first,
+        pass.gamma1.at(6).getImage(),
+        pass.delta1.at(2).getImage0(), pass.delta1.at(2).getImage1(), destination);
+
+    std::vector<VkImage> internal{blackImage.handle()};
+    mipmaps.prepare(internal);
+    for (size_t i = 0; i < 7; ++i) {
+        alpha0.at(i).prepare(internal);
+        alpha1.at(i).prepare(internal);
+        pass.gamma0.at(i).prepare(internal);
+        pass.gamma1.at(i).prepare(internal);
+        if (i >= 4) {
+            pass.delta0.at(i - 4).prepare(internal);
+            pass.delta1.at(i - 4).prepare(internal);
+        }
+    }
+    beta0.prepare(internal);
+    beta1.prepare(internal);
+
+    std::vector<vk::Barrier> barriers;
+    barriers.reserve(internal.size());
+    for (const auto image : internal) {
+        if (image == blackImage.handle())
+            continue;
+        barriers.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, 0,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+    }
+    vk::CommandBuffer command(instance.getVulkan());
+    command.begin(instance.getVulkan());
+    command.insertBarriers(instance.getVulkan(), barriers);
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const vk::Barrier blackToClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, blackImage.handle(), range};
+    command.insertBarriers(instance.getVulkan(), {blackToClear},
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkClearColorValue zero{};
+    instance.getVulkan().df().CmdClearColorImage(command.handle(), blackImage.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+    const vk::Barrier blackToGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, blackImage.handle(), range};
+    command.insertBarriers(instance.getVulkan(), {blackToGeneral},
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    command.end(instance.getVulkan());
+    command.submit(instance.getVulkan());
+    std::cerr << "Black image zero initialization: PASS\n";
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::process(
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    const auto step = state.advance();
+    try {
+    const auto& vk = instance.getVulkan();
+    const uint32_t family = vk.queueFamilyIndex();
+    const bool seed = step.action == RuntimeGenerateDiagnosticAction::SEED_ONLY;
+    const bool runGammaDelta = step.action != RuntimeGenerateDiagnosticAction::SEED_ONLY;
+    const bool runGenerate = step.action == RuntimeGenerateDiagnosticAction::GENERATE;
+    const size_t frameIndex = step.frameIndex;
+
+    const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
+        vk.df().CreateSemaphore, vk.df().DestroySemaphore,
+        vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
+    auto waitSemaphore = vk::createSyncFdImportSemaphore(semaphoreDevice);
+    vk::importSyncFdTemporary(semaphoreDevice, waitSemaphore.handle(), payload);
+
+    vk::CommandBuffer command(vk);
+    command.begin(vk);
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    std::vector<vk::Barrier> acquire{{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, family,
+        transportImage, range}};
+    if (seed) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()}) {
+            acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED, image, range});
+        }
+    } else {
+        const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
+        acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+    }
+    command.insertBarriers(vk, acquire, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+    const VkImageBlit blit{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {{0, 0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1}},
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {{0, 0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1}}};
+    const auto blitTo = [&](VkImage target) {
+        vk.df().CmdBlitImage(command.handle(), transportImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    };
+    if (seed) {
+        blitTo(sources.first.handle());
+        blitTo(sources.second.handle());
+    } else {
+        blitTo(frameIndex == 0 ? sources.first.handle() : sources.second.handle());
+    }
+
+    std::vector<vk::Barrier> ready;
+    if (seed) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()}) {
+            ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+        }
+    } else {
+        const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
+        ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
+    }
+    ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, family, VK_QUEUE_FAMILY_FOREIGN_EXT,
+        transportImage, range});
+    command.insertBarriers(vk, ready, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+    mipmaps.render(vk, command, frameIndex);
+    for (size_t i = 0; i < 7; ++i) {
+        alpha0.at(6 - i).render(vk, command);
+        alpha1.at(6 - i).render(vk, command, frameIndex);
+    }
+    beta0.render(vk, command, frameIndex);
+    beta1.render(vk, command);
+
+    if (runGammaDelta) {
+        for (size_t j = 0; j < 7; ++j) {
+            pass.gamma0.at(j).render(vk, command, frameIndex);
+            pass.gamma1.at(j).render(vk, command);
+            if (j >= 4) {
+                pass.delta0.at(j - 4).render(vk, command, frameIndex);
+                pass.delta1.at(j - 4).render(vk, command);
+            }
+        }
+    }
+
+    if (runGenerate) {
+        const vk::Barrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED, destination.handle(), range};
+        command.insertBarriers(vk, {toClear}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const VkClearColorValue zero{};
+        vk.df().CmdClearColorImage(command.handle(), destination.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+        const vk::Barrier toGenerate{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            destination.handle(), range};
+        command.insertBarriers(vk, {toGenerate}, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        pass.generate->render(vk, command, frameIndex);
+
+        const vk::Barrier toReadback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            destination.handle(), range};
+        command.insertBarriers(vk, {toReadback}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const VkBufferImageCopy copy{0, 0, 0,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
+            {extent.width, extent.height, 1}};
+        vk.df().CmdCopyImageToBuffer(command.handle(), destination.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle(), 1, &copy);
+        const VkBufferMemoryBarrier hostRead{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            readback.handle(), 0, capturedBytes};
+        vk.df().CmdPipelineBarrier(command.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+    }
+
+    command.end(vk);
+    vk::Fence fence(vk);
+    command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
+        {}, VK_NULL_HANDLE, 0, fence.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!fence.wait(vk))
+        throw backend::error("P4C-D2 backend fence wait failed");
+
+    if (step.action == RuntimeGenerateDiagnosticAction::SEED_ONLY) {
+        std::cerr << "[DG2X-P4C-D2] Diagnostic temporal seed\n"
+            << "  D2 direct real frames: 1\n  Seed duplication: YES\n"
+            << "  Generate: NOT RUN\n  Host wait A->B: NONE\n";
+        return;
+    }
+    if (step.action == RuntimeGenerateDiagnosticAction::GAMMA_DELTA) {
+        std::cerr << "[DG2X-P4C-D2A] Gamma/Delta prerequisites\n"
+            << "  D2 temporal pair valid: YES\n"
+            << "  D2 direct real frames: 2\n  Temporal rotations: 1\n"
+            << "  Gamma variant: " << (ctx.perf ? "PERFORMANCE" : "QUALITY") << "\n"
+            << "  Delta variant: " << (ctx.perf ? "PERFORMANCE" : "QUALITY") << "\n"
+            << "  Gamma iterations completed: 7\n"
+            << "  Delta iterations completed: 3\n"
+            << "  Generate: NOT RUN\n  Generated frame: NONE\n"
+            << "  Backend fence completion: PASS\n  Host wait A->B: NONE\n"
+            << "DG2X_P4C_D2A_GAMMA_DELTA_B_PASS\n";
+        return;
+    }
+
+    const auto bytes = readback.read(vk, capturedBytes);
+    if (bytes.size() != capturedBytes)
+        throw backend::error("P4C-D2 generated readback byte count mismatch");
+    uint64_t checksum = 1469598103934665603ULL;
+    size_t nonzero{};
+    for (const auto byte : bytes) {
+        checksum ^= byte;
+        checksum *= 1099511628211ULL;
+        nonzero += byte != 0;
+    }
+    if (nonzero == 0)
+        throw backend::error("P4C-D2 generated destination is entirely zero");
+    state.recordValidatedOutput();
+    if (!state.finalPassReady())
+        throw backend::error("P4C-D2 final marker gate rejected incomplete state");
+
+    std::cerr << "[DG2X-P4C-D2B] GPU-B-local generated frame\n"
+        << "  D2 temporal pair valid: YES\n"
+        << "  D2 direct real frames: 3\n  Temporal rotations: 2\n"
+        << "  Physical source slot 1: older frame B\n"
+        << "  Physical source slot 0: newer frame C\n"
+        << "  Generate sourceImages.first: physical slot 1 / older B\n"
+        << "  Generate sourceImages.second: physical slot 0 / newer C\n"
+        << "  Generate descriptor set: 0\n"
+        << "  Gamma iterations completed: 7\n  Delta iterations completed: 3\n"
+        << "  Generate shader: SDR\n  Generate executions: 1\n"
+        << "  Interpolation constant source: getDefaultConstantBuffer(0, 1, flow)\n"
+        << "  Interpolation timestamp: 0.5\n"
+        << "  Destination format: R8G8B8A8_UNORM\n"
+        << "  Destination zero clear: PASS\n"
+        << "  Captured byte count: " << bytes.size() << "\n"
+        << "  Captured non-zero bytes: " << nonzero << "\n"
+        << "  Captured checksum: 0x" << std::hex << checksum << std::dec << "\n"
+        << "  Backend fence completion: PASS\n"
+        << "  LSFG backend execution: GENERATE_DIAGNOSTIC\n"
+        << "  Frame transport: INPUT_ONLY\n  Generated frame: GPU_B_LOCAL\n"
+        << "  Presentation from B: NONE\n  Output transport B->A: NONE\n"
+        << "  CPU frame bridge: NONE\n  Host wait A->B: NONE\n"
+        << "DG2X_P4C_D2_GENERATED_FRAME_B_PASS\n";
+    } catch (...) {
+        state.recordFailure();
+        throw;
     }
 }
 
