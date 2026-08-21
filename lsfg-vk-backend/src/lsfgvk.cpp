@@ -246,6 +246,8 @@ namespace {
         return *api;
     }
 #endif
+    Ctx createCtx(const InstanceImpl& instance, VkExtent2D extent,
+        bool hdr, float flow, bool perf, size_t count);
 }
 
 InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
@@ -270,6 +272,141 @@ const vk::PhysicalDeviceIdentity& Instance::deviceIdentity() const {
 
 const std::vector<vk::PhysicalDeviceSnapshot>& Instance::visibleDevices() const {
     return this->m_impl->getVisibleDevices();
+}
+
+void Instance::validateRuntimePrepass(VkImage transportImage, VkExtent2D extent,
+        VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf) {
+    if (transportFormat != VK_FORMAT_B8G8R8A8_UNORM)
+        throw backend::error("P4C-D0 supports only the diagnostic B8G8R8A8 transport format");
+    const auto& vk = this->m_impl->getVulkan();
+    const auto family = vk.queueFamilyIndex();
+    if (!vk.fi().GetPhysicalDeviceFormatProperties2)
+        throw backend::error("P4C-D0 format-properties dispatch is unavailable");
+
+    VkDrmFormatModifierProperties2EXT modifierProperties[32]{};
+    VkDrmFormatModifierPropertiesList2EXT modifierList{
+        VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT, nullptr,
+        32, modifierProperties};
+    VkFormatProperties2 transportProperties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        &modifierList, {}};
+    vk.fi().GetPhysicalDeviceFormatProperties2(vk.physdev(), transportFormat,
+        &transportProperties);
+    bool blitSource = false;
+    for (uint32_t i = 0; i < modifierList.drmFormatModifierCount; ++i) {
+        if (modifierProperties[i].drmFormatModifier == transportModifier)
+            blitSource = (modifierProperties[i].drmFormatModifierTilingFeatures
+                & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+    }
+    VkFormatProperties2 nativeProperties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+    vk.fi().GetPhysicalDeviceFormatProperties2(vk.physdev(), VK_FORMAT_R8G8B8A8_UNORM,
+        &nativeProperties);
+    const auto requiredNative = VK_FORMAT_FEATURE_BLIT_DST_BIT
+        | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (!blitSource || (nativeProperties.formatProperties.optimalTilingFeatures
+            & requiredNative) != requiredNative)
+        throw backend::error("P4C-D0 backend format capability gate rejected B8->R8 blit");
+
+    try {
+        auto sources = std::pair<vk::Image, vk::Image>{
+            vk::Image(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+            vk::Image(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)};
+        auto ctx = createCtx(*this->m_impl, extent, false, flow, perf, 0);
+        Mipmaps mipmaps(ctx, sources);
+        std::array<Alpha0, 7> alpha0{
+            Alpha0(ctx, mipmaps.getImages().at(0)), Alpha0(ctx, mipmaps.getImages().at(1)),
+            Alpha0(ctx, mipmaps.getImages().at(2)), Alpha0(ctx, mipmaps.getImages().at(3)),
+            Alpha0(ctx, mipmaps.getImages().at(4)), Alpha0(ctx, mipmaps.getImages().at(5)),
+            Alpha0(ctx, mipmaps.getImages().at(6))};
+        std::array<Alpha1, 7> alpha1{
+            Alpha1(ctx, 3, alpha0.at(0).getImages()), Alpha1(ctx, 2, alpha0.at(1).getImages()),
+            Alpha1(ctx, 2, alpha0.at(2).getImages()), Alpha1(ctx, 2, alpha0.at(3).getImages()),
+            Alpha1(ctx, 2, alpha0.at(4).getImages()), Alpha1(ctx, 2, alpha0.at(5).getImages()),
+            Alpha1(ctx, 2, alpha0.at(6).getImages())};
+        Beta0 beta0(ctx, alpha1.at(0).getImages());
+        Beta1 beta1(ctx, beta0.getImages());
+
+        std::vector<VkImage> internal;
+        mipmaps.prepare(internal);
+        for (size_t i = 0; i < 7; ++i) {
+            alpha0.at(i).prepare(internal);
+            alpha1.at(i).prepare(internal);
+        }
+        beta0.prepare(internal);
+        beta1.prepare(internal);
+
+        vk::CommandBuffer command(vk);
+        command.begin(vk);
+        std::vector<vk::Barrier> barriers;
+        barriers.reserve(3 + internal.size());
+        barriers.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, family,
+            transportImage, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+        for (const auto& source : {sources.first.handle(), sources.second.handle()})
+            barriers.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                VK_QUEUE_FAMILY_IGNORED, source, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+        command.insertBarriers(vk, barriers, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        const VkImageBlit blit{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            {{0, 0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1}},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            {{0, 0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1}}};
+        vk.df().CmdBlitImage(command.handle(), transportImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sources.first.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        vk.df().CmdBlitImage(command.handle(), transportImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sources.second.handle(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+
+        std::vector<vk::Barrier> ready;
+        ready.reserve(2 + internal.size());
+        for (const auto& source : {sources.first.handle(), sources.second.handle()})
+            ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, source,
+                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+        for (const auto image : internal)
+            ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0, 0,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
+                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+        ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, family, VK_QUEUE_FAMILY_FOREIGN_EXT,
+            transportImage, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+        command.insertBarriers(vk, ready, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        mipmaps.render(vk, command, 0);
+        for (size_t i = 0; i < 7; ++i) {
+            alpha0.at(6 - i).render(vk, command);
+            alpha1.at(6 - i).render(vk, command, 0);
+        }
+        beta0.render(vk, command, 0);
+        beta1.render(vk, command);
+        command.end(vk);
+        command.submit(vk);
+        std::cerr << "[DG2X-P4C-D0] Runtime mode: CAPTURE_ONLY\n"
+            << "  Transport B reacquire FOREIGN: PASS\n"
+            << "  Backend input image creation: PASS\n"
+            << "  B8 -> R8 GPU blit: PASS\n"
+            << "  Source 0 seeded: PASS\n  Source 1 seeded: PASS\n"
+            << "  LSFG mipmaps: SCHEDULED\n  LSFG Alpha0/Alpha1: SCHEDULED\n"
+            << "  LSFG Beta0/Beta1: SCHEDULED\n  Generated frame count: 0\n"
+            << "  Generate shader: NOT RUN\n  Destination images: NONE\n"
+            << "  Backend submit: PASS\n  Backend fence completion: PASS\n"
+            << "  CPU frame bridge: NONE\n"
+            << "  Host wait before P4C-D0: YES (DIAGNOSTIC ONLY)\n"
+            << "  LSFG backend execution: PREPASS_ONLY\n  Generated frame: NONE\n"
+            << "  Presentation from B: NONE\n  Frame transport connected: INPUT_ONLY\n"
+            << "DG2X_P4C_D0_LSFG_PREPASS_B_PASS\n";
+    } catch (const std::exception& e) {
+        throw backend::error("Unable to execute P4C-D0 LSFG prepass", e);
+    }
 }
 
 vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {

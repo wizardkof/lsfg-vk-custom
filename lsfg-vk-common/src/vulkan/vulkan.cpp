@@ -417,8 +417,8 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
             "vkGetPhysicalDeviceMemoryProperties"),
         .CreateDevice = ipa<PFN_vkCreateDevice>(mpa, i, "vkCreateDevice"),
         .GetDeviceProcAddr = ipa<PFN_vkGetDeviceProcAddr>(mpa, i, "vkGetDeviceProcAddr"),
-        .GetPhysicalDeviceImageFormatProperties2 = graphical ? imageFormatProperties2 : nullptr,
-        .GetPhysicalDeviceFormatProperties2 = graphical ? formatProperties2 : nullptr,
+        .GetPhysicalDeviceImageFormatProperties2 = imageFormatProperties2,
+        .GetPhysicalDeviceFormatProperties2 = formatProperties2,
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,

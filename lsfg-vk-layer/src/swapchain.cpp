@@ -437,6 +437,10 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             vk::RuntimeImageEndpoint::executeRealFrameTransport(
                 this->frameTransportA, this->frameTransportB, sourceImage,
                 this->info.extent, semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
+            this->instance.get().validateRuntimePrepass(
+                this->frameTransportB.image(), this->info.extent,
+                VK_FORMAT_B8G8R8A8_UNORM, this->frameTransportBacking.modifier(),
+                1.0F / this->profile.flow_scale, this->profile.performance_mode);
             this->captureRealFrameOnce(vk, sourceImage, imageIdx, {});
             std::cerr << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
                 << "cross-device capture hook reached, but real frame transport is not connected yet\n";

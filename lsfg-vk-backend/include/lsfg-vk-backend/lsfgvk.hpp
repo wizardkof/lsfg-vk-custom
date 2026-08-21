@@ -84,6 +84,12 @@ namespace lsfgvk::backend {
         /// Handles remain owned by backend::Instance.
         [[nodiscard]] vk::RuntimeExchangeEndpoint runtimeExchangeEndpoint() const;
 
+        /// Run the real LSFG prepass against one frame already resident on the
+        /// backend device. This is a diagnostic-only, zero-generation path.
+        void validateRuntimePrepass(VkImage transportImage, VkExtent2D extent,
+            VkFormat transportFormat, uint64_t transportModifier,
+            float flow, bool perf);
+
         ///
         /// Open a frame generation context.
         ///
