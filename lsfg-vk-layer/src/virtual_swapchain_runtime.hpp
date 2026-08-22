@@ -8,6 +8,7 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "virtual_swapchain_image_spec.hpp"
 #include "virtual_swapchain_state.hpp"
+#include "graphics_final_queue.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -37,7 +38,11 @@ namespace lsfgvk::layer {
             VkSemaphore readySemaphore,
             void* nextChain,
             std::stop_token stopToken,
-            std::chrono::steady_clock::time_point sourcePresentTime)>;
+            std::chrono::steady_clock::time_point sourcePresentTime,
+            bool d3bSingleSwapchainEligible,
+            const GraphicsFinalQueueInfo& graphicsFinalQueue,
+            BorrowedGraphicsQueueLease& lease,
+            bool& stopAfterCompletion)>;
 
         VirtualSwapchainRuntime(const vk::Vulkan& vk,
             VkQueue offloadQueue,
@@ -61,6 +66,10 @@ namespace lsfgvk::layer {
         /// is true, this call waits for the worker result so nextChain remains
         /// valid for the full presentation operation.
         [[nodiscard]] VkResult queuePresent(VkQueue sourceQueue,
+            uint32_t sourceQueueFamily,
+            uint32_t sourceQueueIndex,
+            VkQueueFlags sourceQueueFlags,
+            bool surfacePresentSupported,
             uint32_t imageIndex,
             const std::vector<VkSemaphore>& waitSemaphores,
             void* nextChain,
@@ -89,6 +98,9 @@ namespace lsfgvk::layer {
             void* nextChain{};
             std::chrono::steady_clock::time_point sourcePresentTime;
             std::shared_ptr<Completion> completion;
+            GraphicsFinalQueueInfo graphicsFinalQueue;
+            std::shared_ptr<BorrowedGraphicsQueueLease> borrowedLease;
+            bool d3bSingleSwapchainEligible{};
         };
 
         [[nodiscard]] VkResult signalAcquire(VkSemaphore semaphore, VkFence fence) const noexcept;

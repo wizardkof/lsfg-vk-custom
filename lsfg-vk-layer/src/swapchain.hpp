@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "d3b1_present_path.hpp"
+
 #include "fixed_frame_scheduler.hpp"
 #include "fixed_output_pacer.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
@@ -16,10 +18,13 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "runtime_dma_buf_backing.hpp"
 #include "generated_output_return_diagnostic.hpp"
+#include "graphics_final_queue.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
 #include <chrono>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -31,6 +36,18 @@
 #include <vulkan/vulkan_core.h>
 
 namespace lsfgvk::layer {
+
+    [[nodiscard]] inline bool d3b1PresentationDiagnosticEnabled() noexcept {
+        const char* value = std::getenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC");
+        return value && std::strcmp(value, "1") == 0;
+    }
+
+    [[nodiscard]] constexpr bool captureDiagnosticFormatSupported(VkFormat format) noexcept {
+        return format == VK_FORMAT_B8G8R8A8_UNORM
+            || format == VK_FORMAT_R8G8B8A8_UNORM
+            || format == VK_FORMAT_A2R10G10B10_UNORM_PACK32
+            || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    }
 
     enum class CrossDeviceRuntimeMode : uint8_t {
         BLOCKED,
@@ -51,6 +68,7 @@ namespace lsfgvk::layer {
         VkImageUsageFlags usage{};
         VkSharingMode sharingMode{VK_SHARING_MODE_EXCLUSIVE};
         std::vector<uint32_t> queueFamilyIndices;
+        std::vector<uint32_t> surfacePresentFamilies;
         bool surfaceSupportsTransferSrc{};
         // Present mode currently selected by the internal context.
         VkPresentModeKHR presentMode;
@@ -86,7 +104,8 @@ namespace lsfgvk::layer {
         /// @param info swapchain info
         Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             vk::RuntimeDevicePair devicePair,
-            ls::GameConf profile, SwapchainInfo info);
+            ls::GameConf profile, SwapchainInfo info,
+            uint32_t offloadQueueFamily = VK_QUEUE_FAMILY_IGNORED);
 
         /// Runtime render/generation role binding captured for this swapchain.
         /// P3C exposes identity/ownership only; transport is connected later.
@@ -107,7 +126,11 @@ namespace lsfgvk::layer {
             void* next_chain, uint32_t imageIdx,
             const std::vector<VkSemaphore>& semaphores,
             std::stop_token stopToken = {},
-            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt);
+            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt,
+            bool d3bSingleSwapchainEligible = false,
+            const GraphicsFinalQueueInfo* graphicsFinalQueue = nullptr,
+            BorrowedGraphicsQueueLease* graphicsLease = nullptr,
+            bool* stopAfterCompletion = nullptr);
     private:
         std::vector<vk::Image> sourceImages;
         std::vector<vk::Image> destinationImages;
@@ -124,7 +147,9 @@ namespace lsfgvk::layer {
 
         // Final real-frame copy resources used only when the application renders
         // into virtual swapchain images.
+        ls::owned_ptr<VkCommandPool> virtualFinalCommandPool;
         ls::lazy<vk::CommandBuffer> virtualFinalCommandBuffer;
+        uint32_t virtualFinalCommandFamily{VK_QUEUE_FAMILY_IGNORED};
         ls::lazy<vk::Semaphore> virtualFinalAcquireSemaphore;
         ls::lazy<vk::Semaphore> virtualFinalPresentSemaphore;
 
@@ -145,11 +170,16 @@ namespace lsfgvk::layer {
         vk::RuntimeImageEndpoint frameTransportA;
         vk::RuntimeImageEndpoint frameTransportB;
         bool frameTransportReady{};
+        uint32_t offloadQueueFamily{VK_QUEUE_FAMILY_IGNORED};
         ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;
         ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>
             runtimeGenerateDiagnosticSession;
         std::unique_ptr<GeneratedOutputReturnDiagnosticSession>
             generatedOutputReturnDiagnosticSession;
+        std::optional<vk::Semaphore> returnedForGraphics;
+        D3B1PresentationState d3b1State{D3B1PresentationState::IDLE};
+
+        void ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family);
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);

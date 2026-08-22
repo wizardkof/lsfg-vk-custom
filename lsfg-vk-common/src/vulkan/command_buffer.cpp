@@ -21,12 +21,13 @@ using namespace vk;
 
 namespace {
     /// create a command buffer
-    ls::owned_ptr<VkCommandBuffer> createCommandBuffer(const vk::Vulkan& vk) {
+    ls::owned_ptr<VkCommandBuffer> createCommandBuffer(const vk::Vulkan& vk,
+            VkCommandPool pool) {
         VkCommandBuffer handle{};
 
         const VkCommandBufferAllocateInfo commandBufferInfo{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = vk.cmdpool(),
+            .commandPool = pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1
         };
@@ -43,7 +44,7 @@ namespace {
 
         return ls::owned_ptr<VkCommandBuffer>(
             new VkCommandBuffer(handle),
-            [dev = vk.dev(), pool = vk.cmdpool(), defunc = vk.df().FreeCommandBuffers](
+            [dev = vk.dev(), pool, defunc = vk.df().FreeCommandBuffers](
                 VkCommandBuffer& commandBufferModule
             ) {
                 defunc(dev, pool, 1, &commandBufferModule);
@@ -53,7 +54,10 @@ namespace {
 }
 
 CommandBuffer::CommandBuffer(const vk::Vulkan& vk)
-        : commandBuffer(createCommandBuffer(vk)) {}
+        : commandBuffer(createCommandBuffer(vk, vk.cmdpool())) {}
+
+CommandBuffer::CommandBuffer(const vk::Vulkan& vk, VkCommandPool pool)
+        : commandBuffer(createCommandBuffer(vk, pool)) {}
 
 void CommandBuffer::begin(const vk::Vulkan& vk) const {
     const VkCommandBufferBeginInfo beginInfo = {
@@ -108,6 +112,14 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         const std::vector<vk::Barrier>& preBarriers,
         std::pair<VkImage, VkImage> images, VkExtent2D extent,
         const std::vector<vk::Barrier>& postBarriers) const {
+    blitImage(vk, preBarriers, images, {extent, extent}, postBarriers);
+}
+
+void CommandBuffer::blitImage(const vk::Vulkan& vk,
+        const std::vector<vk::Barrier>& preBarriers,
+        std::pair<VkImage, VkImage> images,
+        std::pair<VkExtent2D, VkExtent2D> extents,
+        const std::vector<vk::Barrier>& postBarriers) const {
     vk.df().CmdPipelineBarrier(*this->commandBuffer,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0,
@@ -123,8 +135,8 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         },
         .srcOffsets = {
             { 0, 0, 0 },
-            { static_cast<int32_t>(extent.width),
-              static_cast<int32_t>(extent.height), 1 }
+            { static_cast<int32_t>(extents.first.width),
+              static_cast<int32_t>(extents.first.height), 1 }
         },
         .dstSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -132,8 +144,8 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         },
         .dstOffsets = {
             { 0, 0, 0 },
-            { static_cast<int32_t>(extent.width),
-              static_cast<int32_t>(extent.height), 1 }
+            { static_cast<int32_t>(extents.second.width),
+              static_cast<int32_t>(extents.second.height), 1 }
         }
     };
     vk.df().CmdBlitImage(*this->commandBuffer,

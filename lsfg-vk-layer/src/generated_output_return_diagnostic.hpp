@@ -98,18 +98,27 @@ namespace lsfgvk::layer {
             backend::RuntimeGenerateDiagnosticPending&&,
             backend::Instance&, backend::RuntimeGenerateDiagnosticSession&,
             const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
-            vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly);
+            vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly,
+            std::optional<vk::RuntimeForeignImageHandoffInfo> handoff = std::nullopt);
         GeneratedOutputReturnDiagnosticSession(const GeneratedOutputReturnDiagnosticSession&) = delete;
         GeneratedOutputReturnDiagnosticSession& operator=(const GeneratedOutputReturnDiagnosticSession&) = delete;
         ~GeneratedOutputReturnDiagnosticSession();
         [[nodiscard]] GeneratedOutputReturnState state() const noexcept { return states.state(); }
         [[nodiscard]] bool passed() const noexcept { return states.markerReady(); }
         [[nodiscard]] bool gpuChainedPassed() const noexcept { return chainedStates.markerReady(); }
+        [[nodiscard]] bool presentationHandoffPending() const noexcept {
+            return aReadbackPending.valid();
+        }
+        [[nodiscard]] vk::RuntimeForeignImageView returnedImageView() const noexcept {
+            return aReadbackPending.imageView();
+        }
+        void completePresentationDiagnostics();
     private:
         void advance(GeneratedOutputReturnState expected, GeneratedOutputReturnState next);
         void execute(backend::RuntimeGenerateDiagnosticResult&&);
         void executeGpuChained(backend::RuntimeGenerateDiagnosticPending&&,
-            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&,
+            std::optional<vk::RuntimeForeignImageHandoffInfo>);
         [[nodiscard]] std::vector<uint8_t> transportGeneratedImage(
             VkImage sourceImage, VkExtent2D extent, VkFormat format,
             VkSemaphore generationReady, bool chained);
@@ -126,5 +135,10 @@ namespace lsfgvk::layer {
         GeneratedOutputIntegrity authoritative{};
         bool bSubmitted{};
         bool aCompleted{};
+        vk::RuntimeForeignImageReadbackPending aReadbackPending;
+        backend::RuntimeGenerateDiagnosticPending delayedGeneration;
+        backend::Instance* delayedBackend{};
+        backend::RuntimeGenerateDiagnosticSession* delayedBackendSession{};
+        GeneratedOutputIntegrity expected{};
     };
 }

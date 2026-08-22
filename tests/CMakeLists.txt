@@ -71,6 +71,30 @@ target_link_libraries(lsfg-vk-test-generated-output-return-diagnostic PRIVATE
 add_test(NAME lsfg-vk-test-generated-output-return-diagnostic
     COMMAND lsfg-vk-test-generated-output-return-diagnostic)
 
+add_executable(lsfg-vk-test-runtime-foreign-handoff
+    runtime_foreign_handoff_test.cpp)
+target_compile_options(lsfg-vk-test-runtime-foreign-handoff PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-runtime-foreign-handoff PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-runtime-foreign-handoff
+    COMMAND lsfg-vk-test-runtime-foreign-handoff)
+
+lsfgvk_add_layer_unit_test(
+    lsfg-vk-test-d3b1-present-path
+    d3b1_present_path_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b1_present_path.cpp")
+target_include_directories(lsfg-vk-test-d3b1-present-path PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_link_libraries(lsfg-vk-test-d3b1-present-path PRIVATE lsfg-vk-common)
+
+add_executable(lsfg-vk-test-graphics-final-queue graphics_final_queue_test.cpp)
+target_include_directories(lsfg-vk-test-graphics-final-queue PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-graphics-final-queue PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-graphics-final-queue
+    COMMAND lsfg-vk-test-graphics-final-queue)
+
 add_executable(lsfg-vk-test-config-frame-generation-mode
     config_frame_generation_mode_test.cpp)
 

@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "virtual_swapchain_runtime.hpp"
+#include "d3b1_present_path.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
@@ -164,6 +166,10 @@ VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
 }
 
 VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
+        uint32_t sourceQueueFamily,
+        uint32_t sourceQueueIndex,
+        VkQueueFlags sourceQueueFlags,
+        bool surfacePresentSupported,
         uint32_t imageIndex,
         const std::vector<VkSemaphore>& waitSemaphores,
         void* nextChain,
@@ -178,13 +184,33 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
         return pending;
 
     const auto serial = this->presentSerial.fetch_add(1);
-    auto completion = synchronous ? std::make_shared<Completion>() : nullptr;
+    const bool d3bSingleSwapchainEligible = !synchronous;
+    // A borrowed application queue is valid only while the intercepted public
+    // present remains open. Every borrowed graphics-final operation is thus
+    // synchronous, including ordinary virtual-final blits.
+    const bool borrowedSynchronous = true;
+    const GraphicsFinalQueueInfo graphicsFinalQueue{
+        .queue = sourceQueue,
+        .family = sourceQueueFamily,
+        .index = sourceQueueIndex,
+        .flags = sourceQueueFlags,
+        .surfacePresentSupported = surfacePresentSupported,
+        .borrowed = true};
+    if (graphicsFinalExecutionMode(graphicsFinalQueue, borrowedSynchronous)
+            != GraphicsFinalExecutionMode::BORROWED_SYNCHRONOUS)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    auto completion = std::make_shared<Completion>();
+    auto lease = std::make_shared<BorrowedGraphicsQueueLease>(
+        sourceQueue, sourceQueueFamily, sourceQueueIndex, serial);
     {
         const std::scoped_lock lock(this->jobsMutex);
         this->jobs.emplace(serial, Job {
             .nextChain = nextChain,
             .sourcePresentTime = std::chrono::steady_clock::now(),
-            .completion = completion
+            .completion = completion,
+            .graphicsFinalQueue = graphicsFinalQueue,
+            .borrowedLease = lease,
+            .d3bSingleSwapchainEligible = d3bSingleSwapchainEligible
         });
     }
 
@@ -199,6 +225,7 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
             this->jobs.erase(serial);
         }
         (void)this->state.release(imageIndex);
+        (void)lease->release();
         return bridge;
     }
 
@@ -210,12 +237,10 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
         this->asyncResult.store(VK_ERROR_OUT_OF_DATE_KHR);
         this->stopping.store(true);
         this->state.stop();
+        (void)lease->release();
         this->finishCompletion(completion, VK_ERROR_OUT_OF_DATE_KHR);
         return VK_ERROR_OUT_OF_DATE_KHR;
     }
-
-    if (!completion)
-        return pending == VK_SUBOPTIMAL_KHR ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
 
     std::unique_lock lock(completion->mutex);
     completion->cv.wait(lock, [&]() {
@@ -264,13 +289,22 @@ void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
         }
 
         VkResult result{VK_ERROR_UNKNOWN};
+        bool stopAfterCompletion{};
         try {
+            if (!job.borrowedLease
+                    || !job.borrowedLease->validFor(
+                        job.graphicsFinalQueue.queue, job.graphicsFinalQueue.family))
+                throw ls::error("borrowed graphics queue lease is not active");
             result = this->presenter(
                 present->imageIndex,
                 this->readySemaphores.at(present->imageIndex).handle(),
                 job.nextChain,
                 stopToken,
-                job.sourcePresentTime);
+                job.sourcePresentTime,
+                job.d3bSingleSwapchainEligible,
+                job.graphicsFinalQueue,
+                *job.borrowedLease,
+                stopAfterCompletion);
         } catch (...) {
             result = VK_ERROR_UNKNOWN;
         }
@@ -285,7 +319,16 @@ void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
             this->state.stop();
         }
 
+        if (!job.borrowedLease || !job.borrowedLease->release())
+            result = VK_ERROR_UNKNOWN;
         this->finishCompletion(job.completion, result);
+        if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+                && stopAfterCompletion) {
+            this->stopping.store(true);
+            this->state.stop();
+            this->failPending(VK_ERROR_OUT_OF_DATE_KHR);
+            break;
+        }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
             break;
     }

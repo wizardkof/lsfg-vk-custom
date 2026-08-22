@@ -26,6 +26,9 @@ namespace vk {
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
         CommandBuffer(const vk::Vulkan& vk);
+        /// Create a primary command buffer from an explicitly selected pool.
+        /// The pool must belong to the queue family where the buffer is submitted.
+        CommandBuffer(const vk::Vulkan& vk, VkCommandPool pool);
 
         /// begin recording commands
         /// @param vk the vulkan instance
@@ -42,6 +45,11 @@ namespace vk {
         void blitImage(const vk::Vulkan& vk,
             const std::vector<vk::Barrier>& preBarriers,
             std::pair<VkImage, VkImage> images, VkExtent2D extent,
+            const std::vector<vk::Barrier>& postBarriers) const;
+        void blitImage(const vk::Vulkan& vk,
+            const std::vector<vk::Barrier>& preBarriers,
+            std::pair<VkImage, VkImage> images,
+            std::pair<VkExtent2D, VkExtent2D> extents,
             const std::vector<vk::Barrier>& postBarriers) const;
 
         /// insert a bunch of barriers

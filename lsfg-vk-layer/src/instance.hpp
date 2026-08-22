@@ -112,7 +112,11 @@ namespace lsfgvk::layer {
             VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
             const std::vector<VkSemaphore>& semaphores,
             std::stop_token stopToken = {},
-            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt);
+            std::optional<std::chrono::steady_clock::time_point> sourcePresentTime = std::nullopt,
+            bool d3bSingleSwapchainEligible = false,
+            const GraphicsFinalQueueInfo* graphicsFinalQueue = nullptr,
+            BorrowedGraphicsQueueLease* graphicsLease = nullptr,
+            bool* stopAfterCompletion = nullptr);
         /// atomically replace a swapchain context after a configuration reload
         /// @param snapshot immutable configuration for this reload
         void recreateSwapchainContext(const ConfigSnapshot& snapshot,

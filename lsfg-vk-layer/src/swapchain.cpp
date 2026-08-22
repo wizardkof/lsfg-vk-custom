@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -100,6 +101,23 @@ namespace {
             srcQueueFamilyIndex, dstQueueFamilyIndex, range);
     }
 
+    bool modifierSupportsBlitSource(const vk::Vulkan& vk, VkFormat format,
+            uint64_t modifier) {
+        VkDrmFormatModifierPropertiesListEXT list{
+            VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
+        VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &list};
+        vk.fi().GetPhysicalDeviceFormatProperties2(vk.physdev(), format, &properties);
+        std::vector<VkDrmFormatModifierPropertiesEXT> modifiers(
+            list.drmFormatModifierCount);
+        list.pDrmFormatModifierProperties = modifiers.data();
+        vk.fi().GetPhysicalDeviceFormatProperties2(vk.physdev(), format, &properties);
+        return std::ranges::any_of(modifiers, [modifier](const auto& item) {
+            return item.drmFormatModifier == modifier
+                && (item.drmFormatModifierTilingFeatures
+                    & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
+        });
+    }
+
     VkResult acquireRealSwapchainImage(const vk::Vulkan& vk,
             VkSwapchainKHR swapchain, VkSemaphore semaphore,
             uint32_t* imageIndex, std::stop_token stopToken) {
@@ -122,8 +140,7 @@ namespace {
 
 void Swapchain::captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
         uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores) {
-    if (this->info.format != VK_FORMAT_A2R10G10B10_UNORM_PACK32
-            && this->info.format != VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+    if (!captureDiagnosticFormatSupported(this->info.format))
         throw ls::error("P4C-B unsupported capture source format");
     const VkDeviceSize byteSize = static_cast<VkDeviceSize>(this->info.extent.width)
         * this->info.extent.height * 4;
@@ -270,22 +287,22 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
 
 Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             vk::RuntimeDevicePair devicePair,
-            ls::GameConf profile, SwapchainInfo info) :
+            ls::GameConf profile, SwapchainInfo info,
+            uint32_t offloadQueueFamily) :
         instance(backend),
         devicePair(std::move(devicePair)),
         fixedScheduler(profile.target_fps),
         fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
+    this->offloadQueueFamily = offloadQueueFamily;
     if (this->devicePair.crossDevice())
         this->crossDeviceMode = CrossDeviceRuntimeMode::CAPTURE_ONLY;
 
     // A virtual Adaptive 1x swapchain still needs the final virtual->real copy
     // resources even though it must not create an LSFG generation context.
     if (this->info.virtualized) {
-        this->virtualFinalCommandBuffer.emplace(vk);
-        this->virtualFinalAcquireSemaphore.emplace(vk);
-        this->virtualFinalPresentSemaphore.emplace(vk);
-        this->renderFence.emplace(vk);
+        if (offloadQueueFamily == VK_QUEUE_FAMILY_IGNORED)
+            throw ls::error("virtual presentation requires an auxiliary queue family");
     }
 
     // P4C-B0 deliberately exposes only the application-side capture boundary.
@@ -399,13 +416,82 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     }
 }
 
+void Swapchain::ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family) {
+    if (family == VK_QUEUE_FAMILY_IGNORED)
+        throw ls::error("graphics-final queue family is unavailable");
+    if (this->virtualFinalCommandBuffer.has_value()) {
+        if (this->virtualFinalCommandFamily != family)
+            throw ls::error("graphics-final command resources changed queue family");
+        return;
+    }
+    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = family;
+    VkCommandPool pool{};
+    const auto result = vk.df().CreateCommandPool(vk.dev(), &poolInfo, nullptr, &pool);
+    if (result != VK_SUCCESS)
+        throw ls::vulkan_error(result, "graphics-final command pool creation failed");
+    this->virtualFinalCommandPool = ls::owned_ptr<VkCommandPool>(
+        new VkCommandPool(pool),
+        [dev = vk.dev(), destroy = vk.df().DestroyCommandPool](VkCommandPool& value) {
+            destroy(dev, value, nullptr);
+        });
+    this->virtualFinalCommandFamily = family;
+    this->virtualFinalCommandBuffer.emplace(vk, pool);
+    this->virtualFinalAcquireSemaphore.emplace(vk);
+    this->virtualFinalPresentSemaphore.emplace(vk);
+    if (!this->renderFence.has_value()) {
+      this->renderFence.emplace(vk);
+    }
+}
+
 VkResult Swapchain::present(const vk::Vulkan& vk,
         VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
         VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores,
         std::stop_token stopToken,
-        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
+        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime,
+        bool d3bSingleSwapchainEligible,
+        const GraphicsFinalQueueInfo* graphicsFinalQueue,
+        BorrowedGraphicsQueueLease* graphicsLease,
+        bool* stopAfterCompletion) {
+    if (this->info.virtualized) {
+        if (!graphicsFinalQueue || !graphicsLease
+                || graphicsFinalExecutionMode(*graphicsFinalQueue, true)
+                    != GraphicsFinalExecutionMode::BORROWED_SYNCHRONOUS
+                || !graphicsLease->validFor(
+                    graphicsFinalQueue->queue, graphicsFinalQueue->family)
+                || queue != graphicsFinalQueue->queue)
+            throw ls::error("borrowed graphics-final queue contract is unavailable");
+        this->ensureGraphicsFinalResources(vk, graphicsFinalQueue->family);
+    }
+    if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY
+            && this->d3b1State == D3B1PresentationState::PASS) {
+        if (semaphores.size() != 1 || queue == VK_NULL_HANDLE || !queueMutex)
+            throw ls::error("D3B1 terminal ready-semaphore drain is unavailable");
+        constexpr VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        const VkSubmitInfo drain{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = semaphores.data(),
+            .pWaitDstStageMask = &waitStage};
+        if (!this->renderFence.has_value())
+            throw ls::error("D3B1 terminal drain fence is unavailable");
+        this->renderFence->reset(vk);
+        VkResult result{};
+        {
+            const std::scoped_lock queueLock(*queueMutex);
+            result = vk.df().QueueSubmit(
+                queue, 1, &drain, this->renderFence->handle());
+        }
+        if (result != VK_SUCCESS)
+            throw ls::vulkan_error(result, "D3B1 terminal ready-semaphore drain failed");
+        if (!this->renderFence->wait(vk, UINT64_MAX))
+            throw ls::vulkan_error(VK_TIMEOUT,
+                "D3B1 terminal ready-semaphore drain did not retire");
+        return VK_SUCCESS;
+    }
     if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY) {
         if (this->captureOnlyPhase == 0) {
             const auto sourceImage = this->info.images.at(imageIdx);
@@ -490,18 +576,140 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 this->runtimeGenerateDiagnosticSession.get(), this->frameTransportB.image(),
                 std::move(payload));
             if (generated) {
-                this->generatedOutputReturnDiagnosticSession =
-                    std::make_unique<GeneratedOutputReturnDiagnosticSession>(
-                        std::move(*generated), this->instance.get(),
-                        this->runtimeGenerateDiagnosticSession.get(), this->devicePair,
-                        this->instance.get().runtimeExchangeEndpoint(),
-                        vk::makeRuntimeExchangeEndpoint(vk), true);
+                const bool d3bResourcesReady = queue != VK_NULL_HANDLE && queueMutex
+                    && graphicsFinalQueue
+                    && graphicsFinalQueue->family != VK_QUEUE_FAMILY_IGNORED
+                    && this->virtualFinalCommandBuffer.has_value()
+                    && this->virtualFinalAcquireSemaphore.has_value()
+                    && this->virtualFinalPresentSemaphore.has_value()
+                    && this->renderFence.has_value() && !this->info.realImages.empty();
+                const bool d3b = d3b1PresentEligible(d3b1PresentationDiagnosticEnabled(),
+                    d3bSingleSwapchainEligible, next_chain != nullptr,
+                    this->info.virtualized, d3bResourcesReady, this->d3b1State);
+                std::optional<vk::RuntimeForeignImageHandoffInfo> handoff;
+                if (d3b) {
+                    try { this->returnedForGraphics.emplace(vk); }
+                    catch (...) {
+                        this->d3b1State = D3B1PresentationState::FAILED;
+                        throw;
+                    }
+                    handoff = vk::RuntimeForeignImageHandoffInfo{
+                        .destinationQueueFamilyIndex = graphicsFinalQueue->family,
+                        .signalSemaphore = this->returnedForGraphics->handle()};
+                }
+                try {
+                    this->generatedOutputReturnDiagnosticSession =
+                        std::make_unique<GeneratedOutputReturnDiagnosticSession>(
+                            std::move(*generated), this->instance.get(),
+                            this->runtimeGenerateDiagnosticSession.get(), this->devicePair,
+                            this->instance.get().runtimeExchangeEndpoint(),
+                            vk::makeRuntimeExchangeEndpoint(vk), true, handoff);
+                } catch (...) {
+                    if (d3b) {
+                        this->d3b1State = D3B1PresentationState::FAILED;
+                        this->returnedForGraphics.reset();
+                    }
+                    throw;
+                }
+                if (d3b) {
+                    this->d3b1State = D3B1PresentationState::A_HANDOFF_SUBMITTED;
+                    const auto view = this->generatedOutputReturnDiagnosticSession
+                        ->returnedImageView();
+                    VkFormatProperties2 destinationProperties{
+                        VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+                    vk.fi().GetPhysicalDeviceFormatProperties2(
+                        vk.physdev(), this->info.format, &destinationProperties);
+                    D3B1PresentPath presentPath{
+                        .source = {
+                            .image = view.image(), .format = view.format(),
+                            .extent = view.extent(), .layout = view.layout(),
+                            .modifier = view.modifier(),
+                            .sourceQueueFamily = view.sourceQueueFamily(),
+                            .destinationQueueFamily = view.destinationQueueFamily(),
+                            .ownershipAcquireRequired = view.handoffPendingAcquire()},
+                        .hiddenAcquire = this->virtualFinalAcquireSemaphore->handle(),
+                        .returnedForPresent = this->returnedForGraphics->handle(),
+                        .finalPresentSemaphore = this->virtualFinalPresentSemaphore->handle(),
+                        .renderFence = this->renderFence->handle(),
+                        .commandPoolFamily = this->virtualFinalCommandFamily,
+                        .submitQueueFamily = graphicsFinalQueue->family,
+                        .submitQueueFlags = graphicsFinalQueue->flags,
+                        .sourceBlitSupported = view.valid()
+                            && view.destinationQueueFamily() == graphicsFinalQueue->family
+                            && modifierSupportsBlitSource(vk, view.format(), view.modifier()),
+                        .destinationBlitSupported =
+                            (destinationProperties.formatProperties.optimalTilingFeatures
+                                & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
+                        .state = &this->d3b1State};
+                    presentPath.acquireHidden = [&] {
+                        uint32_t index{};
+                        const auto result = acquireRealSwapchainImage(vk, swapchain,
+                            this->virtualFinalAcquireSemaphore->handle(), &index, stopToken);
+                        if (result != VK_SUCCESS)
+                            throw ls::vulkan_error(result, "D3B1 hidden WSI acquire failed");
+                        return D3B1HiddenImage{
+                            this->info.realImages.at(index), index, this->info.extent};
+                    };
+                    presentPath.recordBlit = [&](const auto& pre, VkImage source,
+                            VkImage destination, VkExtent2D sourceExtent,
+                            VkExtent2D destinationExtent, const auto& post) {
+                        const auto& finalCommand = *this->virtualFinalCommandBuffer;
+                        finalCommand.begin(vk);
+                        finalCommand.blitImage(vk, pre, {source, destination},
+                            {sourceExtent, destinationExtent}, post);
+                        finalCommand.end(vk);
+                        this->renderFence->reset(vk);
+                    };
+                    presentPath.submitAndPresent = [&](const auto& waits, const auto&,
+                            VkSemaphore signal, VkFence fence, uint32_t index) {
+                        const VkPresentInfoKHR info{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                            .waitSemaphoreCount = 1, .pWaitSemaphores = &signal,
+                            .swapchainCount = 1, .pSwapchains = &swapchain,
+                            .pImageIndices = &index};
+                        const std::scoped_lock queueLock(*queueMutex);
+                        this->virtualFinalCommandBuffer->submit(vk, queue, waits,
+                            VK_NULL_HANDLE, 0, {signal}, VK_NULL_HANDLE, 0, fence,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const auto presentResult = vk.df().QueuePresentKHR(queue, &info);
+                        return D3B1SubmitPresentResult{presentResult, true};
+                    };
+                    presentPath.waitRenderFence = [&] {
+                        const auto result = this->renderFence->wait(vk, UINT64_MAX);
+                        return result;
+                    };
+                    presentPath.completeDiagnostics = [&] {
+                        this->generatedOutputReturnDiagnosticSession
+                            ->completePresentationDiagnostics();
+                        const auto result = this->generatedOutputReturnDiagnosticSession
+                            ->gpuChainedPassed();
+                        return result;
+                    };
+                    presentPath.retire = [&] {
+                        this->generatedOutputReturnDiagnosticSession.reset();
+                        this->returnedForGraphics.reset();
+                    };
+                    presentPath.emitMarker = [] {
+                        std::cerr << "DG2X_P4C_D3B1_RETURNED_GENERATED_FRAME_PRESENT_PASS\n";
+                    };
+                    const auto result = executeD3B1PresentPath(presentPath);
+                    this->captureOnlyPhase = 6;
+                    if (stopAfterCompletion
+                            && d3b1StopAfterTerminalPass(
+                                d3b1OneShotRequested(std::getenv("LSFGVK_D3B1_ONESHOT")),
+                                this->d3b1State)) {
+                        *stopAfterCompletion = true;
+                        std::cerr << "[D3B1-ONESHOT] terminal PASS; worker stop requested\n";
+                    }
+                    return result;
+                }
             }
             this->captureOnlyPhase++;
             if (this->captureOnlyPhase <= 5) return VK_SUCCESS;
         }
         throw ls::error(
-            "cross-device generated-frame diagnostic completed; output transport remains disconnected");
+            d3b1PresentationDiagnosticEnabled()
+                ? "D3B1_ASYNC_PRESENTATION_NOT_YET_CONNECTED"
+                : "cross-device generated-frame diagnostic completed; output transport remains disconnected");
     }
     const bool adaptiveBypass = isAdaptiveBypass(this->profile);
 

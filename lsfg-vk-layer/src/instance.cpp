@@ -688,7 +688,9 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
     }
 
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info));
+        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info,
+            exchangeQueue.has_value() ? exchangeQueue->familyIndex
+                : VK_QUEUE_FAMILY_IGNORED));
 }
 
 VkResult Root::presentSwapchain(const vk::Vulkan& vk,
@@ -696,14 +698,20 @@ VkResult Root::presentSwapchain(const vk::Vulkan& vk,
         VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
         const std::vector<VkSemaphore>& semaphores,
         std::stop_token stopToken,
-        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime) {
+        std::optional<std::chrono::steady_clock::time_point> sourcePresentTime,
+        bool d3bSingleSwapchainEligible,
+        const GraphicsFinalQueueInfo* graphicsFinalQueue,
+        BorrowedGraphicsQueueLease* graphicsLease,
+        bool* stopAfterCompletion) {
     const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     const auto it = this->swapchains.find(swapchain);
     if (it == this->swapchains.end())
         throw ls::error("swapchain context not found");
 
     return it->second.present(vk, queue, std::move(queueMutex), swapchain,
-        nextChain, imageIndex, semaphores, std::move(stopToken), sourcePresentTime);
+        nextChain, imageIndex, semaphores, std::move(stopToken), sourcePresentTime,
+        d3bSingleSwapchainEligible, graphicsFinalQueue, graphicsLease,
+        stopAfterCompletion);
 }
 
 void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
@@ -735,7 +743,9 @@ void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
 
     this->swapchains.erase(swapchain);
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info));
+        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info,
+            exchangeQueue.has_value() ? exchangeQueue->familyIndex
+                : VK_QUEUE_FAMILY_IGNORED));
 }
 
 void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {

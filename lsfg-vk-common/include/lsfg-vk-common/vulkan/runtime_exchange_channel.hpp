@@ -8,6 +8,8 @@
 #include "external_memory_import.hpp"
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,73 @@
 namespace vk {
 
     class Vulkan;
+    class RuntimeImageEndpoint;
+
+    struct RuntimeForeignImageHandoffInfo {
+        uint32_t destinationQueueFamilyIndex{VK_QUEUE_FAMILY_IGNORED};
+        VkSemaphore signalSemaphore{VK_NULL_HANDLE}; // borrowed; never destroyed here
+    };
+
+    class RuntimeForeignImageReadbackPending;
+
+    class RuntimeForeignImageView {
+    public:
+        [[nodiscard]] bool valid() const noexcept { return imageHandle != VK_NULL_HANDLE && !lifetime.expired(); }
+        [[nodiscard]] VkImage image() const noexcept { return valid() ? imageHandle : VK_NULL_HANDLE; }
+        [[nodiscard]] VkFormat format() const noexcept { return formatValue; }
+        [[nodiscard]] VkExtent2D extent() const noexcept { return extentValue; }
+        [[nodiscard]] VkImageLayout layout() const noexcept { return layoutValue; }
+        [[nodiscard]] uint32_t queueFamily() const noexcept {
+            return handoffPending ? VK_QUEUE_FAMILY_IGNORED : queueFamilyValue;
+        }
+        [[nodiscard]] uint32_t sourceQueueFamily() const noexcept { return sourceQueueFamilyValue; }
+        [[nodiscard]] uint32_t destinationQueueFamily() const noexcept { return destinationQueueFamilyValue; }
+        [[nodiscard]] bool handoffPendingAcquire() const noexcept { return handoffPending; }
+        [[nodiscard]] uint64_t modifier() const noexcept { return modifierValue; }
+    private:
+        friend class RuntimeForeignImageReadbackPending;
+        VkImage imageHandle{};
+        VkFormat formatValue{VK_FORMAT_UNDEFINED};
+        VkExtent2D extentValue{};
+        VkImageLayout layoutValue{VK_IMAGE_LAYOUT_UNDEFINED};
+        uint32_t queueFamilyValue{VK_QUEUE_FAMILY_IGNORED};
+        uint32_t sourceQueueFamilyValue{VK_QUEUE_FAMILY_IGNORED};
+        uint32_t destinationQueueFamilyValue{VK_QUEUE_FAMILY_IGNORED};
+        uint64_t modifierValue{};
+        bool handoffPending{};
+        std::weak_ptr<const uint8_t> lifetime;
+    };
+
+    class RuntimeForeignImageReadbackPending {
+    public:
+        RuntimeForeignImageReadbackPending() noexcept = default;
+        RuntimeForeignImageReadbackPending(const RuntimeForeignImageReadbackPending&) = delete;
+        RuntimeForeignImageReadbackPending& operator=(const RuntimeForeignImageReadbackPending&) = delete;
+        RuntimeForeignImageReadbackPending(RuntimeForeignImageReadbackPending&&) noexcept;
+        RuntimeForeignImageReadbackPending& operator=(RuntimeForeignImageReadbackPending&&) noexcept;
+        ~RuntimeForeignImageReadbackPending();
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] bool completed() const noexcept { return completionConsumed; }
+        [[nodiscard]] RuntimeForeignImageView imageView() const noexcept;
+        [[nodiscard]] bool handoffRequested() const noexcept { return handoffRequestedValue; }
+        [[nodiscard]] bool ownershipReleaseRequired() const noexcept { return releaseRequired; }
+    private:
+        friend class RuntimeImageEndpoint;
+        std::unique_ptr<RuntimeImageEndpoint> owner;
+        SyncFdSemaphore imported;
+        VkFence fence{};
+        std::weak_ptr<const uint8_t> lifetime;
+        bool submitted{};
+        bool completionConsumed{};
+        bool failed{};
+        bool handoffRequestedValue{};
+        bool releaseRequired{};
+        uint32_t sourceQueueFamilyValue{VK_QUEUE_FAMILY_IGNORED};
+        uint32_t destinationQueueFamilyValue{VK_QUEUE_FAMILY_IGNORED};
+        VkSemaphore borrowedSignalSemaphore{VK_NULL_HANDLE};
+        void reset() noexcept;
+        [[nodiscard]] RuntimeImageEndpoint releaseOwner() noexcept;
+    };
 
     /// Minimal logical-device endpoint needed by the P3D cross-device control channel.
     /// Both the application-managed render device and backend-managed generation device
@@ -118,7 +187,14 @@ namespace vk {
             VkExtent2D sourceExtent, VkSemaphore bridgeWait);
         [[nodiscard]] static std::vector<uint8_t> readForeignImage(
             RuntimeImageEndpoint& imageA, SyncFdPayload payload);
+        [[nodiscard]] static RuntimeForeignImageReadbackPending submitForeignImageReadback(
+            RuntimeImageEndpoint&& imageA, SyncFdPayload payload,
+            std::optional<RuntimeForeignImageHandoffInfo> handoff = std::nullopt);
+        [[nodiscard]] static std::vector<uint8_t> completeForeignImageReadback(
+            RuntimeForeignImageReadbackPending& pending);
     private:
+        friend struct RuntimeImageEndpointTestAccess;
+        friend class RuntimeForeignImageReadbackPending;
         friend RuntimeImageEndpoint createRuntimeImageEndpoint(
             const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);
         RuntimeExchangeEndpoint endpoint{};
@@ -135,6 +211,9 @@ namespace vk {
         VkDeviceSize stagingSize{};
         VkFence finalFence{};
         VkExtent2D extent{256, 256};
+        VkFormat format{VK_FORMAT_UNDEFINED};
+        uint64_t modifier{};
+        std::shared_ptr<const uint8_t> lifetime{std::make_shared<const uint8_t>(0)};
     };
 
     [[nodiscard]] RuntimeImageEndpoint createRuntimeImageEndpoint(

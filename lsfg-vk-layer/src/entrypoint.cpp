@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <memory>
@@ -327,7 +328,7 @@ namespace {
         return syncFeatures.internallySynchronizedQueues == VK_TRUE;
     }
 
-    QueueReservation reserveOffloadGraphicsQueue(
+    QueueReservation reserveAuxiliaryTransferQueue(
             VkPhysicalDevice physdev,
             const vk::VulkanInstanceFuncs& funcs,
             PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2,
@@ -778,6 +779,12 @@ namespace {
 
     // instance-wide info initialized at instance creation(s)
     struct InstanceInfo {
+        struct QueueMetadata {
+            VkDevice device{VK_NULL_HANDLE};
+            uint32_t family{VK_QUEUE_FAMILY_IGNORED};
+            uint32_t index{};
+            VkQueueFlags flags{};
+        };
         std::vector<VkInstance> handles; // there may be several instances
         uint32_t applicationApiVersion{VK_API_VERSION_1_0};
         vk::VulkanInstanceFuncs funcs;
@@ -789,6 +796,7 @@ namespace {
         std::unordered_map<VkDevice, SwapchainMaintenanceFamily>
             swapchainMaintenanceFamilies;
         std::unordered_map<VkDevice, OffloadQueueInfo> offloadQueues;
+        std::unordered_map<VkQueue, QueueMetadata> queues;
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
         std::unordered_map<VkSwapchainKHR, std::unique_ptr<VirtualSwapchainRuntime>>
@@ -1046,7 +1054,7 @@ namespace {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
                     PFN_vkGetPhysicalDeviceFeatures2>(layer_info->GetInstanceProcAddr(
                         instance_info->handles.front(), "vkGetPhysicalDeviceFeatures2"));
-                offloadReservation = reserveOffloadGraphicsQueue(
+                offloadReservation = reserveAuxiliaryTransferQueue(
                     physdev, instance_info->funcs, getPhysicalDeviceFeatures2,
                     instance_info->applicationApiVersion, newInfo);
                 offloadReservation.apply(newInfo);
@@ -1146,6 +1154,16 @@ namespace {
                 }
 
                 if (queue != VK_NULL_HANDLE) {
+                    uint32_t familyCount{};
+                    it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        it->second.physdev(), &familyCount, nullptr);
+                    std::vector<VkQueueFamilyProperties> families(familyCount);
+                    it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        it->second.physdev(), &familyCount, families.data());
+                    instance_info->queues[queue] = {
+                        *device, offloadReservation.familyIndex,
+                        offloadReservation.queueIndex,
+                        families.at(offloadReservation.familyIndex).queueFlags};
                     auto res = setLoaderData(*device, queue);
                     if (res != VK_SUCCESS) {
                         std::cerr << "lsfg-vk: failed to attach loader data to fixed-pacing queue\n";
@@ -1264,6 +1282,17 @@ namespace {
                     && offload->second.familyIndex == queueFamilyIndex
                     && offload->second.applicationQueueIndex == queueIndex) {
                 *queue = offload->second.queue;
+                const auto deviceIt = instance_info->devices.find(device);
+                if (deviceIt != instance_info->devices.end()) {
+                    uint32_t count{};
+                    deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        deviceIt->second.physdev(), &count, nullptr);
+                    std::vector<VkQueueFamilyProperties> families(count);
+                    deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        deviceIt->second.physdev(), &count, families.data());
+                    instance_info->queues[*queue] = {device, queueFamilyIndex, queueIndex,
+                        families.at(queueFamilyIndex).queueFlags};
+                }
                 return;
             }
 
@@ -1271,6 +1300,16 @@ namespace {
             if (it != instance_info->devices.end()) {
                 it->second.df().GetDeviceQueue(
                     device, queueFamilyIndex, queueIndex, queue);
+                if (*queue != VK_NULL_HANDLE) {
+                    uint32_t count{};
+                    it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        it->second.physdev(), &count, nullptr);
+                    std::vector<VkQueueFamilyProperties> families(count);
+                    it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        it->second.physdev(), &count, families.data());
+                    instance_info->queues[*queue] = {device, queueFamilyIndex, queueIndex,
+                        families.at(queueFamilyIndex).queueFlags};
+                }
                 return;
             }
 
@@ -1279,6 +1318,19 @@ namespace {
                     instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue"));
                 if (next) {
                     next(device, queueFamilyIndex, queueIndex, queue);
+                    if (*queue != VK_NULL_HANDLE) {
+                        const auto deviceIt = instance_info->devices.find(device);
+                        if (deviceIt != instance_info->devices.end()) {
+                            uint32_t count{};
+                            deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                deviceIt->second.physdev(), &count, nullptr);
+                            std::vector<VkQueueFamilyProperties> families(count);
+                            deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                deviceIt->second.physdev(), &count, families.data());
+                            instance_info->queues[*queue] = {device, queueFamilyIndex, queueIndex,
+                                families.at(queueFamilyIndex).queueFlags};
+                        }
+                    }
                     return;
                 }
             }
@@ -1302,6 +1354,18 @@ namespace {
                     && offload->second.familyIndex == queueInfo->queueFamilyIndex
                     && offload->second.applicationQueueIndex == queueInfo->queueIndex) {
                 *queue = offload->second.queue;
+                const auto deviceIt = instance_info->devices.find(device);
+                if (deviceIt != instance_info->devices.end()) {
+                    uint32_t count{};
+                    deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        deviceIt->second.physdev(), &count, nullptr);
+                    std::vector<VkQueueFamilyProperties> families(count);
+                    deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                        deviceIt->second.physdev(), &count, families.data());
+                    instance_info->queues[*queue] = {device, queueInfo->queueFamilyIndex,
+                        queueInfo->queueIndex,
+                        families.at(queueInfo->queueFamilyIndex).queueFlags};
+                }
                 return;
             }
 
@@ -1310,6 +1374,20 @@ namespace {
                     instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue2"));
                 if (next) {
                     next(device, queueInfo, queue);
+                    if (*queue != VK_NULL_HANDLE) {
+                        const auto deviceIt = instance_info->devices.find(device);
+                        if (deviceIt != instance_info->devices.end()) {
+                            uint32_t count{};
+                            deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                deviceIt->second.physdev(), &count, nullptr);
+                            std::vector<VkQueueFamilyProperties> families(count);
+                            deviceIt->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                deviceIt->second.physdev(), &count, families.data());
+                            instance_info->queues[*queue] = {device,
+                                queueInfo->queueFamilyIndex, queueInfo->queueIndex,
+                                families.at(queueInfo->queueFamilyIndex).queueFlags};
+                        }
+                    }
                     return;
                 }
             }
@@ -1516,6 +1594,17 @@ namespace {
             const bool queuePresentSupported = queueAvailable
                 && offloadQueueSupportsSurface(
                     it->second, queueIt->second, newInfo.surface);
+            std::vector<uint32_t> surfacePresentFamilies;
+            uint32_t surfaceFamilyCount{};
+            it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                it->second.physdev(), &surfaceFamilyCount, nullptr);
+            for (uint32_t family = 0; family < surfaceFamilyCount; ++family) {
+                VkBool32 supported{};
+                if (it->second.fi().GetPhysicalDeviceSurfaceSupportKHR(
+                        it->second.physdev(), family, newInfo.surface, &supported)
+                        == VK_SUCCESS && supported)
+                    surfacePresentFamilies.push_back(family);
+            }
             const bool topologyEligible = fixedMode
                 ? fixedAsyncPresentModeEligible
                 : dualPresentModeDeclared;
@@ -1565,6 +1654,7 @@ namespace {
                         ? std::vector<uint32_t>(newInfo.pQueueFamilyIndices,
                             newInfo.pQueueFamilyIndices + newInfo.queueFamilyIndexCount)
                         : std::vector<uint32_t>{},
+                    .surfacePresentFamilies = std::move(surfacePresentFamilies),
                     .surfaceSupportsTransferSrc = [&]() {
                         VkSurfaceCapabilitiesKHR capabilities{};
                         const auto query = it->second.fi().GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -1600,17 +1690,19 @@ namespace {
                     std::move(runtimeExchangeQueue));
 
                 if (virtualRuntime) {
-                    const auto& offload = instance_info->offloadQueues.at(device);
-                    const auto workerQueue = offload.queue;
-                    const auto workerMutex = offload.mutex;
                     const auto workerSwapchain = *swapchain;
+                    const auto borrowedQueueMutex = std::make_shared<std::mutex>();
                     virtualRuntime->startWorker(
-                        [workerSwapchain, workerQueue, workerMutex, device](
+                        [workerSwapchain, borrowedQueueMutex, device](
                                 uint32_t imageIndex,
                                 VkSemaphore readySemaphore,
                                 void* nextChain,
                                 std::stop_token stopToken,
-                                std::chrono::steady_clock::time_point sourcePresentTime) -> VkResult {
+                                std::chrono::steady_clock::time_point sourcePresentTime,
+                                bool d3bSingleSwapchainEligible,
+                                const GraphicsFinalQueueInfo& graphicsFinalQueue,
+                                BorrowedGraphicsQueueLease& graphicsLease,
+                                bool& stopAfterCompletion) -> VkResult {
                             const auto deviceIt = instance_info->devices.find(device);
                             if (deviceIt == instance_info->devices.end())
                                 return VK_ERROR_DEVICE_LOST;
@@ -1618,14 +1710,18 @@ namespace {
                             try {
                                 return layer_info->root.presentSwapchain(
                                     deviceIt->second,
-                                    workerQueue,
-                                    workerMutex,
+                                    graphicsFinalQueue.queue,
+                                    borrowedQueueMutex,
                                     workerSwapchain,
                                     nextChain,
                                     imageIndex,
                                     { readySemaphore },
                                     stopToken,
-                                    sourcePresentTime);
+                                    sourcePresentTime,
+                                    d3bSingleSwapchainEligible,
+                                    &graphicsFinalQueue,
+                                    &graphicsLease,
+                                    &stopAfterCompletion);
                             } catch (const ls::vulkan_error& e) {
                                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
                                     std::cerr << "lsfg-vk: asynchronous virtual presentation failed:\n";
@@ -1847,8 +1943,20 @@ namespace {
                 if (virtualIt != instance_info->virtualSwapchains.end()) {
                     const bool synchronous = info->pNext != nullptr
                         || info->swapchainCount != 1;
+                    const auto queueMetadata = instance_info->queues.find(queue);
+                    if (queueMetadata == instance_info->queues.end())
+                        return VK_ERROR_FEATURE_NOT_PRESENT;
+                    const bool surfacePresentSupported = std::ranges::find(
+                        instance_info->swapchainInfos.at(swapchain).surfacePresentFamilies,
+                        queueMetadata->second.family)
+                        != instance_info->swapchainInfos.at(swapchain)
+                            .surfacePresentFamilies.end();
                     result = virtualIt->second->queuePresent(
                         queue,
+                        queueMetadata->second.family,
+                        queueMetadata->second.index,
+                        queueMetadata->second.flags,
+                        surfacePresentSupported,
                         info->pImageIndices[i],
                         waitSemaphores,
                         const_cast<void*>(info->pNext),
@@ -1894,11 +2002,17 @@ namespace {
         const auto runtime = instance_info->virtualSwapchains.find(swapchain);
         if (runtime != instance_info->virtualSwapchains.end()) {
             runtime->second->stop();
+            const bool oneShot = d3b1OneShotRequested(
+                std::getenv("LSFGVK_D3B1_ONESHOT"));
+            if (oneShot)
+                std::cerr << "[D3B1-ONESHOT] worker stopped and joined\n";
             // The asynchronous worker can leave GPU work queued when a stop
             // request interrupts a bounded acquire/fence wait. Swapchain
             // destruction is rare, so conservatively drain the device before
             // destroying worker-owned synchronization and swapchain resources.
             const auto idle = it->second.df().DeviceWaitIdle(device);
+            if (oneShot)
+                std::cerr << "[D3B1-ONESHOT] final vkDeviceWaitIdle=" << idle << '\n';
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
                 std::cerr << "lsfg-vk: vkDeviceWaitIdle() failed during virtual swapchain destruction: "
                     << idle << '\n';

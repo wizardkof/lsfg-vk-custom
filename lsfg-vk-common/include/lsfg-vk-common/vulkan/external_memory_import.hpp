@@ -50,6 +50,7 @@ public:
     [[nodiscard]] bool dedicated() const noexcept { return dedicatedAllocation; }
 
 private:
+    friend struct RuntimeImageEndpointTestAccess;
     ImportedExternalMemory(VkDevice, PFN_vkFreeMemory, VkDeviceMemory,
         uint32_t, bool) noexcept;
     void reset() noexcept;

@@ -52,14 +52,15 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
         backend::RuntimeGenerateDiagnosticSession& session,
         const vk::RuntimeDevicePair& pair, vk::RuntimeExchangeEndpoint generation,
-        vk::RuntimeExchangeEndpoint render, bool captureOnly) :
+        vk::RuntimeExchangeEndpoint render, bool captureOnly,
+        std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) :
     generationEndpoint(std::move(generation)), renderEndpoint(std::move(render)) {
     if (!generatedOutputRoleBindingEligible(pair, generationEndpoint.identity,
             renderEndpoint.identity, captureOnly))
         throw std::invalid_argument("D3A2 requires CROSS_PHYSICAL_DEVICE + CAPTURE_ONLY");
     if (generationEndpoint.bufferDevice.device == renderEndpoint.bufferDevice.device)
         throw std::invalid_argument("D3A2 endpoint role mismatch");
-    executeGpuChained(std::move(pending), backend, session);
+    executeGpuChained(std::move(pending), backend, session, handoff);
 }
 
 GeneratedOutputReturnDiagnosticSession::~GeneratedOutputReturnDiagnosticSession() {
@@ -195,7 +196,8 @@ void GeneratedOutputReturnDiagnosticSession::execute(
 
 void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
     bool transportConsumed = false;
     try {
         if (!pending.valid() || pending.identity() == 0
@@ -283,6 +285,16 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         importedA = vk::RuntimeImageEndpoint::createExecutionResources(std::move(importedA), 1);
         chainedStates.advance(GpuChainedReturnState::RETURN_B_SUBMITTED,
             GpuChainedReturnState::A_SUBMITTED);
+        if (handoff.has_value()) {
+            aReadbackPending = vk::RuntimeImageEndpoint::submitForeignImageReadback(
+                std::move(importedA), std::move(sync), handoff);
+            expected = {generation, extent, format,
+                static_cast<size_t>(extent.width) * extent.height * 4U, 0, 0};
+            delayedGeneration = std::move(pending);
+            delayedBackend = &backend;
+            delayedBackendSession = &backendSession;
+            return;
+        }
         const auto bytes = vk::RuntimeImageEndpoint::readForeignImage(importedA, std::move(sync));
         aCompleted = true;
         chainedStates.advance(GpuChainedReturnState::A_SUBMITTED,
@@ -328,6 +340,53 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
                 backendSession, std::move(pending))); }
             catch (...) {}
         }
+        chainedStates.fail();
+        throw;
+    }
+}
+
+void GeneratedOutputReturnDiagnosticSession::completePresentationDiagnostics() {
+    if (!aReadbackPending.valid() || !delayedGeneration.valid()
+            || !delayedBackend || !delayedBackendSession)
+        throw std::logic_error("D3B1 presentation diagnostics are not pending");
+    try {
+        const auto bytes = vk::RuntimeImageEndpoint::completeForeignImageReadback(
+            aReadbackPending);
+        aCompleted = true;
+        chainedStates.advance(GpuChainedReturnState::A_SUBMITTED,
+            GpuChainedReturnState::A_COMPLETED);
+        auto validated = delayedBackend->completeRuntimeGenerateDiagnostic(
+            *delayedBackendSession, std::move(delayedGeneration));
+        authoritative = {validated.metadata.generation, validated.metadata.extent,
+            validated.metadata.format, validated.metadata.byteCount,
+            validated.metadata.nonzeroByteCount, validated.metadata.checksum};
+        chainedStates.advance(GpuChainedReturnState::A_COMPLETED,
+            GpuChainedReturnState::B_VALIDATED);
+        GeneratedOutputIntegrity observed{expected.generation, expected.extent,
+            expected.format, bytes.size(), 0,
+            lsfgvk::common::fnv1a64(bytes.data(), bytes.size())};
+        for (const uint8_t byte : bytes) observed.nonzeroByteCount += byte != 0;
+        chainedStates.advance(GpuChainedReturnState::B_VALIDATED,
+            GpuChainedReturnState::A_VALIDATED);
+        if (!generatedOutputIntegrityMatches(authoritative, observed))
+            throw std::runtime_error("D3B1 same-generation B/A integrity mismatch");
+        std::cerr << "[DG2X-P4C-D3B1] terminal returned-image integrity\n"
+            << "  B generation: " << authoritative.generation << "\n"
+            << "  B format: " << static_cast<int>(authoritative.format) << "\n"
+            << "  B extent: " << authoritative.extent.width << 'x'
+            << authoritative.extent.height << "\n"
+            << "  B bytes: " << authoritative.byteCount << "\n"
+            << "  B nonzero bytes: " << authoritative.nonzeroByteCount << "\n"
+            << "  B FNV-1a: 0x" << std::hex << authoritative.checksum << std::dec << "\n"
+            << "  A generation: " << observed.generation << "\n"
+            << "  A format: " << static_cast<int>(observed.format) << "\n"
+            << "  A extent: " << observed.extent.width << 'x' << observed.extent.height << "\n"
+            << "  A bytes: " << observed.byteCount << "\n"
+            << "  A nonzero bytes: " << observed.nonzeroByteCount << "\n"
+            << "  A FNV-1a: 0x" << std::hex << observed.checksum << std::dec << "\n";
+        chainedStates.advance(GpuChainedReturnState::A_VALIDATED,
+            GpuChainedReturnState::PASS);
+    } catch (...) {
         chainedStates.fail();
         throw;
     }

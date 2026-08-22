@@ -1,8 +1,10 @@
 #include "generated_output_return_diagnostic.hpp"
+#include "swapchain.hpp"
 #include "lsfg-vk-common/fnv1a.hpp"
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 
@@ -38,6 +40,36 @@ vk::PhysicalDeviceIdentity identity(uint8_t id) {
 using namespace lsfgvk::layer;
 
 int main() {
+    static_assert(captureDiagnosticFormatSupported(VK_FORMAT_B8G8R8A8_UNORM));
+    static_assert(captureDiagnosticFormatSupported(VK_FORMAT_R8G8B8A8_UNORM));
+    static_assert(captureDiagnosticFormatSupported(VK_FORMAT_A2R10G10B10_UNORM_PACK32));
+    static_assert(!captureDiagnosticFormatSupported(VK_FORMAT_R16G16B16A16_SFLOAT));
+    ::unsetenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC");
+    assert(!d3b1PresentationDiagnosticEnabled());
+    ::setenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC", "0", 1);
+    assert(!d3b1PresentationDiagnosticEnabled());
+    ::setenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC", "1", 1);
+    assert(d3b1PresentationDiagnosticEnabled());
+    ::setenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC", "true", 1);
+    assert(!d3b1PresentationDiagnosticEnabled());
+    ::unsetenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC");
+    static_assert(!std::is_copy_constructible_v<vk::RuntimeForeignImageReadbackPending>);
+    static_assert(!std::is_copy_assignable_v<vk::RuntimeForeignImageReadbackPending>);
+    static_assert(std::is_move_constructible_v<vk::RuntimeForeignImageReadbackPending>);
+    static_assert(std::is_move_assignable_v<vk::RuntimeForeignImageReadbackPending>);
+    vk::RuntimeForeignImageReadbackPending emptyReadback;
+    assert(!emptyReadback.valid());
+    auto movedEmptyReadback = std::move(emptyReadback);
+    assert(!emptyReadback.valid() && !movedEmptyReadback.valid());
+    const auto noHandoff = vk::RuntimeForeignImageHandoffInfo{};
+    assert(noHandoff.destinationQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED);
+    assert(noHandoff.signalSemaphore == VK_NULL_HANDLE);
+    const auto differentFamily = vk::RuntimeForeignImageHandoffInfo{
+        .destinationQueueFamilyIndex = 7,
+        .signalSemaphore = reinterpret_cast<VkSemaphore>(uintptr_t{0x7890})};
+    assert(differentFamily.destinationQueueFamilyIndex != 3);
+    assert(differentFamily.signalSemaphore != VK_NULL_HANDLE);
+    static_assert(D3B1PresentationState::PASS != D3B1PresentationState::FAILED);
     std::vector<uint8_t> known(256U * 256U * 4U);
     for (size_t i = 0; i < known.size(); i += 4) {
         known[i] = 0xff; known[i + 1] = 0; known[i + 2] = 0xff; known[i + 3] = 0xff;

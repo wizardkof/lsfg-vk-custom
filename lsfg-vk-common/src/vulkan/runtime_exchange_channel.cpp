@@ -280,6 +280,102 @@ namespace {
     }
 }
 
+RuntimeForeignImageReadbackPending::RuntimeForeignImageReadbackPending(
+        RuntimeForeignImageReadbackPending&& other) noexcept :
+    owner(std::move(other.owner)), imported(std::move(other.imported)),
+    fence(std::exchange(other.fence, VK_NULL_HANDLE)), lifetime(std::move(other.lifetime)),
+    submitted(std::exchange(other.submitted, false)),
+    completionConsumed(std::exchange(other.completionConsumed, false)),
+    failed(std::exchange(other.failed, false)),
+    handoffRequestedValue(std::exchange(other.handoffRequestedValue, false)),
+    releaseRequired(std::exchange(other.releaseRequired, false)),
+    sourceQueueFamilyValue(std::exchange(other.sourceQueueFamilyValue, VK_QUEUE_FAMILY_IGNORED)),
+    destinationQueueFamilyValue(std::exchange(other.destinationQueueFamilyValue, VK_QUEUE_FAMILY_IGNORED)),
+    borrowedSignalSemaphore(std::exchange(other.borrowedSignalSemaphore, VK_NULL_HANDLE)) {}
+
+RuntimeForeignImageReadbackPending& RuntimeForeignImageReadbackPending::operator=(
+        RuntimeForeignImageReadbackPending&& other) noexcept {
+    if (this != &other) {
+        reset();
+        owner = std::move(other.owner);
+        imported = std::move(other.imported);
+        fence = std::exchange(other.fence, VK_NULL_HANDLE);
+        lifetime = std::move(other.lifetime);
+        submitted = std::exchange(other.submitted, false);
+        completionConsumed = std::exchange(other.completionConsumed, false);
+        failed = std::exchange(other.failed, false);
+        handoffRequestedValue = std::exchange(other.handoffRequestedValue, false);
+        releaseRequired = std::exchange(other.releaseRequired, false);
+        sourceQueueFamilyValue = std::exchange(other.sourceQueueFamilyValue, VK_QUEUE_FAMILY_IGNORED);
+        destinationQueueFamilyValue = std::exchange(other.destinationQueueFamilyValue, VK_QUEUE_FAMILY_IGNORED);
+        borrowedSignalSemaphore = std::exchange(other.borrowedSignalSemaphore, VK_NULL_HANDLE);
+    }
+    return *this;
+}
+
+RuntimeForeignImageReadbackPending::~RuntimeForeignImageReadbackPending() { reset(); }
+
+bool RuntimeForeignImageReadbackPending::valid() const noexcept {
+    return owner && submitted && !failed && fence != VK_NULL_HANDLE && !lifetime.expired();
+}
+
+RuntimeForeignImageView RuntimeForeignImageReadbackPending::imageView() const noexcept {
+    RuntimeForeignImageView view;
+    if (!valid()) return view;
+    view.imageHandle = owner->imageHandle;
+    view.formatValue = owner->format;
+    view.extentValue = owner->extent;
+    view.layoutValue = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    view.queueFamilyValue = owner->endpoint.queueFamilyIndex;
+    view.sourceQueueFamilyValue = owner->endpoint.queueFamilyIndex;
+    view.destinationQueueFamilyValue = destinationQueueFamilyValue;
+    view.modifierValue = owner->modifier;
+    view.handoffPending = releaseRequired;
+    view.lifetime = lifetime;
+    return view;
+}
+
+void RuntimeForeignImageReadbackPending::reset() noexcept {
+    if (owner && submitted && !completionConsumed && !lifetime.expired()
+            && owner->endpoint.DeviceWaitIdle) {
+        static_cast<void>(owner->endpoint.DeviceWaitIdle(owner->endpoint.bufferDevice.device));
+    }
+    if (owner && fence && !lifetime.expired() && owner->endpoint.DestroyFence)
+        owner->endpoint.DestroyFence(owner->endpoint.bufferDevice.device, fence, nullptr);
+    owner.reset();
+    fence = VK_NULL_HANDLE;
+    imported = {};
+    lifetime.reset();
+    submitted = false;
+    completionConsumed = false;
+    failed = false;
+    handoffRequestedValue = false;
+    releaseRequired = false;
+    sourceQueueFamilyValue = VK_QUEUE_FAMILY_IGNORED;
+    destinationQueueFamilyValue = VK_QUEUE_FAMILY_IGNORED;
+    borrowedSignalSemaphore = VK_NULL_HANDLE;
+}
+
+RuntimeImageEndpoint RuntimeForeignImageReadbackPending::releaseOwner() noexcept {
+    if (!owner) return {};
+    if (fence && owner->endpoint.DestroyFence)
+        owner->endpoint.DestroyFence(owner->endpoint.bufferDevice.device, fence, nullptr);
+    fence = VK_NULL_HANDLE;
+    imported = {};
+    submitted = false;
+    completionConsumed = false;
+    failed = false;
+    handoffRequestedValue = false;
+    releaseRequired = false;
+    sourceQueueFamilyValue = VK_QUEUE_FAMILY_IGNORED;
+    destinationQueueFamilyValue = VK_QUEUE_FAMILY_IGNORED;
+    borrowedSignalSemaphore = VK_NULL_HANDLE;
+    lifetime.reset();
+    RuntimeImageEndpoint result = std::move(*owner);
+    owner.reset();
+    return result;
+}
+
 RuntimeImageEndpoint::RuntimeImageEndpoint(RuntimeImageEndpoint&& other) noexcept
     : endpoint(std::move(other.endpoint)), imageHandle(std::exchange(other.imageHandle, VK_NULL_HANDLE)),
       memory(std::move(other.memory)), memoryRequirements(other.memoryRequirements),
@@ -287,7 +383,8 @@ RuntimeImageEndpoint::RuntimeImageEndpoint(RuntimeImageEndpoint&& other) noexcep
       commandBuffers(std::move(other.commandBuffers)), stagingBuffer(std::exchange(other.stagingBuffer, VK_NULL_HANDLE)),
       stagingMemory(std::exchange(other.stagingMemory, VK_NULL_HANDLE)), stagingMapped(std::exchange(other.stagingMapped, nullptr)),
       stagingHostCoherent(other.stagingHostCoherent), stagingSize(other.stagingSize),
-      finalFence(std::exchange(other.finalFence, VK_NULL_HANDLE)), extent(other.extent) {}
+      finalFence(std::exchange(other.finalFence, VK_NULL_HANDLE)), extent(other.extent),
+      format(other.format), modifier(other.modifier), lifetime(std::move(other.lifetime)) {}
 
 RuntimeImageEndpoint& RuntimeImageEndpoint::operator=(RuntimeImageEndpoint&& other) noexcept {
     if (this != &other) {
@@ -306,6 +403,9 @@ RuntimeImageEndpoint& RuntimeImageEndpoint::operator=(RuntimeImageEndpoint&& oth
         stagingSize = other.stagingSize;
         finalFence = std::exchange(other.finalFence, VK_NULL_HANDLE);
         extent = other.extent;
+        format = other.format;
+        modifier = other.modifier;
+        lifetime = std::move(other.lifetime);
     }
     return *this;
 }
@@ -844,13 +944,24 @@ SyncFdPayload RuntimeImageEndpoint::submitRealFrameTransportA(
     return exportSyncFd(imageA.endpoint.semaphoreDevice, signal.handle());
 }
 
-std::vector<uint8_t> RuntimeImageEndpoint::readForeignImage(
-        RuntimeImageEndpoint& imageA, SyncFdPayload payload) {
+RuntimeForeignImageReadbackPending RuntimeImageEndpoint::submitForeignImageReadback(
+        RuntimeImageEndpoint&& source, SyncFdPayload payload,
+        std::optional<RuntimeForeignImageHandoffInfo> handoff) {
+    auto owned = std::make_unique<RuntimeImageEndpoint>(std::move(source));
+    auto& imageA = *owned;
+    if (handoff.has_value()) {
+        if (handoff->destinationQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED
+                || handoff->signalSemaphore == VK_NULL_HANDLE)
+            throw std::invalid_argument("invalid foreign image handoff description");
+        if (imageA.imageHandle == VK_NULL_HANDLE
+                || imageA.format == VK_FORMAT_UNDEFINED
+                || imageA.endpoint.queueFamilyIndex == VK_QUEUE_FAMILY_IGNORED)
+            throw std::invalid_argument("foreign image handoff source metadata incomplete");
+    }
     if (imageA.commandBuffers.empty() || !imageA.endpoint.CmdCopyImageToBuffer
-            || !imageA.endpoint.QueueSubmit || !imageA.endpoint.WaitForFences)
+            || !imageA.endpoint.QueueSubmit)
         throw std::runtime_error("D3A1 A readback dispatch/resources incomplete");
-    bool aSubmitted = false;
-    bool aCompleted = false;
+    RuntimeForeignImageReadbackPending pending;
     try {
     auto imported = createSyncFdImportSemaphore(imageA.endpoint.semaphoreDevice);
     importSyncFdTemporary(imageA.endpoint.semaphoreDevice, imported.handle(), payload);
@@ -874,39 +985,97 @@ std::vector<uint8_t> RuntimeImageEndpoint::readForeignImage(
         VK_QUEUE_FAMILY_IGNORED, imageA.stagingBuffer, 0, imageA.stagingSize};
     imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+    VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    result = imageA.endpoint.CreateFence(imageA.endpoint.bufferDevice.device,
+        &info, nullptr, &pending.fence);
+    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence creation");
+    pending.owner = std::move(owned);
+    pending.lifetime = imageA.lifetime;
+    if (handoff.has_value()) {
+        pending.handoffRequestedValue = true;
+        pending.releaseRequired = handoff->destinationQueueFamilyIndex
+            != imageA.endpoint.queueFamilyIndex;
+        pending.sourceQueueFamilyValue = imageA.endpoint.queueFamilyIndex;
+        pending.destinationQueueFamilyValue = handoff->destinationQueueFamilyIndex;
+        pending.borrowedSignalSemaphore = handoff->signalSemaphore;
+    }
+    if (handoff.has_value() && pending.releaseRequired) {
+        const VkImageMemoryBarrier release{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, imageA.endpoint.queueFamilyIndex,
+            handoff->destinationQueueFamilyIndex, imageA.imageHandle,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        imageA.endpoint.CmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &release);
+    }
     result = imageA.endpoint.EndCommandBuffer(command);
     if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkEndCommandBuffer A");
-    if (!imageA.finalFence) {
-        VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        result = imageA.endpoint.CreateFence(imageA.endpoint.bufferDevice.device,
-            &info, nullptr, &imageA.finalFence);
-        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence creation");
-    }
     const VkSemaphore wait = imported.handle();
     constexpr VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    if (handoff.has_value()) {
+        const VkSemaphore signal = handoff->signalSemaphore;
+        VkSubmitInfo handoffSubmit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        handoffSubmit.waitSemaphoreCount = 1; handoffSubmit.pWaitSemaphores = &wait;
+        handoffSubmit.pWaitDstStageMask = &stage; handoffSubmit.commandBufferCount = 1;
+        handoffSubmit.pCommandBuffers = &command; handoffSubmit.signalSemaphoreCount = 1;
+        handoffSubmit.pSignalSemaphores = &signal;
+        result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &handoffSubmit, pending.fence);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkQueueSubmit handoff A");
+        pending.imported = std::move(imported);
+        pending.submitted = true;
+        return pending;
+    }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &wait;
     submit.pWaitDstStageMask = &stage; submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submit, imageA.finalFence);
+    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submit, pending.fence);
     if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkQueueSubmit A");
-    aSubmitted = true;
-    result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
-        &imageA.finalFence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence wait");
-    aCompleted = true;
-    if (!imageA.stagingHostCoherent) {
+    pending.imported = std::move(imported);
+    pending.submitted = true;
+    return pending;
+    } catch (...) {
+        pending.reset();
+        throw;
+    }
+}
+
+std::vector<uint8_t> RuntimeImageEndpoint::completeForeignImageReadback(
+        RuntimeForeignImageReadbackPending& pending) {
+    if (!pending.valid() || pending.completionConsumed || pending.failed)
+        throw std::logic_error("foreign image readback pending is invalid or already completed");
+    auto& imageA = *pending.owner;
+    try {
+        if (!imageA.endpoint.WaitForFences)
+            throw std::runtime_error("foreign image readback completion dispatch incomplete");
+        auto result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
+            &pending.fence, VK_TRUE, UINT64_MAX);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence wait");
+        if (!imageA.stagingHostCoherent) {
         VkMappedMemoryRange invalidate{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
         invalidate.memory = imageA.stagingMemory; invalidate.size = VK_WHOLE_SIZE;
         result = imageA.endpoint.InvalidateMappedMemoryRanges(
             imageA.endpoint.bufferDevice.device, 1, &invalidate);
         if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 A readback invalidate");
-    }
-    const auto* first = static_cast<const uint8_t*>(imageA.stagingMapped);
-    return {first, first + imageA.stagingSize};
+        }
+        const auto* first = static_cast<const uint8_t*>(imageA.stagingMapped);
+        pending.completionConsumed = true;
+        return {first, first + imageA.stagingSize};
     } catch (...) {
-        if (aSubmitted && !aCompleted && imageA.endpoint.DeviceWaitIdle)
-            static_cast<void>(imageA.endpoint.DeviceWaitIdle(imageA.endpoint.bufferDevice.device));
+        pending.failed = true;
+        throw;
+    }
+}
+
+std::vector<uint8_t> RuntimeImageEndpoint::readForeignImage(
+        RuntimeImageEndpoint& imageA, SyncFdPayload payload) {
+    auto pending = submitForeignImageReadback(std::move(imageA), std::move(payload));
+    try {
+        auto result = completeForeignImageReadback(pending);
+        imageA = pending.releaseOwner();
+        return result;
+    } catch (...) {
+        imageA = pending.releaseOwner();
         throw;
     }
 }
@@ -936,6 +1105,8 @@ RuntimeImageEndpoint vk::createRuntimeImageEndpoint(const RuntimeExchangeEndpoin
     modifier.pPlaneLayouts = planeLayouts.data();
     modifier.pNext = &external;
     result.extent = backing.extent;
+    result.format = backing.format;
+    result.modifier = backing.modifier;
     const VkImageCreateInfo create{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &modifier, 0,
         VK_IMAGE_TYPE_2D, backing.format,
         {backing.extent.width, backing.extent.height, 1}, 1, 1,
