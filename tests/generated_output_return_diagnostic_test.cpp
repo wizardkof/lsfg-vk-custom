@@ -14,6 +14,14 @@ struct RuntimeGeneratedFrameTokenTestAccess {
             VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 3, lifetime);
     }
 };
+struct RuntimeGenerateDiagnosticPendingTestAccess {
+    static RuntimeGenerateDiagnosticPending issue(RuntimeGenerationId generation, VkImage image,
+            VkSemaphore readiness, const std::shared_ptr<const uint8_t>& lifetime) {
+        return RuntimeGenerateDiagnosticPending(generation, image, {8, 8},
+            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 3,
+            readiness, lifetime);
+    }
+};
 }
 
 namespace {
@@ -51,9 +59,39 @@ int main() {
     assert(!generatedOutputRoleBindingEligible(*same, render, render, true));
     static_assert(!std::is_copy_constructible_v<lsfgvk::backend::RuntimeGeneratedFrameToken>);
     static_assert(std::is_move_constructible_v<lsfgvk::backend::RuntimeGeneratedFrameToken>);
+    static_assert(!std::is_copy_constructible_v<lsfgvk::backend::RuntimeGenerateDiagnosticPending>);
+    static_assert(std::is_move_constructible_v<lsfgvk::backend::RuntimeGenerateDiagnosticPending>);
+    static_assert(std::is_default_constructible_v<lsfgvk::backend::RuntimeGenerateDiagnosticPending>);
+    lsfgvk::backend::RuntimeGenerateDiagnosticPending emptyPending;
+    assert(!emptyPending.valid());
+    auto movedEmptyPending = std::move(emptyPending);
+    assert(!emptyPending.valid() && !movedEmptyPending.valid());
+
+    const auto reusedImage = reinterpret_cast<VkImage>(uintptr_t{0x1234});
+    auto pendingLifetime1 = std::make_shared<const uint8_t>(0);
+    const auto fakeReady = reinterpret_cast<VkSemaphore>(uintptr_t{0x5678});
+    auto pendingCapability =
+        lsfgvk::backend::RuntimeGenerateDiagnosticPendingTestAccess::issue(
+            44, reusedImage, fakeReady, pendingLifetime1);
+    assert(pendingCapability.valid());
+    assert(pendingCapability.identity() == 44);
+    assert(pendingCapability.readinessSemaphore() == fakeReady);
+    auto movedPending = std::move(pendingCapability);
+    assert(!pendingCapability.valid() && movedPending.valid());
+    movedPending.consumeTransport();
+    bool pendingRetryRejected = false;
+    try { movedPending.consumeTransport(); }
+    catch (const std::logic_error&) { pendingRetryRejected = true; }
+    assert(pendingRetryRejected);
+    pendingLifetime1.reset();
+    assert(!movedPending.valid());
+    auto pendingLifetime2 = std::make_shared<const uint8_t>(0);
+    auto recreatedPending =
+        lsfgvk::backend::RuntimeGenerateDiagnosticPendingTestAccess::issue(
+            45, reusedImage, fakeReady, pendingLifetime2);
+    assert(!movedPending.valid() && recreatedPending.valid());
 
     auto lifetime1 = std::make_shared<const uint8_t>(0);
-    const auto reusedImage = reinterpret_cast<VkImage>(uintptr_t{0x1234});
     auto stale = lsfgvk::backend::RuntimeGeneratedFrameTokenTestAccess::issue(
         41, reusedImage, lifetime1);
     assert(stale.valid());
@@ -157,4 +195,37 @@ int main() {
     assert(!generatedOutputIntegrityMatches(expected, mismatch));
     mismatch = expected; mismatch.extent.width = 9;
     assert(!generatedOutputIntegrityMatches(expected, mismatch));
+
+    GpuChainedReturnStateMachine chained;
+    const GpuChainedReturnState chainedOrder[]{
+        GpuChainedReturnState::D2_SUBMITTED,
+        GpuChainedReturnState::PENDING_GENERATION,
+        GpuChainedReturnState::TRANSPORT_CONSUMED,
+        GpuChainedReturnState::RETURN_B_PREPARED,
+        GpuChainedReturnState::RETURN_B_SUBMITTED,
+        GpuChainedReturnState::A_SUBMITTED,
+        GpuChainedReturnState::A_COMPLETED,
+        GpuChainedReturnState::B_VALIDATED,
+        GpuChainedReturnState::A_VALIDATED,
+        GpuChainedReturnState::PASS};
+    auto chainedPrevious = GpuChainedReturnState::EMPTY;
+    for (const auto next : chainedOrder) {
+        chained.advance(chainedPrevious, next); chainedPrevious = next;
+    }
+    assert(chained.markerReady());
+    GpuChainedReturnStateMachine chainedFailure;
+    chainedFailure.advance(GpuChainedReturnState::EMPTY,
+        GpuChainedReturnState::D2_SUBMITTED);
+    chainedFailure.fail();
+    assert(!chainedFailure.markerReady());
+
+    const GpuChainedMarkerGate exact{true, false, false, true, true, true, false};
+    assert(exact.ready());
+    auto gate = exact; gate.readinessDependencyUsed = false; assert(!gate.ready());
+    gate = exact; gate.generateReturnHostWaitUsed = true; assert(!gate.ready());
+    gate = exact; gate.bToAHostWaitUsed = true; assert(!gate.ready());
+    gate = exact; gate.bValidated = false; assert(!gate.ready());
+    gate = exact; gate.aValidated = false; assert(!gate.ready());
+    gate = exact; gate.integrityExact = false; assert(!gate.ready());
+    gate = exact; gate.synchronousD3A1Path = true; assert(!gate.ready());
 }

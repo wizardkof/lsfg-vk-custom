@@ -6,6 +6,7 @@
 #include "lsfg-vk-common/vulkan/vulkan_native_external_image_backing.hpp"
 
 #include <optional>
+#include <vector>
 
 namespace lsfgvk::layer {
     enum class GeneratedOutputReturnState {
@@ -55,10 +56,47 @@ namespace lsfgvk::layer {
     [[nodiscard]] bool generatedOutputIntegrityMatches(
         const GeneratedOutputIntegrity&, const GeneratedOutputIntegrity&) noexcept;
 
+    enum class GpuChainedReturnState {
+        EMPTY, D2_SUBMITTED, PENDING_GENERATION, TRANSPORT_CONSUMED,
+        RETURN_B_PREPARED, RETURN_B_SUBMITTED, A_SUBMITTED, A_COMPLETED,
+        B_VALIDATED, A_VALIDATED, PASS, FAILED
+    };
+
+    class GpuChainedReturnStateMachine {
+    public:
+        void advance(GpuChainedReturnState expected, GpuChainedReturnState next);
+        void fail() noexcept { current = GpuChainedReturnState::FAILED; }
+        [[nodiscard]] GpuChainedReturnState state() const noexcept { return current; }
+        [[nodiscard]] bool markerReady() const noexcept {
+            return current == GpuChainedReturnState::PASS;
+        }
+    private:
+        GpuChainedReturnState current{GpuChainedReturnState::EMPTY};
+    };
+
+    struct GpuChainedMarkerGate {
+        bool readinessDependencyUsed{};
+        bool generateReturnHostWaitUsed{};
+        bool bToAHostWaitUsed{};
+        bool bValidated{};
+        bool aValidated{};
+        bool integrityExact{};
+        bool synchronousD3A1Path{};
+        [[nodiscard]] bool ready() const noexcept {
+            return readinessDependencyUsed && !generateReturnHostWaitUsed && !bToAHostWaitUsed
+                && bValidated && aValidated && integrityExact && !synchronousD3A1Path;
+        }
+    };
+
     class GeneratedOutputReturnDiagnosticSession {
     public:
         GeneratedOutputReturnDiagnosticSession(
             backend::RuntimeGenerateDiagnosticResult&&,
+            const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
+            vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly);
+        GeneratedOutputReturnDiagnosticSession(
+            backend::RuntimeGenerateDiagnosticPending&&,
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&,
             const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
             vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly);
         GeneratedOutputReturnDiagnosticSession(const GeneratedOutputReturnDiagnosticSession&) = delete;
@@ -66,13 +104,20 @@ namespace lsfgvk::layer {
         ~GeneratedOutputReturnDiagnosticSession();
         [[nodiscard]] GeneratedOutputReturnState state() const noexcept { return states.state(); }
         [[nodiscard]] bool passed() const noexcept { return states.markerReady(); }
+        [[nodiscard]] bool gpuChainedPassed() const noexcept { return chainedStates.markerReady(); }
     private:
         void advance(GeneratedOutputReturnState expected, GeneratedOutputReturnState next);
         void execute(backend::RuntimeGenerateDiagnosticResult&&);
+        void executeGpuChained(backend::RuntimeGenerateDiagnosticPending&&,
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
+        [[nodiscard]] std::vector<uint8_t> transportGeneratedImage(
+            VkImage sourceImage, VkExtent2D extent, VkFormat format,
+            VkSemaphore generationReady, bool chained);
         void resetBCommands() noexcept;
         vk::RuntimeExchangeEndpoint generationEndpoint{};
         vk::RuntimeExchangeEndpoint renderEndpoint{};
         GeneratedOutputReturnStateMachine states;
+        GpuChainedReturnStateMachine chainedStates;
         vk::VulkanNativeExternalImageBacking backing;
         vk::RuntimeImageEndpoint importedA;
         vk::SyncFdSemaphore signalB;

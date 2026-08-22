@@ -48,7 +48,16 @@ namespace lsfgvk::backend {
             if (directFrames != 3 || generateExecutions != 1)
                 throw std::logic_error("D2 output validation occurred outside Generate");
             outputValidated = true;
+            generationPending = false;
         }
+
+        void recordSubmittedGeneration() {
+            if (failed || generateExecutions != 1 || generationPending || outputValidated)
+                throw std::logic_error("invalid D2 pending-generation submission");
+            generationPending = true;
+        }
+
+        [[nodiscard]] bool pendingGeneration() const noexcept { return generationPending; }
 
         void recordFailure() { failed = true; }
 
@@ -76,6 +85,7 @@ namespace lsfgvk::backend {
         size_t rotations{};
         size_t generateExecutions{};
         bool outputValidated{};
+        bool generationPending{};
         bool failed{};
         bool completionResultIssued{};
     };

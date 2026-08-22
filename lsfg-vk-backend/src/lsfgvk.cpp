@@ -15,6 +15,7 @@
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "shaderchains/alpha0.hpp"
@@ -57,6 +58,84 @@ using namespace lsfgvk;
 using namespace lsfgvk::backend;
 
 namespace lsfgvk::backend {
+
+class RuntimeGenerateDiagnosticPendingState {
+public:
+    RuntimeGenerationId generation{};
+    VkImage image{};
+    VkExtent2D extent{};
+    VkFormat format{VK_FORMAT_UNDEFINED};
+    VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    uint32_t family{};
+    std::weak_ptr<const uint8_t> sessionLifetime;
+    std::unique_ptr<vk::Fence> fence;
+    std::unique_ptr<vk::Semaphore> readiness;
+    VkSemaphore readinessHandle{};
+    bool transportConsumed{};
+    bool completionConsumed{};
+};
+
+RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
+        std::shared_ptr<RuntimeGenerateDiagnosticPendingState> value) noexcept :
+    pending(std::move(value)) {}
+
+RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
+        RuntimeGenerationId generation, VkImage image, VkExtent2D extent, VkFormat format,
+        VkImageLayout layout, uint32_t family, VkSemaphore readiness,
+        std::weak_ptr<const uint8_t> lifetime) :
+    pending(std::make_shared<RuntimeGenerateDiagnosticPendingState>()) {
+    pending->generation = generation; pending->image = image; pending->extent = extent;
+    pending->format = format; pending->layout = layout; pending->family = family;
+    pending->readinessHandle = readiness; pending->sessionLifetime = std::move(lifetime);
+}
+
+RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
+        RuntimeGenerateDiagnosticPending&& other) noexcept :
+    pending(std::move(other.pending)) { other.pending.reset(); }
+
+RuntimeGenerateDiagnosticPending& RuntimeGenerateDiagnosticPending::operator=(
+        RuntimeGenerateDiagnosticPending&& other) noexcept {
+    if (this != &other) {
+        pending = std::move(other.pending);
+        other.pending.reset();
+    }
+    return *this;
+}
+
+bool RuntimeGenerateDiagnosticPending::valid() const noexcept {
+    const auto& value = pending;
+    return value && value->generation != 0 && value->image != VK_NULL_HANDLE
+        && !value->sessionLifetime.expired() && !value->completionConsumed;
+}
+
+RuntimeGenerationId RuntimeGenerateDiagnosticPending::identity() const noexcept {
+    const auto& value = pending; return value ? value->generation : 0;
+}
+VkImage RuntimeGenerateDiagnosticPending::imageHandle() const noexcept {
+    const auto& value = pending; return value ? value->image : VK_NULL_HANDLE;
+}
+VkExtent2D RuntimeGenerateDiagnosticPending::extentValue() const noexcept {
+    const auto& value = pending; return value ? value->extent : VkExtent2D{};
+}
+VkFormat RuntimeGenerateDiagnosticPending::formatValue() const noexcept {
+    const auto& value = pending; return value ? value->format : VK_FORMAT_UNDEFINED;
+}
+VkImageLayout RuntimeGenerateDiagnosticPending::layoutValue() const noexcept {
+    const auto& value = pending; return value ? value->layout : VK_IMAGE_LAYOUT_UNDEFINED;
+}
+uint32_t RuntimeGenerateDiagnosticPending::queueFamily() const noexcept {
+    const auto& value = pending; return value ? value->family : 0;
+}
+VkSemaphore RuntimeGenerateDiagnosticPending::readinessSemaphore() const noexcept {
+    const auto& value = pending;
+    return value ? value->readinessHandle : VK_NULL_HANDLE;
+}
+void RuntimeGenerateDiagnosticPending::consumeTransport() {
+    const auto& value = pending;
+    if (!value || !valid() || value->transportConsumed)
+        throw std::logic_error("invalid, stale, or consumed D3A2 transport capability");
+    value->transportConsumed = true;
+}
 
 RuntimeGeneratedFrameToken::RuntimeGeneratedFrameToken(RuntimeGenerationId id,
         VkImage imageHandle, VkExtent2D imageExtent, VkFormat imageFormat,
@@ -219,6 +298,10 @@ namespace lsfgvk::backend {
             VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
         std::optional<RuntimeGenerateDiagnosticResult> process(
             VkImage transportImage, vk::SyncFdPayload payload);
+        std::optional<RuntimeGenerateDiagnosticPending> submit(
+            VkImage transportImage, vk::SyncFdPayload payload);
+        RuntimeGenerateDiagnosticResult complete(RuntimeGenerateDiagnosticPending&& pending);
+        [[nodiscard]] bool hasPending() const noexcept { return pendingGeneration != nullptr; }
     private:
         struct Pass {
             std::vector<Gamma0> gamma0;
@@ -247,6 +330,11 @@ namespace lsfgvk::backend {
         RuntimeGenerateDiagnosticState state;
         RuntimeGenerationId generation{};
         std::shared_ptr<const uint8_t> sessionLifetime{std::make_shared<const uint8_t>(0)};
+        std::shared_ptr<RuntimeGenerateDiagnosticPendingState> pendingGeneration;
+        std::optional<RuntimeGenerateDiagnosticPending> processSubmission(
+            VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion);
+        RuntimeGenerateDiagnosticResult validateCompletedGeneration(
+            const std::shared_ptr<RuntimeGenerateDiagnosticPendingState>& pending);
     };
 }
 
@@ -540,8 +628,22 @@ std::optional<RuntimeGenerateDiagnosticResult> Instance::processRuntimeGenerateD
     return session.process(transportImage, std::move(payload));
 }
 
+std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateDiagnostic(
+        RuntimeGenerateDiagnosticSession& session,
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    return session.submit(transportImage, std::move(payload));
+}
+
+RuntimeGenerateDiagnosticResult Instance::completeRuntimeGenerateDiagnostic(
+        RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerateDiagnosticPending&& pending) {
+    return session.complete(std::move(pending));
+}
+
 void Instance::closeRuntimeGenerateDiagnosticSession(
         const RuntimeGenerateDiagnosticSession& session) {
+    if (session.hasPending())
+        throw std::logic_error("cannot close runtime Generate diagnostic with pending generation");
     const auto it = std::ranges::find_if(m_runtimeGenerateDiagnosticSessions,
         [&session](const auto& candidate) { return candidate.get() == &session; });
     if (it != m_runtimeGenerateDiagnosticSessions.end())
@@ -1015,8 +1117,12 @@ RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
     std::cerr << "Black image zero initialization: PASS\n";
 }
 
-std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionImpl::process(
-        VkImage transportImage, vk::SyncFdPayload payload) {
+std::optional<RuntimeGenerateDiagnosticPending>
+RuntimeGenerateDiagnosticSessionImpl::processSubmission(
+        VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion) {
+    static_cast<void>(deferGenerateCompletion);
+    if (pendingGeneration)
+        throw std::logic_error("runtime Generate diagnostic already has a pending generation");
     const auto step = state.advance();
     try {
     const auto& vk = instance.getVulkan();
@@ -1154,6 +1260,26 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionI
     }
 
     command.end(vk);
+    if (runGenerate) {
+        auto pending = std::make_shared<RuntimeGenerateDiagnosticPendingState>();
+        pending->generation = generation;
+        pending->image = destination.handle();
+        pending->extent = extent;
+        pending->format = VK_FORMAT_R8G8B8A8_UNORM;
+        pending->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        pending->family = family;
+        pending->sessionLifetime = sessionLifetime;
+        pending->fence = std::make_unique<vk::Fence>(vk);
+        pending->readiness = std::make_unique<vk::Semaphore>(vk);
+        pending->readinessHandle = pending->readiness->handle();
+        state.recordSubmittedGeneration();
+        command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
+            {pending->readiness->handle()}, VK_NULL_HANDLE, 0,
+            pending->fence->handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+        pendingGeneration = pending;
+        return RuntimeGenerateDiagnosticPending(pending);
+    }
+
     vk::Fence fence(vk);
     command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
         {}, VK_NULL_HANDLE, 0, fence.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1180,6 +1306,21 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionI
         return std::nullopt;
     }
 
+    throw std::logic_error("runtime Generate submission did not produce pending state");
+    } catch (...) {
+        state.recordFailure();
+        throw;
+    }
+}
+
+RuntimeGenerateDiagnosticResult
+RuntimeGenerateDiagnosticSessionImpl::validateCompletedGeneration(
+        const std::shared_ptr<RuntimeGenerateDiagnosticPendingState>& pending) {
+    const auto& vk = instance.getVulkan();
+    if (!pending || pending != pendingGeneration || pending->completionConsumed)
+        throw std::logic_error("invalid or already completed D3A2 generation");
+    if (!pending->fence->wait(vk))
+        throw backend::error("P4C-D2 delayed backend fence wait failed");
     const auto bytes = readback.read(vk, capturedBytes);
     if (bytes.size() != capturedBytes)
         throw backend::error("P4C-D2 generated readback byte count mismatch");
@@ -1222,10 +1363,40 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionI
         .metadata = {generation, extent, VK_FORMAT_R8G8B8A8_UNORM,
             bytes.size(), nonzero, checksum},
         .frame = RuntimeGeneratedFrameToken(generation, destination.handle(), extent,
-            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, family,
+            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pending->family,
             sessionLifetime)
     };
+}
+
+std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionImpl::process(
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    auto pending = processSubmission(transportImage, std::move(payload), false);
+    if (!pending) return std::nullopt;
+    pending->consumeTransport();
+    return complete(std::move(*pending));
+}
+
+std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateDiagnosticSessionImpl::submit(
+        VkImage transportImage, vk::SyncFdPayload payload) {
+    return processSubmission(transportImage, std::move(payload), true);
+}
+
+RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
+        RuntimeGenerateDiagnosticPending&& capability) {
+    const auto pending = capability.pending;
+    if (!pending || pending != pendingGeneration || !capability.valid()
+            || !pending->transportConsumed)
+        throw std::logic_error("D3A2 completion lacks consumed transport authority");
+    try {
+        auto result = validateCompletedGeneration(pending);
+        pending->completionConsumed = true;
+        capability.pending.reset();
+        pendingGeneration.reset();
+        return result;
     } catch (...) {
+        pending->completionConsumed = true;
+        capability.pending.reset();
+        pendingGeneration.reset();
         state.recordFailure();
         throw;
     }

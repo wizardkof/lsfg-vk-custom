@@ -22,7 +22,9 @@ namespace lsfgvk::backend {
     class [[gnu::visibility("default")]] InstanceImpl;
     class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
     class [[gnu::visibility("default")]] RuntimeGenerateDiagnosticSessionImpl;
+    class RuntimeGenerateDiagnosticPendingState;
     struct RuntimeGeneratedFrameTokenTestAccess;
+    struct RuntimeGenerateDiagnosticPendingTestAccess;
 
     using Context = ContextImpl;
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
@@ -75,6 +77,34 @@ namespace lsfgvk::backend {
     struct [[gnu::visibility("default")]] RuntimeGenerateDiagnosticResult {
         RuntimeGeneratedFrameMetadata metadata;
         RuntimeGeneratedFrameToken frame;
+    };
+
+    class [[gnu::visibility("default")]] RuntimeGenerateDiagnosticPending {
+    public:
+        RuntimeGenerateDiagnosticPending() noexcept = default;
+        RuntimeGenerateDiagnosticPending(const RuntimeGenerateDiagnosticPending&) = delete;
+        RuntimeGenerateDiagnosticPending& operator=(const RuntimeGenerateDiagnosticPending&) = delete;
+        RuntimeGenerateDiagnosticPending(RuntimeGenerateDiagnosticPending&&) noexcept;
+        RuntimeGenerateDiagnosticPending& operator=(RuntimeGenerateDiagnosticPending&&) noexcept;
+        ~RuntimeGenerateDiagnosticPending() = default;
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] RuntimeGenerationId identity() const noexcept;
+        [[nodiscard]] VkImage imageHandle() const noexcept;
+        [[nodiscard]] VkExtent2D extentValue() const noexcept;
+        [[nodiscard]] VkFormat formatValue() const noexcept;
+        [[nodiscard]] VkImageLayout layoutValue() const noexcept;
+        [[nodiscard]] uint32_t queueFamily() const noexcept;
+        [[nodiscard]] VkSemaphore readinessSemaphore() const noexcept;
+        void consumeTransport();
+    private:
+        friend class RuntimeGenerateDiagnosticSessionImpl;
+        friend struct RuntimeGenerateDiagnosticPendingTestAccess;
+        explicit RuntimeGenerateDiagnosticPending(
+            std::shared_ptr<RuntimeGenerateDiagnosticPendingState>) noexcept;
+        RuntimeGenerateDiagnosticPending(RuntimeGenerationId, VkImage, VkExtent2D,
+            VkFormat, VkImageLayout, uint32_t, VkSemaphore,
+            std::weak_ptr<const uint8_t>);
+        std::shared_ptr<RuntimeGenerateDiagnosticPendingState> pending;
     };
 
     ///
@@ -156,6 +186,12 @@ namespace lsfgvk::backend {
         std::optional<RuntimeGenerateDiagnosticResult> processRuntimeGenerateDiagnostic(
             RuntimeGenerateDiagnosticSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
+        std::optional<RuntimeGenerateDiagnosticPending> submitRuntimeGenerateDiagnostic(
+            RuntimeGenerateDiagnosticSession& session,
+            VkImage transportImage, vk::SyncFdPayload payload);
+        RuntimeGenerateDiagnosticResult completeRuntimeGenerateDiagnostic(
+            RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerateDiagnosticPending&& pending);
         void closeRuntimeGenerateDiagnosticSession(
             const RuntimeGenerateDiagnosticSession& session);
 

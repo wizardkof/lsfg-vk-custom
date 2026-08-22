@@ -35,8 +35,19 @@ int main() {
     assert(state.generatedFrames() == 1);
     assert(!state.finalPassReady());
     assert(!state.completionResultAvailable());
+    assert(!state.pendingGeneration());
+
+    state.recordSubmittedGeneration();
+    assert(state.pendingGeneration());
+    assert(!state.finalPassReady());
+    assert(!state.completionResultAvailable());
+    bool rejectedOverlappingPending = false;
+    try { state.recordSubmittedGeneration(); }
+    catch (const std::logic_error&) { rejectedOverlappingPending = true; }
+    assert(rejectedOverlappingPending);
 
     state.recordValidatedOutput();
+    assert(!state.pendingGeneration());
     assert(state.finalPassReady());
     assert(state.completionResultAvailable());
     state.issueCompletionResult();

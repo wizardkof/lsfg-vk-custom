@@ -486,13 +486,14 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
                 this->frameTransportA, sourceImage, this->info.extent,
                 semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
-            auto generated = this->instance.get().processRuntimeGenerateDiagnostic(
+            auto generated = this->instance.get().submitRuntimeGenerateDiagnostic(
                 this->runtimeGenerateDiagnosticSession.get(), this->frameTransportB.image(),
                 std::move(payload));
             if (generated) {
                 this->generatedOutputReturnDiagnosticSession =
                     std::make_unique<GeneratedOutputReturnDiagnosticSession>(
-                        std::move(*generated), this->devicePair,
+                        std::move(*generated), this->instance.get(),
+                        this->runtimeGenerateDiagnosticSession.get(), this->devicePair,
                         this->instance.get().runtimeExchangeEndpoint(),
                         vk::makeRuntimeExchangeEndpoint(vk), true);
             }
