@@ -3,6 +3,7 @@
 #pragma once
 
 #include "d3b1_present_path.hpp"
+#include "d3b2_insertion_path.hpp"
 
 #include "fixed_frame_scheduler.hpp"
 #include "fixed_output_pacer.hpp"
@@ -37,8 +38,30 @@
 
 namespace lsfgvk::layer {
 
+enum class SwapchainReleaseBackend : uint8_t { None, Khr, Ext };
+
+enum class GeneratedOutputTerminalConsumer : uint8_t {
+    DiagnosticOnly,
+    D3B1,
+    D3B2
+};
+
+[[nodiscard]] constexpr GeneratedOutputTerminalConsumer
+selectGeneratedOutputTerminalConsumer(bool d3b1Eligible, bool d3b2Eligible) noexcept {
+    if (d3b2Eligible)
+        return GeneratedOutputTerminalConsumer::D3B2;
+    if (d3b1Eligible)
+        return GeneratedOutputTerminalConsumer::D3B1;
+    return GeneratedOutputTerminalConsumer::DiagnosticOnly;
+}
+
     [[nodiscard]] inline bool d3b1PresentationDiagnosticEnabled() noexcept {
         const char* value = std::getenv("LSFGVK_D3B1_PRESENT_DIAGNOSTIC");
+        return value && std::strcmp(value, "1") == 0;
+    }
+
+    [[nodiscard]] inline bool d3b2InsertionDiagnosticEnabled() noexcept {
+        const char* value = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
         return value && std::strcmp(value, "1") == 0;
     }
 
@@ -84,6 +107,7 @@ namespace lsfgvk::layer {
         // Tracks the mode of the Root-owned Swapchain context. The virtual
         // VkImage handles and VirtualSwapchainRuntime remain stable.
         bool fixedContext{};
+        SwapchainReleaseBackend releaseBackend{SwapchainReleaseBackend::None};
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
@@ -152,6 +176,9 @@ namespace lsfgvk::layer {
         uint32_t virtualFinalCommandFamily{VK_QUEUE_FAMILY_IGNORED};
         ls::lazy<vk::Semaphore> virtualFinalAcquireSemaphore;
         ls::lazy<vk::Semaphore> virtualFinalPresentSemaphore;
+        ls::lazy<vk::Semaphore> d3b2OriginalAcquireSemaphore;
+        ls::lazy<vk::Semaphore> d3b2GeneratedPresentSemaphore;
+        ls::lazy<vk::Semaphore> d3b2OriginalPresentSemaphore;
 
         ls::R<backend::Instance> instance;
         vk::RuntimeDevicePair devicePair;
@@ -178,6 +205,7 @@ namespace lsfgvk::layer {
             generatedOutputReturnDiagnosticSession;
         std::optional<vk::Semaphore> returnedForGraphics;
         D3B1PresentationState d3b1State{D3B1PresentationState::IDLE};
+        D3B2InsertionState d3b2State{D3B2InsertionState::INACTIVE};
 
         void ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family);
 

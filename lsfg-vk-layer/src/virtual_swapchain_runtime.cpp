@@ -13,6 +13,8 @@
 #include <optional>
 #include <utility>
 #include <vector>
+#include <array>
+#include <cstring>
 
 #include <vulkan/vulkan_core.h>
 
@@ -22,11 +24,13 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
         VkQueue offloadQueue,
         std::shared_ptr<std::mutex> offloadMutex,
         size_t imageCount,
-        const VirtualSwapchainImageSpec& spec) :
+        const VirtualSwapchainImageSpec& spec,
+        bool d3b2ReleaseCapable) :
         vk(std::cref(vk)),
         offloadQueue(offloadQueue),
         offloadMutex(std::move(offloadMutex)),
-        state(imageCount) {
+        state(imageCount),
+        d3b2ReleaseCapable(d3b2ReleaseCapable) {
     if (this->offloadQueue == VK_NULL_HANDLE || !this->offloadMutex)
         throw ls::error("virtual swapchain requires a dedicated graphics queue");
     if (!spec.supported())
@@ -34,6 +38,7 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
 
     this->images.reserve(imageCount);
     this->readySemaphores.reserve(imageCount);
+    this->originalReadySemaphores.reserve(imageCount);
     for (size_t i = 0; i < imageCount; ++i) {
         auto formatList = spec.makeFormatListInfo();
         const void* pNext = spec.hasFormatList ? &formatList : nullptr;
@@ -44,6 +49,7 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
             spec.usage,
             spec.imageOptions(pNext));
         this->readySemaphores.emplace_back(vk);
+        this->originalReadySemaphores.emplace_back(vk);
     }
 }
 
@@ -146,6 +152,12 @@ VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
     std::vector<VkPipelineStageFlags> stages(
         waitSemaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     const auto ready = this->readySemaphores.at(imageIndex).handle();
+    const auto originalReady = this->originalReadySemaphores.at(imageIndex).handle();
+    const bool d3b2 = [] {
+        const char* value = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const std::array<VkSemaphore, 2> signals{ready, originalReady};
     const VkSubmitInfo submitInfo{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size()),
@@ -153,8 +165,8 @@ VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
         .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
         .commandBufferCount = 0,
         .pCommandBuffers = nullptr,
-        .signalSemaphoreCount = 1,
-        .pSignalSemaphores = &ready
+        .signalSemaphoreCount = d3b2 ? 2U : 1U,
+        .pSignalSemaphores = signals.data()
     };
 
     // vkQueuePresentKHR requires host access to its queue to be externally
@@ -185,6 +197,10 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
 
     const auto serial = this->presentSerial.fetch_add(1);
     const bool d3bSingleSwapchainEligible = !synchronous;
+    const char* d3b2 = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
+    if (d3bSingleSwapchainEligible && d3b2 && std::strcmp(d3b2, "1") == 0
+            && !this->d3b2ReleaseCapable)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     // A borrowed application queue is valid only while the intercepted public
     // present remains open. Every borrowed graphics-final operation is thus
     // synchronous, including ordinary virtual-final blits.
@@ -298,6 +314,7 @@ void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
             result = this->presenter(
                 present->imageIndex,
                 this->readySemaphores.at(present->imageIndex).handle(),
+                this->originalReadySemaphores.at(present->imageIndex).handle(),
                 job.nextChain,
                 stopToken,
                 job.sourcePresentTime,

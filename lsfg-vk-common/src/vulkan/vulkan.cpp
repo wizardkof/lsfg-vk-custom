@@ -520,7 +520,13 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .QueuePresentKHR = graphical ?
             dpa<PFN_vkQueuePresentKHR>(f, d, "vkQueuePresentKHR") : nullptr,
         .DestroySwapchainKHR = graphical ?
-            dpa<PFN_vkDestroySwapchainKHR>(f, d, "vkDestroySwapchainKHR") : nullptr
+            dpa<PFN_vkDestroySwapchainKHR>(f, d, "vkDestroySwapchainKHR") : nullptr,
+        .ReleaseSwapchainImagesKHR = graphical ?
+            reinterpret_cast<PFN_vkReleaseSwapchainImagesKHR>(f.GetDeviceProcAddr(d,
+                "vkReleaseSwapchainImagesKHR")) : nullptr,
+        .ReleaseSwapchainImagesEXT = graphical ?
+            reinterpret_cast<PFN_vkReleaseSwapchainImagesEXT>(f.GetDeviceProcAddr(d,
+                "vkReleaseSwapchainImagesEXT")) : nullptr
     };
 }
 

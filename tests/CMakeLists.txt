@@ -87,6 +87,14 @@ target_include_directories(lsfg-vk-test-d3b1-present-path PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
 target_link_libraries(lsfg-vk-test-d3b1-present-path PRIVATE lsfg-vk-common)
 
+lsfgvk_add_layer_unit_test(
+    lsfg-vk-test-d3b2-insertion-path
+    d3b2_insertion_path_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-d3b2-insertion-path PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_link_libraries(lsfg-vk-test-d3b2-insertion-path PRIVATE lsfg-vk-common)
+
 add_executable(lsfg-vk-test-graphics-final-queue graphics_final_queue_test.cpp)
 target_include_directories(lsfg-vk-test-graphics-final-queue PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")

@@ -1619,7 +1619,17 @@ namespace {
                         queueIt->second.queue,
                         queueIt->second.mutex,
                         realImages.size(),
-                        spec);
+                        spec,
+                        [&]() {
+                            const auto maintenanceIt = instance_info->swapchainMaintenanceFamilies.find(device);
+                            if (maintenanceIt == instance_info->swapchainMaintenanceFamilies.end())
+                                return false;
+                            const auto& funcs = it->second.df();
+                            return (maintenanceIt->second == SwapchainMaintenanceFamily::KHR
+                                    && funcs.ReleaseSwapchainImagesKHR)
+                                || (maintenanceIt->second == SwapchainMaintenanceFamily::EXT
+                                    && funcs.ReleaseSwapchainImagesEXT);
+                        }());
                     applicationImages = virtualRuntime->imageHandles();
                     virtualized = true;
                     // The same runtime is valid for Adaptive and Fixed.
@@ -1669,7 +1679,18 @@ namespace {
                     .virtualized = virtualized,
                     .dynamicPresentModeEligible =
                         virtualized && dynamicPresentModeEligible,
-                    .fixedContext = fixedMode
+                    .fixedContext = fixedMode,
+                    .releaseBackend = [&]() {
+                        const auto maintenanceIt = instance_info->swapchainMaintenanceFamilies.find(device);
+                        if (maintenanceIt == instance_info->swapchainMaintenanceFamilies.end())
+                            return SwapchainReleaseBackend::None;
+                        const auto& funcs = it->second.df();
+                        if (maintenanceIt->second == SwapchainMaintenanceFamily::KHR && funcs.ReleaseSwapchainImagesKHR)
+                            return SwapchainReleaseBackend::Khr;
+                        if (maintenanceIt->second == SwapchainMaintenanceFamily::EXT && funcs.ReleaseSwapchainImagesEXT)
+                            return SwapchainReleaseBackend::Ext;
+                        return SwapchainReleaseBackend::None;
+                    }()
                 });
             if (!inserted)
                 throw ls::error("swapchain info already exists");
@@ -1696,6 +1717,7 @@ namespace {
                         [workerSwapchain, borrowedQueueMutex, device](
                                 uint32_t imageIndex,
                                 VkSemaphore readySemaphore,
+                                VkSemaphore originalReadySemaphore,
                                 void* nextChain,
                                 std::stop_token stopToken,
                                 std::chrono::steady_clock::time_point sourcePresentTime,
@@ -1715,7 +1737,10 @@ namespace {
                                     workerSwapchain,
                                     nextChain,
                                     imageIndex,
-                                    { readySemaphore },
+                                    (std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC")
+                                        && std::strcmp(std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC"), "1") == 0)
+                                        ? std::vector<VkSemaphore>{readySemaphore, originalReadySemaphore}
+                                        : std::vector<VkSemaphore>{readySemaphore},
                                     stopToken,
                                     sourcePresentTime,
                                     d3bSingleSwapchainEligible,

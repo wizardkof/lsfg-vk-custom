@@ -40,6 +40,14 @@ vk::PhysicalDeviceIdentity identity(uint8_t id) {
 using namespace lsfgvk::layer;
 
 int main() {
+    static_assert(selectGeneratedOutputTerminalConsumer(false, false)
+        == GeneratedOutputTerminalConsumer::DiagnosticOnly);
+    static_assert(selectGeneratedOutputTerminalConsumer(true, false)
+        == GeneratedOutputTerminalConsumer::D3B1);
+    static_assert(selectGeneratedOutputTerminalConsumer(false, true)
+        == GeneratedOutputTerminalConsumer::D3B2);
+    static_assert(selectGeneratedOutputTerminalConsumer(true, true)
+        == GeneratedOutputTerminalConsumer::D3B2);
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_B8G8R8A8_UNORM));
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_R8G8B8A8_UNORM));
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_A2R10G10B10_UNORM_PACK32));

@@ -36,6 +36,7 @@ namespace lsfgvk::layer {
         using Presenter = std::function<VkResult(
             uint32_t imageIndex,
             VkSemaphore readySemaphore,
+            VkSemaphore originalReadySemaphore,
             void* nextChain,
             std::stop_token stopToken,
             std::chrono::steady_clock::time_point sourcePresentTime,
@@ -48,7 +49,8 @@ namespace lsfgvk::layer {
             VkQueue offloadQueue,
             std::shared_ptr<std::mutex> offloadMutex,
             size_t imageCount,
-            const VirtualSwapchainImageSpec& spec);
+            const VirtualSwapchainImageSpec& spec,
+            bool d3b2ReleaseCapable = false);
         ~VirtualSwapchainRuntime();
 
         [[nodiscard]] VkResult getImages(uint32_t* count, VkImage* images) const noexcept;
@@ -117,11 +119,13 @@ namespace lsfgvk::layer {
         std::shared_ptr<std::mutex> offloadMutex;
         std::vector<vk::Image> images;
         std::vector<vk::Semaphore> readySemaphores;
+        std::vector<vk::Semaphore> originalReadySemaphores;
         VirtualSwapchainState state;
 
         std::atomic<uint64_t> presentSerial{1};
         std::atomic<VkResult> asyncResult{VK_SUCCESS};
         std::atomic_bool stopping{false};
+        bool d3b2ReleaseCapable{};
 
         mutable std::mutex jobsMutex;
         std::unordered_map<uint64_t, Job> jobs;

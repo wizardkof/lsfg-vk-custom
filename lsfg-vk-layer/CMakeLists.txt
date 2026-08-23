@@ -1,4 +1,5 @@
 set(LAYER_SOURCES
+    "src/d3b2_insertion_path.cpp"
     "src/d3b1_present_path.cpp"
     "src/entrypoint.cpp"
     "src/fixed_frame_scheduler.cpp"

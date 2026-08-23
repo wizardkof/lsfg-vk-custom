@@ -440,6 +440,11 @@ void Swapchain::ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t fami
     this->virtualFinalCommandBuffer.emplace(vk, pool);
     this->virtualFinalAcquireSemaphore.emplace(vk);
     this->virtualFinalPresentSemaphore.emplace(vk);
+    if (d3b2InsertionDiagnosticEnabled()) {
+        this->d3b2OriginalAcquireSemaphore.emplace(vk);
+        this->d3b2GeneratedPresentSemaphore.emplace(vk);
+        this->d3b2OriginalPresentSemaphore.emplace(vk);
+    }
     if (!this->renderFence.has_value()) {
       this->renderFence.emplace(vk);
     }
@@ -586,11 +591,21 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 const bool d3b = d3b1PresentEligible(d3b1PresentationDiagnosticEnabled(),
                     d3bSingleSwapchainEligible, next_chain != nullptr,
                     this->info.virtualized, d3bResourcesReady, this->d3b1State);
+                const bool d3b2 = d3b1PresentEligible(d3b2InsertionDiagnosticEnabled(),
+                    d3bSingleSwapchainEligible, next_chain != nullptr,
+                    this->info.virtualized, d3bResourcesReady
+                        && this->info.releaseBackend != SwapchainReleaseBackend::None
+                        && this->d3b2OriginalAcquireSemaphore.has_value()
+                        && this->d3b2GeneratedPresentSemaphore.has_value()
+                        && this->d3b2OriginalPresentSemaphore.has_value(),
+                    this->d3b1State);
+                const auto terminalConsumer = selectGeneratedOutputTerminalConsumer(d3b, d3b2);
                 std::optional<vk::RuntimeForeignImageHandoffInfo> handoff;
-                if (d3b) {
+                if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly) {
                     try { this->returnedForGraphics.emplace(vk); }
                     catch (...) {
-                        this->d3b1State = D3B1PresentationState::FAILED;
+                        if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B1)
+                            this->d3b1State = D3B1PresentationState::FAILED;
                         throw;
                     }
                     handoff = vk::RuntimeForeignImageHandoffInfo{
@@ -605,20 +620,151 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                             this->instance.get().runtimeExchangeEndpoint(),
                             vk::makeRuntimeExchangeEndpoint(vk), true, handoff);
                 } catch (...) {
-                    if (d3b) {
-                        this->d3b1State = D3B1PresentationState::FAILED;
+                    if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly) {
+                        if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B1)
+                            this->d3b1State = D3B1PresentationState::FAILED;
                         this->returnedForGraphics.reset();
                     }
                     throw;
                 }
-                if (d3b) {
-                    this->d3b1State = D3B1PresentationState::A_HANDOFF_SUBMITTED;
+                if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly) {
+                    if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B1)
+                        this->d3b1State = D3B1PresentationState::A_HANDOFF_SUBMITTED;
                     const auto view = this->generatedOutputReturnDiagnosticSession
                         ->returnedImageView();
                     VkFormatProperties2 destinationProperties{
                         VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
                     vk.fi().GetPhysicalDeviceFormatProperties2(
                         vk.physdev(), this->info.format, &destinationProperties);
+                    if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B2) {
+                        this->d3b2State = D3B2InsertionState::INACTIVE;
+                        D3B2InsertionPath insertion{
+                            .generated = {
+                                .image = view.image(), .format = view.format(),
+                                .extent = view.extent(), .layout = view.layout(),
+                                .sourceQueueFamily = view.sourceQueueFamily(),
+                                .destinationQueueFamily = view.destinationQueueFamily(),
+                                .ownershipAcquireRequired = view.handoffPendingAcquire(),
+                                .blitSourceSupported = view.valid()
+                                    && modifierSupportsBlitSource(vk, view.format(), view.modifier())},
+                            .original = {
+                                .image = this->info.images.at(imageIdx),
+                                .format = this->info.format, .extent = this->info.extent,
+                                .layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                .sourceQueueFamily = graphicsFinalQueue->family,
+                                .destinationQueueFamily = graphicsFinalQueue->family,
+                                .blitSourceSupported = (destinationProperties.formatProperties.optimalTilingFeatures
+                                    & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0},
+                            .originalReady = semaphores.size() > 1 ? semaphores.at(1) : VK_NULL_HANDLE,
+                            .returnedForGraphics = this->returnedForGraphics->handle(),
+                            .acquireGenerated = this->virtualFinalAcquireSemaphore->handle(),
+                            .acquireOriginal = this->d3b2OriginalAcquireSemaphore->handle(),
+                            .generatedPresentReady = this->d3b2GeneratedPresentSemaphore->handle(),
+                            .originalPresentReady = this->d3b2OriginalPresentSemaphore->handle(),
+                            .graphicsFence = this->renderFence->handle(),
+                            .commandPoolFamily = this->virtualFinalCommandFamily,
+                            .submitQueueFamily = graphicsFinalQueue->family,
+                            .submitQueueFlags = graphicsFinalQueue->flags,
+                            .singleSwapchain = d3bSingleSwapchainEligible,
+                            .hasPNext = next_chain != nullptr,
+                            .fifo = this->info.adaptivePresentMode == VK_PRESENT_MODE_FIFO_KHR,
+                            .hiddenBlitDestinationSupported = (destinationProperties.formatProperties.optimalTilingFeatures
+                                & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
+                            .maintenanceReleaseCapable = this->info.releaseBackend
+                                != SwapchainReleaseBackend::None,
+                            .state = &this->d3b2State};
+                        insertion.acquire = [&](VkSemaphore acquireSemaphore) {
+                            uint32_t index{};
+                            const auto result = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                                2ULL * 1000 * 1000 * 1000, acquireSemaphore, VK_NULL_HANDLE, &index);
+                            if (result != VK_SUCCESS)
+                                throw ls::vulkan_error(result, "D3B2 hidden WSI acquire failed");
+                            return D3B2HiddenImage{this->info.realImages.at(index), index, this->info.extent};
+                        };
+                        insertion.record = [&](const D3B2HiddenImage& generated,
+                                const D3B2HiddenImage& original) {
+                            const auto& command = *this->virtualFinalCommandBuffer;
+                            command.begin(vk);
+                            std::vector<vk::Barrier> generatedPre;
+                            if (view.handoffPendingAcquire())
+                                generatedPre.push_back(barrierHelper(view.image(), 0,
+                                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    view.sourceQueueFamily(), view.destinationQueueFamily()));
+                            generatedPre.push_back(barrierHelper(generated.image, 0,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+                            command.blitImage(vk, generatedPre, {view.image(), generated.image},
+                                {view.extent(), generated.extent}, {barrierHelper(generated.image,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
+                            command.blitImage(vk, {
+                                    barrierHelper(this->info.images.at(imageIdx), 0,
+                                        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                                    barrierHelper(original.image, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)},
+                                {this->info.images.at(imageIdx), original.image},
+                                this->info.extent,
+                                {barrierHelper(this->info.images.at(imageIdx),
+                                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                                 barrierHelper(original.image, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
+                            command.end(vk);
+                            this->renderFence->reset(vk);
+                        };
+                        insertion.submit = [&] {
+                            const std::vector<VkSemaphore> waits{
+                                insertion.originalReady, insertion.returnedForGraphics,
+                                insertion.acquireGenerated, insertion.acquireOriginal};
+                            const std::scoped_lock queueLock(*queueMutex);
+                            this->virtualFinalCommandBuffer->submit(vk, queue, waits,
+                                VK_NULL_HANDLE, 0,
+                                {insertion.generatedPresentReady, insertion.originalPresentReady},
+                                VK_NULL_HANDLE, 0, insertion.graphicsFence,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+                            return VK_SUCCESS;
+                        };
+                        insertion.present = [&](const D3B2HiddenImage& image, VkSemaphore ready) {
+                            const VkPresentInfoKHR info{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                .waitSemaphoreCount = 1, .pWaitSemaphores = &ready,
+                                .swapchainCount = 1, .pSwapchains = &swapchain,
+                                .pImageIndices = &image.index};
+                            const std::scoped_lock queueLock(*queueMutex);
+                            return vk.df().QueuePresentKHR(queue, &info);
+                        };
+                        insertion.waitGraphicsFence = [&] { return this->renderFence->wait(vk, UINT64_MAX); };
+                        insertion.generatedIntegrity = [&] {
+                            this->generatedOutputReturnDiagnosticSession->completePresentationDiagnostics();
+                            return this->generatedOutputReturnDiagnosticSession->gpuChainedPassed();
+                        };
+                        insertion.originalIdentity = [&] { return insertion.original.image == this->info.images.at(imageIdx); };
+                        insertion.retire = [&] { this->generatedOutputReturnDiagnosticSession.reset(); this->returnedForGraphics.reset(); };
+                        insertion.emitMarker = [] { std::cerr << "DG2X_P4C_D3B2_GENERATED_THEN_ORIGINAL_PRESENT_PASS\n"; };
+                        insertion.releaseAcquiredImages = [&](const std::vector<uint32_t>& indices) {
+                            VkReleaseSwapchainImagesInfoKHR releaseInfo{
+                                .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
+                                .swapchain = swapchain,
+                                .imageIndexCount = static_cast<uint32_t>(indices.size()),
+                                .pImageIndices = indices.data()};
+                            if (this->info.releaseBackend == SwapchainReleaseBackend::Khr
+                                    && vk.df().ReleaseSwapchainImagesKHR)
+                                return vk.df().ReleaseSwapchainImagesKHR(vk.dev(), &releaseInfo);
+                            if (this->info.releaseBackend == SwapchainReleaseBackend::Ext
+                                    && vk.df().ReleaseSwapchainImagesEXT)
+                                return vk.df().ReleaseSwapchainImagesEXT(vk.dev(), &releaseInfo);
+                            return VK_ERROR_EXTENSION_NOT_PRESENT;
+                        };
+                        const auto result = executeD3B2Insertion(insertion);
+                        this->captureOnlyPhase = 6;
+                        if (stopAfterCompletion && d3b1OneShotRequested(std::getenv("LSFGVK_D3B1_ONESHOT")))
+                            *stopAfterCompletion = true;
+                        return result;
+                    }
                     D3B1PresentPath presentPath{
                         .source = {
                             .image = view.image(), .format = view.format(),
