@@ -12,6 +12,19 @@ ExternalSemaphoreError::ExternalSemaphoreError(
         ExternalSemaphoreFailure failure, VkResult result, const char* message) :
     std::runtime_error(message), failureCode(failure), vkResult(result) {}
 
+SyncFdPayload::SyncFdPayload(SyncFdPayload&& other) noexcept :
+    validPayload(std::exchange(other.validPayload, false)),
+    sentinelPayload(std::exchange(other.sentinelPayload, false)),
+    fd(std::move(other.fd)) {}
+
+SyncFdPayload& SyncFdPayload::operator=(SyncFdPayload&& other) noexcept {
+    if (this == &other) return *this;
+    this->validPayload = std::exchange(other.validPayload, false);
+    this->sentinelPayload = std::exchange(other.sentinelPayload, false);
+    this->fd = std::move(other.fd);
+    return *this;
+}
+
 void SyncFdPayload::invalidateAfterImport() noexcept {
     if (!this->sentinelPayload)
         static_cast<void>(this->fd.release());

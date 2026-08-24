@@ -40,6 +40,12 @@ vk::PhysicalDeviceIdentity identity(uint8_t id) {
 using namespace lsfgvk::layer;
 
 int main() {
+    static_assert(!std::is_copy_constructible_v<RuntimeGeneratedBReturnPending>);
+    static_assert(std::is_move_constructible_v<RuntimeGeneratedBReturnPending>);
+    assert(returnSubmissionFence(ReturnSubmissionFencePolicy::ACTIVE_COMPATIBLE,
+        reinterpret_cast<VkFence>(uintptr_t{1})) == VK_NULL_HANDLE);
+    assert(returnSubmissionFence(ReturnSubmissionFencePolicy::SHADOW_REAL,
+        reinterpret_cast<VkFence>(uintptr_t{1})) != VK_NULL_HANDLE);
     static_assert(selectGeneratedOutputTerminalConsumer(false, false)
         == GeneratedOutputTerminalConsumer::DiagnosticOnly);
     static_assert(selectGeneratedOutputTerminalConsumer(true, false)
@@ -48,6 +54,8 @@ int main() {
         == GeneratedOutputTerminalConsumer::D3B2);
     static_assert(selectGeneratedOutputTerminalConsumer(true, true)
         == GeneratedOutputTerminalConsumer::D3B2);
+    static_assert(selectGeneratedOutputTerminalConsumer(true, true, true)
+        == GeneratedOutputTerminalConsumer::D3B3);
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_B8G8R8A8_UNORM));
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_R8G8B8A8_UNORM));
     static_assert(captureDiagnosticFormatSupported(VK_FORMAT_A2R10G10B10_UNORM_PACK32));
@@ -118,6 +126,12 @@ int main() {
     assert(pendingCapability.readinessSemaphore() == fakeReady);
     auto movedPending = std::move(pendingCapability);
     assert(!pendingCapability.valid() && movedPending.valid());
+    auto retirementAuthority = movedPending.operationRetirementAuthority();
+    assert(retirementAuthority.valid() && retirementAuthority.generationId() == 44);
+    bool duplicateAuthorityRejected = false;
+    try { static_cast<void>(movedPending.operationRetirementAuthority()); }
+    catch (const std::logic_error&) { duplicateAuthorityRejected = true; }
+    assert(duplicateAuthorityRejected);
     movedPending.consumeTransport();
     bool pendingRetryRejected = false;
     try { movedPending.consumeTransport(); }

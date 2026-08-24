@@ -7,6 +7,27 @@
 
 namespace lsfgvk::layer {
 
+void validateD3B2InsertionPreflight(const D3B2InsertionPath& path) {
+    if (!path.singleSwapchain || path.hasPNext || !path.fifo
+            || !path.generated.image || !path.original.image
+            || !path.generated.blitSourceSupported
+            || !path.original.blitSourceSupported
+            || !path.hiddenBlitDestinationSupported
+            || !path.originalReady || !path.returnedForGraphics
+            || !path.acquireGenerated || !path.acquireOriginal
+            || !path.releaseAcquiredImages
+            || !path.maintenanceReleaseCapable
+            || !path.generatedPresentReady || !path.originalPresentReady
+            || !path.graphicsFence
+            || path.commandPoolFamily == VK_QUEUE_FAMILY_IGNORED
+            || path.commandPoolFamily != path.submitQueueFamily
+            || !(path.submitQueueFlags & VK_QUEUE_GRAPHICS_BIT)
+            || (!path.submit && !path.submitWithWaitStage)
+            || path.returnedForGraphicsWaitStage
+                != d3b2FirstTerminalConsumerStage())
+        throw std::runtime_error("D3B2 insertion preflight failed");
+}
+
 VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
     if (!path.state || *path.state == D3B2InsertionState::PASS
             || *path.state == D3B2InsertionState::FAILED)
@@ -20,21 +41,7 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
     const auto retire = [&] { if (!retired) { path.retire(); retired = true; } };
     try {
         *path.state = D3B2InsertionState::PREFLIGHT;
-        if (!path.singleSwapchain || path.hasPNext || !path.fifo
-                || !path.singleSwapchain || !path.generated.image
-                || !path.original.image || !path.generated.blitSourceSupported
-                || !path.original.blitSourceSupported
-                || !path.hiddenBlitDestinationSupported
-                || !path.originalReady || !path.returnedForGraphics
-                || !path.acquireGenerated || !path.acquireOriginal
-                || !path.releaseAcquiredImages
-                || !path.maintenanceReleaseCapable
-                || !path.generatedPresentReady || !path.originalPresentReady
-                || !path.graphicsFence
-                || path.commandPoolFamily == VK_QUEUE_FAMILY_IGNORED
-                || path.commandPoolFamily != path.submitQueueFamily
-                || !(path.submitQueueFlags & VK_QUEUE_GRAPHICS_BIT))
-            throw std::runtime_error("D3B2 insertion preflight failed");
+        validateD3B2InsertionPreflight(path);
         *path.state = D3B2InsertionState::GENERATED_READY;
         const auto generated = path.acquire(path.acquireGenerated);
         imageIndices[0] = generated.index;
@@ -45,9 +52,14 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
         if (!generated.image || !original.image || generated.index == original.index)
             throw std::runtime_error("D3B2 hidden acquire invariant failed");
         path.distinctHiddenImages = true;
+        if (path.onDestinationsAcquired) path.onDestinationsAcquired();
         *path.state = D3B2InsertionState::TWO_ACQUIRES_READY;
+        if (path.onRecordBegin) path.onRecordBegin();
         path.record(generated, original);
-        const auto submitResult = path.submit();
+        if (path.onRecordEnd) path.onRecordEnd();
+        const auto submitResult = path.submitWithWaitStage
+            ? path.submitWithWaitStage(path.returnedForGraphicsWaitStage)
+            : path.submit();
         if (submitResult != VK_SUCCESS)
         {
             deviceLost = submitResult == VK_ERROR_DEVICE_LOST;
@@ -56,8 +68,12 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
         submitted = true;
         imageStates.fill(D3B2ImageState::SUBMITTED_FOR_GRAPHICS);
         *path.state = D3B2InsertionState::INSERT_SUBMITTED;
+        if (path.onTerminalSubmitAccepted) path.onTerminalSubmitAccepted();
         imageStates[0] = D3B2ImageState::PRESENT_CALL_ISSUED;
-        const auto generatedResult = path.present(generated, path.generatedPresentReady);
+        const auto generatedResult = path.presentFences.enabled() && path.presentWithFence
+            ? path.presentWithFence(generated, path.generatedPresentReady,
+                path.presentFences.generated)
+            : path.present(generated, path.generatedPresentReady);
         if (generatedResult != VK_SUCCESS)
         {
             deviceLost = generatedResult == VK_ERROR_DEVICE_LOST;
@@ -65,8 +81,12 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
         }
         imageStates[0] = D3B2ImageState::PRESENT_ACQUISITION_RELEASED;
         *path.state = D3B2InsertionState::GENERATED_PRESENTED;
+        if (path.onGeneratedPresentAccepted) path.onGeneratedPresentAccepted();
         imageStates[1] = D3B2ImageState::PRESENT_CALL_ISSUED;
-        const auto originalResult = path.present(original, path.originalPresentReady);
+        const auto originalResult = path.presentFences.enabled() && path.presentWithFence
+            ? path.presentWithFence(original, path.originalPresentReady,
+                path.presentFences.original)
+            : path.present(original, path.originalPresentReady);
         if (originalResult != VK_SUCCESS)
         {
             deviceLost = originalResult == VK_ERROR_DEVICE_LOST;
@@ -74,9 +94,11 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
         }
         imageStates[1] = D3B2ImageState::PRESENT_ACQUISITION_RELEASED;
         *path.state = D3B2InsertionState::ORIGINAL_PRESENTED;
+        if (path.onOriginalPresentAccepted) path.onOriginalPresentAccepted();
         if (!path.waitGraphicsFence())
             throw ls::vulkan_error(VK_TIMEOUT, "D3B2 graphics fence failed");
         submitted = false;
+        if (path.onGraphicsFenceRetired) path.onGraphicsFenceRetired();
         *path.state = D3B2InsertionState::VALIDATING;
         if (!path.generatedIntegrity() || !path.originalIdentity())
             throw std::runtime_error("D3B2 terminal validation failed");

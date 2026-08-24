@@ -6,6 +6,7 @@
 #include "helpers/limits.hpp"
 #include "helpers/utils.hpp"
 #include "runtime_generate_diagnostic_state.hpp"
+#include "lsfg-vk-backend/runtime_operation_authority.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/fnv1a.hpp"
@@ -59,6 +60,18 @@ using namespace lsfgvk::backend;
 
 namespace lsfgvk::backend {
 
+struct RuntimeShadowIngestAuthorityAccess {
+    static RuntimeIngestPending accepted(uint64_t frame, TemporalSourceSlot slot,
+            uint64_t epoch, VkFence fence, VkSemaphore payload,
+            const std::shared_ptr<const uint8_t>& lifetime) {
+        RuntimeSubmissionRetirement submission(fence, epoch, lifetime);
+        RuntimeTemporarySemaphorePayload imported(payload, epoch, lifetime);
+        submission.submitted();
+        imported.waitSubmitted(epoch);
+        return {frame, slot, epoch, std::move(submission), std::move(imported), lifetime};
+    }
+};
+
 class RuntimeGenerateDiagnosticPendingState {
 public:
     RuntimeGenerationId generation{};
@@ -73,6 +86,12 @@ public:
     VkSemaphore readinessHandle{};
     bool transportConsumed{};
     bool completionConsumed{};
+    bool retirementAuthorityIssued{};
+    bool operationRetired{};
+    RuntimeTemporalPairIdentity temporalPair{};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    RuntimeBinarySemaphoreEpoch generationReadyEpoch;
+#endif
 };
 
 RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
@@ -129,6 +148,35 @@ uint32_t RuntimeGenerateDiagnosticPending::queueFamily() const noexcept {
 VkSemaphore RuntimeGenerateDiagnosticPending::readinessSemaphore() const noexcept {
     const auto& value = pending;
     return value ? value->readinessHandle : VK_NULL_HANDLE;
+}
+VkFence RuntimeGenerateDiagnosticPending::sourceReadRetirementFence() const noexcept {
+    const auto& value = pending;
+    return value && value->fence ? value->fence->handle() : VK_NULL_HANDLE;
+}
+RuntimeTemporalPairIdentity RuntimeGenerateDiagnosticPending::temporalPair() const noexcept {
+    const auto& value = pending;
+    return value ? value->temporalPair : RuntimeTemporalPairIdentity{};
+}
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+bool RuntimeGenerateDiagnosticPending::transportConsumedForTesting() const noexcept {
+    return pending && pending->transportConsumed;
+}
+bool RuntimeGenerateDiagnosticPending::retirementAuthorityIssuedForTesting() const noexcept {
+    return pending && pending->retirementAuthorityIssued;
+}
+bool RuntimeGenerateDiagnosticPending::operationRetiredForTesting() const noexcept {
+    return pending && pending->operationRetired;
+}
+#endif
+RuntimeGenerationOperationRetirement
+RuntimeGenerateDiagnosticPending::operationRetirementAuthority() {
+    if (!pending || !valid() || pending->retirementAuthorityIssued)
+        throw std::logic_error("invalid or duplicate generation retirement authority");
+    pending->retirementAuthorityIssued = true;
+    return RuntimeGenerationOperationRetirement(pending);
+}
+RuntimeGenerationId RuntimeGenerationOperationRetirement::generationId() const noexcept {
+    return pending ? pending->generation : 0;
 }
 void RuntimeGenerateDiagnosticPending::consumeTransport() {
     const auto& value = pending;
@@ -188,6 +236,11 @@ namespace lsfgvk::backend {
             std::shared_ptr<std::vector<vk::PhysicalDeviceSnapshot>> observedDevices,
             const std::filesystem::path& shaderDllPath,
             bool allowLowPrecision);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        InstanceImpl(VkInstance instance, VkDevice device, VkPhysicalDevice physicalDevice,
+            vk::VulkanInstanceFuncs instanceFuncs, vk::VulkanDeviceFuncs deviceFuncs,
+            const std::unordered_map<uint32_t, std::vector<uint8_t>>& shaderResources);
+#endif
 
         /// get the Vulkan instance
         /// @return the Vulkan instance
@@ -295,14 +348,72 @@ namespace lsfgvk::backend {
     class RuntimeGenerateDiagnosticSessionImpl {
     public:
         RuntimeGenerateDiagnosticSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
-            VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
+            VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf,
+            RuntimeGenerateMode mode);
         std::optional<RuntimeGenerateDiagnosticResult> process(
             VkImage transportImage, vk::SyncFdPayload payload);
         std::optional<RuntimeGenerateDiagnosticPending> submit(
             VkImage transportImage, vk::SyncFdPayload payload);
+        std::optional<RuntimeGenerateDiagnosticPending> submitExplicit(
+            VkImage transportImage, vk::SyncFdPayload payload,
+            TemporalSourceSlot destinationSlot, uint64_t frameId,
+            std::optional<RuntimeTemporalPairIdentity> pair);
         RuntimeGenerateDiagnosticResult complete(RuntimeGenerateDiagnosticPending&& pending);
+        void retireOperation(RuntimeGenerationOperationRetirement&& authority);
         [[nodiscard]] bool hasPending() const noexcept { return pendingGeneration != nullptr; }
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        [[nodiscard]] RuntimeShadowSplitResourceSnapshot shadowSnapshot() const noexcept {
+            if (!shadowSplit) return {};
+            return {shadowSplit->ingestCommand.handle(), shadowSplit->generateCommand.handle(),
+                shadowSplit->ingestReady.handle(), shadowSplit->ingestFence.handle(),
+                instance.getVulkan().queueFamilyIndex(),
+                shadowSplit->ingestReadyEpoch.canSignalAgain()};
+        }
+        RuntimeShadowIngestSnapshot submitShadowIngest(VkImage, vk::SyncFdPayload,
+            TemporalSourceSlot, uint64_t);
+        RuntimeShadowIngestSnapshot retireShadowIngest();
+        [[nodiscard]] RuntimeShadowIngestSnapshot shadowIngestSnapshot() const noexcept;
+        RuntimeShadowGenerateSnapshot submitShadowGenerate(RuntimeTemporalPairIdentity);
+        RuntimeShadowGenerateSnapshot retireShadowGenerate();
+        [[nodiscard]] RuntimeShadowGenerateSnapshot shadowGenerateSnapshot() const noexcept;
+        std::optional<RuntimeGenerateDiagnosticPending> takeShadowGeneratePending();
+        void recordShadowBReturnSubmitted(RuntimeGenerationId);
+        void recordShadowBReturnRejected(RuntimeGenerationId, bool deviceLost);
+        void retireShadowBReturnWait(RuntimeGenerationId);
+        void failShadowBReturnRetirement(RuntimeGenerationId, bool deviceLost);
+        void releaseShadowGenerationReady(RuntimeGenerationId);
+        void recordShadowAReturnSubmitted(RuntimeGenerationId);
+#endif
     private:
+        struct ShadowSplitResources {
+            explicit ShadowSplitResources(const vk::Vulkan& vk) :
+                ingestCommand(vk), generateCommand(vk), ingestReady(vk), ingestFence(vk) {}
+            vk::CommandBuffer ingestCommand;
+            vk::CommandBuffer generateCommand;
+            vk::Semaphore ingestReady;
+            vk::Fence ingestFence;
+            RuntimeBinarySemaphoreEpoch ingestReadyEpoch;
+            std::unique_ptr<vk::Semaphore> importedWait;
+            std::optional<RuntimeIngestPending> pending;
+            std::optional<RuntimeGenerateDiagnosticPending> generatePending;
+            std::shared_ptr<RuntimeGenerateDiagnosticPendingState> generateState;
+            uint64_t nextEpoch{1};
+            VkSemaphore submittedWait{};
+            bool frameTransportReusable{true};
+            bool failed{};
+            bool deviceLost{};
+            bool generateExecutionRetired{};
+            bool generationReadyOutstanding{};
+            uint32_t ingestSubmitCount{};
+            uint32_t generateSubmitCount{};
+            uint32_t bReturnSubmitCount{};
+            uint32_t aReturnSubmitCount{};
+            RuntimeTemporalPairIdentity lastRetiredPair{};
+            RuntimeGenerationId lastRetiredGeneration{};
+            bool lastExecutionRetired{};
+            bool lastGeneratedOutputRetired{};
+            bool lastGenerationReadyReusable{};
+        };
         struct Pass {
             std::vector<Gamma0> gamma0;
             std::vector<Gamma1> gamma1;
@@ -328,11 +439,22 @@ namespace lsfgvk::backend {
         Beta1 beta1;
         Pass pass;
         RuntimeGenerateDiagnosticState state;
+        RuntimeGenerateSerialState serialState;
+        RuntimeGenerateMode mode{RuntimeGenerateMode::OneShot};
+        std::array<uint64_t, 2> temporalFrameIds{};
+        std::unique_ptr<ShadowSplitResources> shadowSplit;
         RuntimeGenerationId generation{};
         std::shared_ptr<const uint8_t> sessionLifetime{std::make_shared<const uint8_t>(0)};
         std::shared_ptr<RuntimeGenerateDiagnosticPendingState> pendingGeneration;
         std::optional<RuntimeGenerateDiagnosticPending> processSubmission(
-            VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion);
+            VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion,
+            std::optional<TemporalSourceSlot> destinationSlot = std::nullopt,
+            uint64_t frameId = 0,
+            std::optional<RuntimeTemporalPairIdentity> pair = std::nullopt);
+        void recordTemporalIngestCommands(const vk::Vulkan&, const vk::CommandBuffer&,
+            VkImage transportImage, size_t frameIndex, bool seed, uint32_t family);
+        void recordPrepassGenerateCommands(const vk::Vulkan&, const vk::CommandBuffer&,
+            size_t frameIndex, bool runGammaDelta, bool runGenerate);
         RuntimeGenerateDiagnosticResult validateCompletedGeneration(
             const std::shared_ptr<RuntimeGenerateDiagnosticPendingState>& pending);
     };
@@ -363,6 +485,14 @@ Instance::Instance(
         selectFunc, observedDevices, shaderDllPath, allowLowPrecision
     );
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+Instance::Instance(VkInstance instance, VkDevice device, VkPhysicalDevice physicalDevice,
+        vk::VulkanInstanceFuncs instanceFuncs, vk::VulkanDeviceFuncs deviceFuncs,
+        const std::unordered_map<uint32_t, std::vector<uint8_t>>& shaderResources) :
+    m_impl(std::make_unique<InstanceImpl>(instance, device, physicalDevice,
+        instanceFuncs, deviceFuncs, shaderResources)) {}
+#endif
 
 namespace {
     /// find the cache file path
@@ -451,6 +581,18 @@ InstanceImpl::InstanceImpl(vk::PhysicalDeviceSelector selectPhysicalDevice,
 #endif
     vk.persistPipelineCache(); // will silently fail
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+InstanceImpl::InstanceImpl(VkInstance instance, VkDevice device,
+        VkPhysicalDevice physicalDevice, vk::VulkanInstanceFuncs instanceFuncs,
+        vk::VulkanDeviceFuncs deviceFuncs,
+        const std::unordered_map<uint32_t, std::vector<uint8_t>>& shaderResources) :
+    vk(instance, device, physicalDevice, instanceFuncs, deviceFuncs, false),
+    deviceIdentity(vk::getPhysicalDeviceIdentity(this->vk.fi(), this->vk.physdev())),
+    shaders(buildShaderRegistry(this->vk, false, shaderResources)) {
+    visibleDevices.push_back({deviceIdentity, {}});
+}
+#endif
 
 const vk::PhysicalDeviceIdentity& Instance::deviceIdentity() const {
     return this->m_impl->getDeviceIdentity();
@@ -615,11 +757,11 @@ void Instance::closeRuntimePrepassSession(const RuntimePrepassSession& session) 
 
 RuntimeGenerateDiagnosticSession& Instance::openRuntimeGenerateDiagnosticSession(
         VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
-        float flow, bool perf) {
+        float flow, bool perf, RuntimeGenerateMode mode) {
     validateRuntimeGenerateFormats(*m_impl, transportFormat, transportModifier);
     return *m_runtimeGenerateDiagnosticSessions.emplace_back(
         std::make_unique<RuntimeGenerateDiagnosticSessionImpl>(*m_impl, extent,
-            transportFormat, transportModifier, flow, perf));
+            transportFormat, transportModifier, flow, perf, mode));
 }
 
 std::optional<RuntimeGenerateDiagnosticResult> Instance::processRuntimeGenerateDiagnostic(
@@ -634,10 +776,23 @@ std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateD
     return session.submit(transportImage, std::move(payload));
 }
 
+std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateExplicit(
+        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+        uint64_t frameId, std::optional<RuntimeTemporalPairIdentity> pair) {
+    return session.submitExplicit(transportImage, std::move(payload),
+        destinationSlot, frameId, pair);
+}
+
 RuntimeGenerateDiagnosticResult Instance::completeRuntimeGenerateDiagnostic(
         RuntimeGenerateDiagnosticSession& session,
         RuntimeGenerateDiagnosticPending&& pending) {
     return session.complete(std::move(pending));
+}
+
+void Instance::retireRuntimeGenerateOperation(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationOperationRetirement&& authority) {
+    session.retireOperation(std::move(authority));
 }
 
 void Instance::closeRuntimeGenerateDiagnosticSession(
@@ -649,6 +804,82 @@ void Instance::closeRuntimeGenerateDiagnosticSession(
     if (it != m_runtimeGenerateDiagnosticSessions.end())
         m_runtimeGenerateDiagnosticSessions.erase(it);
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+RuntimeShadowSplitResourceSnapshot Instance::inspectShadowSplitResources(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowSnapshot();
+}
+
+RuntimeShadowIngestSnapshot Instance::submitShadowTemporalIngest(
+        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+        uint64_t frameId) {
+    return session.submitShadowIngest(transportImage, std::move(payload),
+        destinationSlot, frameId);
+}
+
+RuntimeShadowIngestSnapshot Instance::retireShadowTemporalIngest(
+        RuntimeGenerateDiagnosticSession& session) {
+    return session.retireShadowIngest();
+}
+
+RuntimeShadowIngestSnapshot Instance::inspectShadowTemporalIngest(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowIngestSnapshot();
+}
+
+RuntimeShadowGenerateSnapshot Instance::submitShadowPrepassGenerate(
+        RuntimeGenerateDiagnosticSession& session,
+        RuntimeTemporalPairIdentity pair) {
+    return session.submitShadowGenerate(pair);
+}
+
+RuntimeShadowGenerateSnapshot Instance::retireShadowPrepassGenerate(
+        RuntimeGenerateDiagnosticSession& session) {
+    return session.retireShadowGenerate();
+}
+
+RuntimeShadowGenerateSnapshot Instance::inspectShadowPrepassGenerate(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowGenerateSnapshot();
+}
+
+std::optional<RuntimeGenerateDiagnosticPending>
+Instance::takeShadowPrepassGeneratePending(RuntimeGenerateDiagnosticSession& session) {
+    return session.takeShadowGeneratePending();
+}
+
+void Instance::recordShadowBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.recordShadowBReturnSubmitted(generation);
+}
+
+void Instance::recordShadowBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation, bool deviceLost) {
+    session.recordShadowBReturnRejected(generation, deviceLost);
+}
+
+void Instance::retireShadowBReturnWait(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.retireShadowBReturnWait(generation);
+}
+
+void Instance::failShadowBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation, bool deviceLost) {
+    session.failShadowBReturnRetirement(generation, deviceLost);
+}
+
+void Instance::releaseShadowGenerationReady(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.releaseShadowGenerationReady(generation);
+}
+
+void Instance::recordShadowAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.recordShadowAReturnSubmitted(generation);
+}
+#endif
 
 vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {
     return vk::makeRuntimeExchangeEndpoint(this->m_impl->getVulkan());
@@ -1001,9 +1232,9 @@ void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayloa
 
 RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
         const InstanceImpl& instance, VkExtent2D extent, VkFormat transportFormat,
-        uint64_t transportModifier, float flow, bool perf) :
+        uint64_t transportModifier, float flow, bool perf, RuntimeGenerateMode sessionMode) :
     instance(instance), extent(extent), transportFormat(transportFormat),
-    transportModifier(transportModifier),
+    transportModifier(transportModifier), mode(sessionMode),
     generation([] {
         static std::atomic<RuntimeGenerationId> next{1};
         auto id = next.fetch_add(1, std::memory_order_relaxed);
@@ -1114,44 +1345,29 @@ RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     command.end(instance.getVulkan());
     command.submit(instance.getVulkan());
+    try {
+        shadowSplit = std::make_unique<ShadowSplitResources>(instance.getVulkan());
+    } catch (...) {
+        // The inactive scaffold must never make the qualified monolithic path unavailable.
+        shadowSplit.reset();
+    }
     std::cerr << "Black image zero initialization: PASS\n";
 }
 
-std::optional<RuntimeGenerateDiagnosticPending>
-RuntimeGenerateDiagnosticSessionImpl::processSubmission(
-        VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion) {
-    static_cast<void>(deferGenerateCompletion);
-    if (pendingGeneration)
-        throw std::logic_error("runtime Generate diagnostic already has a pending generation");
-    const auto step = state.advance();
-    try {
-    const auto& vk = instance.getVulkan();
-    const uint32_t family = vk.queueFamilyIndex();
-    const bool seed = step.action == RuntimeGenerateDiagnosticAction::SEED_ONLY;
-    const bool runGammaDelta = step.action != RuntimeGenerateDiagnosticAction::SEED_ONLY;
-    const bool runGenerate = step.action == RuntimeGenerateDiagnosticAction::GENERATE;
-    const size_t frameIndex = step.frameIndex;
-
-    const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
-        vk.df().CreateSemaphore, vk.df().DestroySemaphore,
-        vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
-    auto waitSemaphore = vk::createSyncFdImportSemaphore(semaphoreDevice);
-    vk::importSyncFdTemporary(semaphoreDevice, waitSemaphore.handle(), payload);
-
-    vk::CommandBuffer command(vk);
-    command.begin(vk);
+void RuntimeGenerateDiagnosticSessionImpl::recordTemporalIngestCommands(
+        const vk::Vulkan& vk, const vk::CommandBuffer& command,
+        VkImage transportImage, size_t frameIndex, bool seed, uint32_t family) {
     const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     std::vector<vk::Barrier> acquire{{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
         VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_FOREIGN_EXT, family,
         transportImage, range}};
     if (seed) {
-        for (const auto image : {sources.first.handle(), sources.second.handle()}) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()})
             acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
                 VK_QUEUE_FAMILY_IGNORED, image, range});
-        }
     } else {
         const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
         acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
@@ -1161,7 +1377,6 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
     }
     command.insertBarriers(vk, acquire, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT);
-
     const VkImageBlit blit{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         {{0, 0, 0}, {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1}},
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -1171,21 +1386,15 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     };
-    if (seed) {
-        blitTo(sources.first.handle());
-        blitTo(sources.second.handle());
-    } else {
-        blitTo(frameIndex == 0 ? sources.first.handle() : sources.second.handle());
-    }
-
+    if (seed) { blitTo(sources.first.handle()); blitTo(sources.second.handle()); }
+    else blitTo(frameIndex == 0 ? sources.first.handle() : sources.second.handle());
     std::vector<vk::Barrier> ready;
     if (seed) {
-        for (const auto image : {sources.first.handle(), sources.second.handle()}) {
+        for (const auto image : {sources.first.handle(), sources.second.handle()})
             ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
-        }
     } else {
         const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
         ready.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
@@ -1199,70 +1408,493 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
         transportImage, range});
     command.insertBarriers(vk, ready, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
 
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+RuntimeShadowIngestSnapshot
+RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
+    RuntimeShadowIngestSnapshot result{};
+    if (!shadowSplit) return result;
+    const auto& shadow = *shadowSplit;
+    if (shadow.pending) {
+        result.frameId = shadow.pending->frameIdentity();
+        result.slot = shadow.pending->destination();
+        result.epoch = shadow.pending->epoch();
+        result.submitAccepted = shadow.pending->submissionAuthority().state()
+            != RuntimeAuthorityState::PREPARED;
+        result.submissionRetired = shadow.pending->submissionAuthority().state()
+            == RuntimeAuthorityState::RETIRED;
+        result.payloadRetired = shadow.pending->payloadAuthority().state()
+            == RuntimeTemporaryPayloadState::WAIT_RETIRED;
+    }
+    result.waitSemaphore = shadow.submittedWait;
+    result.waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    result.commandBuffer = shadow.ingestCommand.handle();
+    result.signalSemaphore = shadow.ingestReady.handle();
+    result.fence = shadow.ingestFence.handle();
+    result.frameTransportReusable = shadow.frameTransportReusable;
+    result.ingestReadyReusable = shadow.ingestReadyEpoch.canSignalAgain();
+    result.failed = shadow.failed;
+    result.deviceLost = shadow.deviceLost;
+    result.shadowSubmitCount = shadow.ingestSubmitCount;
+    result.shadowGenerateSubmitCount = shadow.generateSubmitCount;
+    return result;
+}
+
+RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIngest(
+        VkImage transportImage, vk::SyncFdPayload payload,
+        TemporalSourceSlot destinationSlot, uint64_t frameId) {
+    if (!shadowSplit) throw std::logic_error("shadow split resources unavailable");
+    auto& shadow = *shadowSplit;
+    if (transportImage == VK_NULL_HANDLE || frameId == 0
+            || temporalSourceSlotIndex(destinationSlot) >= 2)
+        throw std::invalid_argument("invalid shadow ingest identity");
+    if (shadow.pending || shadow.failed || !shadow.ingestReadyEpoch.canSignalAgain())
+        throw std::logic_error("shadow ingest resources are not reusable");
+
+    const auto& vk = instance.getVulkan();
+    const uint64_t epoch = shadow.nextEpoch++;
+    bool epochReserved{};
+    bool submitAccepted{};
+    try {
+        shadow.importedWait = std::make_unique<vk::Semaphore>(vk);
+        const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
+            vk.df().CreateSemaphore, vk.df().DestroySemaphore,
+            vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
+        vk::importSyncFdTemporary(semaphoreDevice, shadow.importedWait->handle(), payload);
+        shadow.submittedWait = shadow.importedWait->handle();
+
+        shadow.ingestCommand.begin(vk);
+        recordTemporalIngestCommands(vk, shadow.ingestCommand, transportImage,
+            temporalSourceSlotIndex(destinationSlot), false, vk.queueFamilyIndex());
+        shadow.ingestCommand.end(vk);
+
+        shadow.ingestReadyEpoch.reserveSignal(epoch);
+        epochReserved = true;
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        const VkSemaphore waitSemaphore = shadow.importedWait->handle();
+        const VkCommandBuffer commandBuffer = shadow.ingestCommand.handle();
+        const VkSemaphore signalSemaphore = shadow.ingestReady.handle();
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &waitSemaphore,
+            .pWaitDstStageMask = &waitStage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signalSemaphore
+        };
+        const VkResult submitResult = vk.df().QueueSubmit(
+            vk.queue(), 1, &submit, shadow.ingestFence.handle());
+        if (submitResult != VK_SUCCESS) {
+            shadow.deviceLost = submitResult == VK_ERROR_DEVICE_LOST;
+            throw ls::vulkan_error(submitResult, "shadow ingest vkQueueSubmit() failed");
+        }
+        submitAccepted = true;
+
+        shadow.ingestReadyEpoch.producerSubmitted(epoch);
+        shadow.pending.emplace(RuntimeShadowIngestAuthorityAccess::accepted(
+            frameId, destinationSlot, epoch, shadow.ingestFence.handle(),
+            shadow.importedWait->handle(), sessionLifetime));
+        shadow.frameTransportReusable = false;
+        ++shadow.ingestSubmitCount;
+        return shadowIngestSnapshot();
+    } catch (...) {
+        if (epochReserved) shadow.ingestReadyEpoch.producerFailed();
+        shadow.failed = true;
+        if (!submitAccepted && !shadow.deviceLost) {
+            shadow.importedWait.reset();
+            shadow.pending.reset();
+        }
+        throw;
+    }
+}
+
+RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowIngest() {
+    if (!shadowSplit || !shadowSplit->pending)
+        throw std::logic_error("no accepted shadow ingest to retire");
+    auto& shadow = *shadowSplit;
+    const auto epoch = shadow.pending->epoch();
+    if (!shadow.ingestFence.wait(instance.getVulkan())) {
+        shadow.pending->submissionAuthority().fail();
+        shadow.pending->payloadAuthority().fail();
+        shadow.ingestReadyEpoch.producerFailed();
+        shadow.failed = true;
+        throw backend::error("shadow ingest fence wait failed");
+    }
+    shadow.pending->submissionAuthority().retire(epoch);
+    shadow.pending->payloadAuthority().waitRetired(epoch);
+    shadow.frameTransportReusable = true;
+    shadow.importedWait.reset();
+    return shadowIngestSnapshot();
+}
+
+RuntimeShadowGenerateSnapshot
+RuntimeGenerateDiagnosticSessionImpl::shadowGenerateSnapshot() const noexcept {
+    RuntimeShadowGenerateSnapshot result{};
+    if (!shadowSplit) return result;
+    const auto& shadow = *shadowSplit;
+    if (shadow.generateState) {
+        const auto& pair = shadow.generateState->temporalPair;
+        result.generationId = pair.generationId;
+        result.olderFrameId = pair.olderFrameId;
+        result.newerFrameId = pair.newerFrameId;
+        result.olderSlot = pair.olderSlot;
+        result.newerSlot = pair.newerSlot;
+        result.waitSemaphore = shadow.ingestReady.handle();
+        result.signalSemaphore = shadow.generateState->readinessHandle;
+        result.fence = shadow.generateState->fence
+            ? shadow.generateState->fence->handle() : VK_NULL_HANDLE;
+        result.generatedImage = shadow.generateState->image;
+        result.submitAccepted = true;
+    }
+    result.waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    result.commandBuffer = shadow.generateCommand.handle();
+    result.executionRetired = shadow.generateExecutionRetired;
+    result.ingestReadyReusable = shadow.ingestReadyEpoch.canSignalAgain();
+    if (shadow.generateState) {
+        const auto readyState = shadow.generateState->generationReadyEpoch.state();
+        result.generationReadySignalOutstanding =
+            readyState == RuntimeBinarySemaphoreState::SIGNAL_SUBMITTED;
+        result.generationReadyWaitSubmitted =
+            readyState == RuntimeBinarySemaphoreState::WAIT_SUBMITTED;
+        result.generationReadyWaitRetired =
+            readyState == RuntimeBinarySemaphoreState::WAIT_RETIRED;
+        result.generationReadyReusable =
+            shadow.generateState->generationReadyEpoch.canSignalAgain();
+        result.generatedOutputRetired = shadow.generateState->operationRetired;
+        result.generatedOutputLive = !shadow.generateState->operationRetired;
+    } else {
+        result.generationId = shadow.lastRetiredPair.generationId;
+        result.olderFrameId = shadow.lastRetiredPair.olderFrameId;
+        result.newerFrameId = shadow.lastRetiredPair.newerFrameId;
+        result.olderSlot = shadow.lastRetiredPair.olderSlot;
+        result.newerSlot = shadow.lastRetiredPair.newerSlot;
+        result.executionRetired = shadow.lastExecutionRetired;
+        result.generationReadyReusable = shadow.lastGenerationReadyReusable;
+        result.generatedOutputRetired = shadow.lastGeneratedOutputRetired;
+    }
+    result.failed = shadow.failed;
+    result.deviceLost = shadow.deviceLost;
+    result.totalShadowSubmitCount = shadow.ingestSubmitCount + shadow.generateSubmitCount;
+    result.bReturnSubmitCount = shadow.bReturnSubmitCount;
+    result.aReturnSubmitCount = shadow.aReturnSubmitCount;
+    return result;
+}
+
+RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowGenerate(
+        RuntimeTemporalPairIdentity pair) {
+    if (!shadowSplit) throw std::logic_error("shadow split resources unavailable");
+    auto& shadow = *shadowSplit;
+    if (mode != RuntimeGenerateMode::SerialReusable)
+        throw std::logic_error("shadow Generate requires SerialReusable authority");
+    if (!shadow.pending || shadow.generateState || shadow.failed)
+        throw std::logic_error("shadow ingest is not ready for Generate");
+    if (!validTemporalPair(pair)
+            || pair.newerFrameId != shadow.pending->frameIdentity()
+            || pair.newerSlot != shadow.pending->destination()
+            || pair.olderSlot == pair.newerSlot
+            || shadow.ingestReadyEpoch.state() != RuntimeBinarySemaphoreState::SIGNAL_SUBMITTED)
+        throw std::invalid_argument("invalid shadow Generate temporal identity");
+
+    // The previous generation's B/A counts remain visible in the last-retired
+    // snapshot until the next Generate begins.  Reset only the live epoch
+    // counters now that the ingest authority has been proven reusable.
+    shadow.bReturnSubmitCount = 0;
+    shadow.aReturnSubmitCount = 0;
+
+    const auto& vk = instance.getVulkan();
+    const auto epoch = shadow.pending->epoch();
+    auto pending = std::make_shared<RuntimeGenerateDiagnosticPendingState>();
+    pending->generation = pair.generationId;
+    pending->image = destination.handle();
+    pending->extent = extent;
+    pending->format = VK_FORMAT_R8G8B8A8_UNORM;
+    pending->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    pending->family = vk.queueFamilyIndex();
+    pending->sessionLifetime = sessionLifetime;
+    pending->fence = std::make_unique<vk::Fence>(vk);
+    pending->readiness = std::make_unique<vk::Semaphore>(vk);
+    pending->readinessHandle = pending->readiness->handle();
+    pending->temporalPair = pair;
+
+    bool submitAccepted{};
+    serialState.submit(pair.generationId);
+    try {
+        shadow.generateCommand.begin(vk);
+        recordPrepassGenerateCommands(vk, shadow.generateCommand,
+            temporalSourceSlotIndex(pair.newerSlot), true, true);
+        shadow.generateCommand.end(vk);
+
+        const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        const VkSemaphore waitSemaphore = shadow.ingestReady.handle();
+        const VkCommandBuffer commandBuffer = shadow.generateCommand.handle();
+        const VkSemaphore signalSemaphore = pending->readinessHandle;
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &waitSemaphore,
+            .pWaitDstStageMask = &waitStage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &signalSemaphore
+        };
+        const VkResult submitResult = vk.df().QueueSubmit(
+            vk.queue(), 1, &submit, pending->fence->handle());
+        if (submitResult != VK_SUCCESS) {
+            shadow.deviceLost = submitResult == VK_ERROR_DEVICE_LOST;
+            throw ls::vulkan_error(submitResult, "shadow Generate vkQueueSubmit() failed");
+        }
+        submitAccepted = true;
+
+        shadow.ingestReadyEpoch.waitSubmitted(epoch);
+        pending->generationReadyEpoch.signalSubmitted(pair.generationId);
+        shadow.generateState = pending;
+        shadow.generatePending.emplace(RuntimeGenerateDiagnosticPending(pending));
+        pendingGeneration = pending;
+        shadow.generationReadyOutstanding = true;
+        ++shadow.generateSubmitCount;
+        return shadowGenerateSnapshot();
+    } catch (...) {
+        shadow.ingestReadyEpoch.consumerFailed(epoch);
+        serialState.fail();
+        shadow.failed = true;
+        if (!submitAccepted && !shadow.deviceLost) {
+            shadow.generatePending.reset();
+            shadow.generateState.reset();
+        } else if (submitAccepted) {
+            shadow.generateState = std::move(pending);
+        }
+        throw;
+    }
+}
+
+RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowGenerate() {
+    if (!shadowSplit || !shadowSplit->generateState)
+        throw std::logic_error("no accepted shadow Generate to retire");
+    auto& shadow = *shadowSplit;
+    const auto epoch = shadow.pending->epoch();
+    if (!shadow.generateState->fence->wait(instance.getVulkan())) {
+        shadow.ingestReadyEpoch.consumerFailed(epoch);
+        shadow.failed = true;
+        throw backend::error("shadow Generate fence wait failed");
+    }
+    shadow.ingestReadyEpoch.waitRetired(epoch);
+    shadow.ingestReadyEpoch.makeAvailable(epoch);
+    shadow.pending->submissionAuthority().retire(epoch);
+    shadow.pending->payloadAuthority().waitRetired(epoch);
+    shadow.frameTransportReusable = true;
+    shadow.pending.reset();
+    shadow.importedWait.reset();
+    if (serialState.currentPhase() == RuntimeGenerateSerialPhase::IN_FLIGHT)
+        serialState.sourceReadsRetired(shadow.generateState->generation);
+    shadow.generateExecutionRetired = true;
+    return shadowGenerateSnapshot();
+}
+
+std::optional<RuntimeGenerateDiagnosticPending>
+RuntimeGenerateDiagnosticSessionImpl::takeShadowGeneratePending() {
+    if (!shadowSplit || !shadowSplit->generatePending || shadowSplit->failed)
+        throw std::logic_error("no usable shadow Generate pending capability");
+    auto result = std::move(shadowSplit->generatePending);
+    shadowSplit->generatePending.reset();
+    shadowSplit->generationReadyOutstanding = true;
+    return result;
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnSubmitted(
+        RuntimeGenerationId generation) {
+    if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
+            || shadowSplit->generateState->generation != generation
+            || shadowSplit->bReturnSubmitCount != 0)
+        throw std::logic_error("invalid shadow B-return submit authority");
+    shadowSplit->generateState->generationReadyEpoch.waitSubmitted(generation);
+    ++shadowSplit->bReturnSubmitCount;
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnRejected(
+        RuntimeGenerationId generation, bool lost) {
+    if (!shadowSplit || !shadowSplit->generateState
+            || shadowSplit->generateState->generation != generation
+            || shadowSplit->bReturnSubmitCount != 0)
+        throw std::logic_error("invalid rejected shadow B-return authority");
+    shadowSplit->generateState->generationReadyEpoch.consumerFailed(generation);
+    shadowSplit->failed = true;
+    shadowSplit->deviceLost = lost;
+    serialState.fail();
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::retireShadowBReturnWait(
+        RuntimeGenerationId generation) {
+    if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
+            || shadowSplit->generateState->generation != generation
+            || shadowSplit->bReturnSubmitCount != 1)
+        throw std::logic_error("invalid shadow B-return retirement authority");
+    shadowSplit->generateState->generationReadyEpoch.waitRetired(generation);
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::failShadowBReturnRetirement(
+        RuntimeGenerationId generation, bool lost) {
+    if (!shadowSplit || !shadowSplit->generateState
+            || shadowSplit->generateState->generation != generation
+            || shadowSplit->bReturnSubmitCount != 1)
+        throw std::logic_error("invalid failed shadow B-return retirement authority");
+    shadowSplit->generateState->generationReadyEpoch.consumerFailed(generation);
+    shadowSplit->failed = true;
+    shadowSplit->deviceLost = lost;
+    serialState.fail();
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::releaseShadowGenerationReady(
+        RuntimeGenerationId generation) {
+    if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
+            || shadowSplit->generateState->generation != generation
+            || !shadowSplit->generateState->operationRetired)
+        throw std::logic_error("generated output has not retired for semaphore reuse");
+    shadowSplit->generateState->generationReadyEpoch.makeAvailable(generation);
+    shadowSplit->lastRetiredPair = shadowSplit->generateState->temporalPair;
+    shadowSplit->lastRetiredGeneration = generation;
+    shadowSplit->lastExecutionRetired = shadowSplit->generateExecutionRetired;
+    shadowSplit->lastGeneratedOutputRetired = shadowSplit->generateState->operationRetired;
+    shadowSplit->lastGenerationReadyReusable = true;
+    shadowSplit->generateState.reset();
+    shadowSplit->generatePending.reset();
+    shadowSplit->generationReadyOutstanding = false;
+    shadowSplit->generateExecutionRetired = false;
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::recordShadowAReturnSubmitted(
+        RuntimeGenerationId generation) {
+    if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
+            || shadowSplit->generateState->generation != generation
+            || shadowSplit->bReturnSubmitCount != 1
+            || shadowSplit->aReturnSubmitCount != 0)
+        throw std::logic_error("invalid shadow A-return submit authority");
+    ++shadowSplit->aReturnSubmitCount;
+}
+#endif
+
+void RuntimeGenerateDiagnosticSessionImpl::recordPrepassGenerateCommands(
+        const vk::Vulkan& vk, const vk::CommandBuffer& command,
+        size_t frameIndex, bool runGammaDelta, bool runGenerate) {
     mipmaps.render(vk, command, frameIndex);
     for (size_t i = 0; i < 7; ++i) {
         alpha0.at(6 - i).render(vk, command);
         alpha1.at(6 - i).render(vk, command, frameIndex);
     }
-    beta0.render(vk, command, frameIndex);
-    beta1.render(vk, command);
+    beta0.render(vk, command, frameIndex); beta1.render(vk, command);
+    if (runGammaDelta) for (size_t j = 0; j < 7; ++j) {
+        pass.gamma0.at(j).render(vk, command, frameIndex); pass.gamma1.at(j).render(vk, command);
+        if (j >= 4) { pass.delta0.at(j - 4).render(vk, command, frameIndex); pass.delta1.at(j - 4).render(vk, command); }
+    }
+    if (!runGenerate) return;
+    const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const vk::Barrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, destination.handle(), range};
+    command.insertBarriers(vk, {toClear}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkClearColorValue zero{};
+    vk.df().CmdClearColorImage(command.handle(), destination.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+    const vk::Barrier toGenerate{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, destination.handle(), range};
+    command.insertBarriers(vk, {toGenerate}, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    pass.generate->render(vk, command, frameIndex);
+    const vk::Barrier toReadback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, destination.handle(), range};
+    command.insertBarriers(vk, {toReadback}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const VkBufferImageCopy copy{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        {0, 0, 0}, {extent.width, extent.height, 1}};
+    vk.df().CmdCopyImageToBuffer(command.handle(), destination.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle(), 1, &copy);
+    const VkBufferMemoryBarrier hostRead{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, readback.handle(), 0, capturedBytes};
+    vk.df().CmdPipelineBarrier(command.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+}
 
-    if (runGammaDelta) {
-        for (size_t j = 0; j < 7; ++j) {
-            pass.gamma0.at(j).render(vk, command, frameIndex);
-            pass.gamma1.at(j).render(vk, command);
-            if (j >= 4) {
-                pass.delta0.at(j - 4).render(vk, command, frameIndex);
-                pass.delta1.at(j - 4).render(vk, command);
-            }
+std::optional<RuntimeGenerateDiagnosticPending>
+RuntimeGenerateDiagnosticSessionImpl::processSubmission(
+        VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion,
+        std::optional<TemporalSourceSlot> explicitDestination, uint64_t frameId,
+        std::optional<RuntimeTemporalPairIdentity> explicitPair) {
+    static_cast<void>(deferGenerateCompletion);
+    if (pendingGeneration)
+        throw std::logic_error("runtime Generate diagnostic already has a pending generation");
+    RuntimeGenerateDiagnosticStep step{};
+    if (mode == RuntimeGenerateMode::OneShot) {
+        step = state.advance();
+    } else {
+        if (!explicitDestination || temporalSourceSlotIndex(*explicitDestination) >= 2
+                || frameId == 0)
+            throw std::invalid_argument("serial Generate requires explicit temporal ingest identity");
+        const auto index = temporalSourceSlotIndex(*explicitDestination);
+        const bool seedOperation = temporalFrameIds[0] == 0 && temporalFrameIds[1] == 0;
+        step = {seedOperation ? RuntimeGenerateDiagnosticAction::SEED_ONLY
+                             : explicitPair ? RuntimeGenerateDiagnosticAction::GENERATE
+                                            : RuntimeGenerateDiagnosticAction::GAMMA_DELTA,
+            0, 0, index, 0, index, index};
+    }
+    try {
+    const auto& vk = instance.getVulkan();
+    const uint32_t family = vk.queueFamilyIndex();
+    const bool seed = step.action == RuntimeGenerateDiagnosticAction::SEED_ONLY;
+    const bool runGammaDelta = step.action != RuntimeGenerateDiagnosticAction::SEED_ONLY;
+    const bool runGenerate = step.action == RuntimeGenerateDiagnosticAction::GENERATE;
+    const size_t frameIndex = step.frameIndex;
+    const auto expectedDestination = frameIndex == 0
+        ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
+    if (explicitDestination && temporalSourceSlotIndex(*explicitDestination) >= 2)
+        throw std::invalid_argument("invalid explicit temporal destination");
+    if (mode == RuntimeGenerateMode::OneShot
+            && explicitDestination && *explicitDestination != expectedDestination)
+        throw std::invalid_argument("explicit temporal destination contradicts backend orientation");
+    if (explicitDestination && frameId == 0)
+        throw std::invalid_argument("explicit temporal ingest requires frame identity");
+    if (runGenerate) {
+        if (!explicitPair)
+            throw std::invalid_argument("explicit Generate requires temporal pair identity");
+        if (!validTemporalPair(*explicitPair)
+                || temporalPairFrameIndex(*explicitPair) != frameIndex
+                || explicitPair->newerFrameId != frameId)
+            throw std::invalid_argument("invalid explicit temporal pair orientation or identity");
+        if (mode == RuntimeGenerateMode::SerialReusable) {
+            const auto olderIndex = temporalSourceSlotIndex(explicitPair->olderSlot);
+            if (temporalFrameIds[olderIndex] != explicitPair->olderFrameId)
+                throw std::invalid_argument("stale explicit temporal history identity");
+            serialState.submit(explicitPair->generationId);
         }
     }
-
-    if (runGenerate) {
-        const vk::Barrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
-            VK_QUEUE_FAMILY_IGNORED, destination.handle(), range};
-        command.insertBarriers(vk, {toClear}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkClearColorValue zero{};
-        vk.df().CmdClearColorImage(command.handle(), destination.handle(),
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
-        const vk::Barrier toGenerate{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            destination.handle(), range};
-        command.insertBarriers(vk, {toGenerate}, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-        pass.generate->render(vk, command, frameIndex);
-
-        const vk::Barrier toReadback{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            destination.handle(), range};
-        command.insertBarriers(vk, {toReadback}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkBufferImageCopy copy{0, 0, 0,
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},
-            {extent.width, extent.height, 1}};
-        vk.df().CmdCopyImageToBuffer(command.handle(), destination.handle(),
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.handle(), 1, &copy);
-        const VkBufferMemoryBarrier hostRead{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            readback.handle(), 0, capturedBytes};
-        vk.df().CmdPipelineBarrier(command.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+    if (mode == RuntimeGenerateMode::SerialReusable) {
+        if (seed)
+            temporalFrameIds = {frameId, frameId};
+        else
+            temporalFrameIds[frameIndex] = frameId;
     }
+
+    const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
+        vk.df().CreateSemaphore, vk.df().DestroySemaphore,
+        vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
+    auto waitSemaphore = vk::createSyncFdImportSemaphore(semaphoreDevice);
+    vk::importSyncFdTemporary(semaphoreDevice, waitSemaphore.handle(), payload);
+
+    vk::CommandBuffer command(vk);
+    command.begin(vk);
+    recordTemporalIngestCommands(vk, command, transportImage, frameIndex, seed, family);
+    recordPrepassGenerateCommands(vk, command, frameIndex, runGammaDelta, runGenerate);
 
     command.end(vk);
     if (runGenerate) {
         auto pending = std::make_shared<RuntimeGenerateDiagnosticPendingState>();
-        pending->generation = generation;
+        pending->generation = mode == RuntimeGenerateMode::SerialReusable
+            ? explicitPair->generationId : generation;
         pending->image = destination.handle();
         pending->extent = extent;
         pending->format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -1272,7 +1904,10 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
         pending->fence = std::make_unique<vk::Fence>(vk);
         pending->readiness = std::make_unique<vk::Semaphore>(vk);
         pending->readinessHandle = pending->readiness->handle();
-        state.recordSubmittedGeneration();
+        pending->temporalPair = *explicitPair;
+        pending->temporalPair.generationId = pending->generation;
+        if (mode == RuntimeGenerateMode::OneShot)
+            state.recordSubmittedGeneration();
         command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
             {pending->readiness->handle()}, VK_NULL_HANDLE, 0,
             pending->fence->handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1308,7 +1943,8 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
 
     throw std::logic_error("runtime Generate submission did not produce pending state");
     } catch (...) {
-        state.recordFailure();
+        if (mode == RuntimeGenerateMode::OneShot) state.recordFailure();
+        else serialState.fail();
         throw;
     }
 }
@@ -1370,7 +2006,14 @@ RuntimeGenerateDiagnosticSessionImpl::validateCompletedGeneration(
 
 std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionImpl::process(
         VkImage transportImage, vk::SyncFdPayload payload) {
-    auto pending = processSubmission(transportImage, std::move(payload), false);
+    const auto step = state.nextStep();
+    const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
+    std::optional<RuntimeTemporalPairIdentity> pair;
+    if (step.action == RuntimeGenerateDiagnosticAction::GENERATE)
+        pair = RuntimeTemporalPairIdentity{TemporalSourceSlot::Slot1,
+            TemporalSourceSlot::Slot0, 2, 3, generation};
+    auto pending = processSubmission(transportImage, std::move(payload), false,
+        slot, step.directFrames, pair);
     if (!pending) return std::nullopt;
     pending->consumeTransport();
     return complete(std::move(*pending));
@@ -1378,7 +2021,23 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionI
 
 std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateDiagnosticSessionImpl::submit(
         VkImage transportImage, vk::SyncFdPayload payload) {
-    return processSubmission(transportImage, std::move(payload), true);
+    const auto step = state.nextStep();
+    const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
+    std::optional<RuntimeTemporalPairIdentity> pair;
+    if (step.action == RuntimeGenerateDiagnosticAction::GENERATE)
+        pair = RuntimeTemporalPairIdentity{TemporalSourceSlot::Slot1,
+            TemporalSourceSlot::Slot0, 2, 3, generation};
+    return submitExplicit(transportImage, std::move(payload), slot,
+        step.directFrames, pair);
+}
+
+std::optional<RuntimeGenerateDiagnosticPending>
+RuntimeGenerateDiagnosticSessionImpl::submitExplicit(
+        VkImage transportImage, vk::SyncFdPayload payload,
+        TemporalSourceSlot destinationSlot, uint64_t frameId,
+        std::optional<RuntimeTemporalPairIdentity> pair) {
+    return processSubmission(transportImage, std::move(payload), true,
+        destinationSlot, frameId, pair);
 }
 
 RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
@@ -1388,6 +2047,25 @@ RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
             || !pending->transportConsumed)
         throw std::logic_error("D3A2 completion lacks consumed transport authority");
     try {
+        if (mode == RuntimeGenerateMode::SerialReusable) {
+            if (serialState.currentPhase() == RuntimeGenerateSerialPhase::IN_FLIGHT) {
+                if (!pending->fence || !pending->fence->wait(instance.getVulkan()))
+                    throw backend::error("serial Generate source-read fence wait failed");
+                serialState.sourceReadsRetired(pending->generation);
+            } else if (serialState.currentPhase()
+                    != RuntimeGenerateSerialPhase::SOURCE_READS_RETIRED) {
+                throw std::logic_error("serial Generate source reads lack retirement proof");
+            }
+            serialState.outputInUse(pending->generation);
+            RuntimeGenerateDiagnosticResult result{
+                .metadata = {pending->generation, pending->extent, pending->format, 0, 0, 0},
+                .frame = RuntimeGeneratedFrameToken(pending->generation, pending->image,
+                    pending->extent, pending->format, pending->layout, pending->family,
+                    pending->sessionLifetime)};
+            pending->completionConsumed = true;
+            capability.pending.reset();
+            return result;
+        }
         auto result = validateCompletedGeneration(pending);
         pending->completionConsumed = true;
         capability.pending.reset();
@@ -1397,9 +2075,23 @@ RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
         pending->completionConsumed = true;
         capability.pending.reset();
         pendingGeneration.reset();
-        state.recordFailure();
+        if (mode == RuntimeGenerateMode::OneShot) state.recordFailure();
+        else serialState.fail();
         throw;
     }
+}
+
+void RuntimeGenerateDiagnosticSessionImpl::retireOperation(
+        RuntimeGenerationOperationRetirement&& authority) {
+    const auto pending = authority.pending;
+    if (mode != RuntimeGenerateMode::SerialReusable || !pending
+            || pending != pendingGeneration || pending->operationRetired
+            || !pending->completionConsumed)
+        throw std::logic_error("invalid or stale serial Generate retirement authority");
+    serialState.retireOperation(pending->generation);
+    pending->operationRetired = true;
+    authority.pending.reset();
+    pendingGeneration.reset();
 }
 
 ContextImpl::ContextImpl(const InstanceImpl& instance,

@@ -4,8 +4,30 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 using namespace lsfgvk::layer;
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+namespace {
+struct ShadowBReturnResourceLifetime {
+    vk::RuntimeExchangeEndpoint endpoint;
+    vk::VulkanNativeExternalImageBacking backing;
+    vk::SyncFdSemaphore signal;
+    VkCommandPool commandPool{};
+    VkCommandBuffer command{};
+
+    ~ShadowBReturnResourceLifetime() {
+        if (command && commandPool && endpoint.FreeCommandBuffers)
+            endpoint.FreeCommandBuffers(endpoint.bufferDevice.device,
+                commandPool, 1, &command);
+        if (commandPool && endpoint.DestroyCommandPool)
+            endpoint.DestroyCommandPool(endpoint.bufferDevice.device,
+                commandPool, nullptr);
+    }
+};
+}
+#endif
 
 bool lsfgvk::layer::generatedOutputIntegrityMatches(
         const GeneratedOutputIntegrity& a, const GeneratedOutputIntegrity& b) noexcept {
@@ -62,6 +84,20 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
         throw std::invalid_argument("D3A2 endpoint role mismatch");
     executeGpuChained(std::move(pending), backend, session, handoff);
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+        ShadowReturnExecutionForTesting, const vk::RuntimeDevicePair& pair,
+        vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
+        bool captureOnly) : generationEndpoint(std::move(generation)),
+    renderEndpoint(std::move(render)) {
+    if (!generatedOutputRoleBindingEligible(pair, generationEndpoint.identity,
+            renderEndpoint.identity, captureOnly))
+        throw std::invalid_argument("shadow return requires CROSS_PHYSICAL_DEVICE + CAPTURE_ONLY");
+    if (generationEndpoint.bufferDevice.device == renderEndpoint.bufferDevice.device)
+        throw std::invalid_argument("shadow return endpoint role mismatch");
+}
+#endif
 
 GeneratedOutputReturnDiagnosticSession::~GeneratedOutputReturnDiagnosticSession() {
     resetBCommands();
@@ -144,7 +180,12 @@ void GeneratedOutputReturnDiagnosticSession::execute(
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO}; submit.commandBufferCount = 1;
         submit.pCommandBuffers = &bCommand; submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &signal;
-        vr = generationEndpoint.QueueSubmit(generationEndpoint.queue, 1, &submit, VK_NULL_HANDLE);
+        // The qualified active route intentionally retains its historical
+        // VK_NULL_HANDLE fence.  The inactive shadow route supplies a real
+        // fence through the same submission seam; no host wait is introduced.
+        vr = generationEndpoint.QueueSubmit(generationEndpoint.queue, 1, &submit,
+            returnSubmissionFence(ReturnSubmissionFencePolicy::ACTIVE_COMPATIBLE,
+                VK_NULL_HANDLE));
         if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A1 vkQueueSubmit B");
         bSubmitted = true;
         advance(GeneratedOutputReturnState::B_BACKING_READY, GeneratedOutputReturnState::B_COPY_SUBMITTED);
@@ -198,24 +239,55 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
         backend::RuntimeGenerateDiagnosticSession& backendSession,
         std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
-    bool transportConsumed = false;
     try {
-        if (!pending.valid() || pending.identity() == 0
-                || pending.layoutValue() != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                || pending.queueFamily() != generationEndpoint.queueFamilyIndex
-                || pending.readinessSemaphore() == VK_NULL_HANDLE)
-            throw std::invalid_argument("invalid or stale D3A2 pending generation capability");
-        const auto generation = pending.identity();
-        const auto extent = pending.extentValue();
-        const auto format = pending.formatValue();
-        const auto sourceImage = pending.imageHandle();
-        const auto generationReady = pending.readinessSemaphore();
+        auto bPending = submitGeneratedBReturn(std::move(pending),
+            ReturnSubmissionFencePolicy::ACTIVE_COMPATIBLE, backend, backendSession);
+        completeGeneratedReturnOnA(std::move(bPending), backend, backendSession, handoff);
+    } catch (...) {
+        chainedStates.fail();
+        throw;
+    }
+}
+
+RuntimeGeneratedBReturnPending GeneratedOutputReturnDiagnosticSession::submitGeneratedBReturn(
+        backend::RuntimeGenerateDiagnosticPending&& pending,
+        ReturnSubmissionFencePolicy fencePolicy, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession, VkFence shadowFence) {
+    if (!pending.valid() || pending.identity() == 0
+            || pending.layoutValue() != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+            || pending.queueFamily() != generationEndpoint.queueFamilyIndex
+            || pending.readinessSemaphore() == VK_NULL_HANDLE)
+        throw std::invalid_argument("invalid or stale D3A2 pending generation capability");
+    const auto generation = pending.identity();
+    const auto extent = pending.extentValue();
+    const auto format = pending.formatValue();
+    const auto sourceImage = pending.imageHandle();
+    const auto generationReady = pending.readinessSemaphore();
+    const bool shadowPolicy = fencePolicy == ReturnSubmissionFencePolicy::SHADOW_REAL;
+    std::shared_ptr<VkFence> fenceOwner;
+    if (shadowPolicy) {
+        VkFence created{};
+        const VkFenceCreateInfo info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        const auto result = generationEndpoint.CreateFence(
+            generationEndpoint.bufferDevice.device, &info, nullptr, &created);
+        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A3 shadow B-return fence");
+        fenceOwner = std::shared_ptr<VkFence>(new VkFence(created),
+            [endpoint = generationEndpoint](VkFence* value) {
+                if (value && *value && endpoint.DestroyFence)
+                    endpoint.DestroyFence(endpoint.bufferDevice.device, *value, nullptr);
+                delete value;
+            });
+        shadowFence = created;
+    }
+    backend::RuntimeSubmissionRetirement authority;
+    std::shared_ptr<void> returnResources;
+    bool shadowRejectionRecorded{};
+    try {
         chainedStates.advance(GpuChainedReturnState::EMPTY,
             GpuChainedReturnState::D2_SUBMITTED);
         chainedStates.advance(GpuChainedReturnState::D2_SUBMITTED,
             GpuChainedReturnState::PENDING_GENERATION);
         pending.consumeTransport();
-        transportConsumed = true;
         chainedStates.advance(GpuChainedReturnState::PENDING_GENERATION,
             GpuChainedReturnState::TRANSPORT_CONSUMED);
 
@@ -266,13 +338,127 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         submit.pWaitDstStageMask = &generationWaitStage;
         submit.commandBufferCount = 1; submit.pCommandBuffers = &bCommand;
         submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &signal;
-        vr = generationEndpoint.QueueSubmit(generationEndpoint.queue, 1, &submit, VK_NULL_HANDLE);
-        if (vr != VK_SUCCESS) throw ls::vulkan_error(vr, "D3A2 vkQueueSubmit B");
+        vr = generationEndpoint.QueueSubmit(generationEndpoint.queue, 1, &submit,
+            returnSubmissionFence(fencePolicy, shadowFence));
+        if (vr != VK_SUCCESS) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (shadowPolicy) {
+                backend.recordShadowBReturnRejected(
+                    backendSession, generation, vr == VK_ERROR_DEVICE_LOST);
+                shadowRejectionRecorded = true;
+            }
+#endif
+            throw ls::vulkan_error(vr, "D3A2 vkQueueSubmit B");
+        }
         bSubmitted = true;
         chainedStates.advance(GpuChainedReturnState::RETURN_B_PREPARED,
             GpuChainedReturnState::RETURN_B_SUBMITTED);
-        auto sync = vk::exportSyncFd(generationEndpoint.semaphoreDevice, signalB.handle());
-        auto descriptor = backing.exportDescriptor();
+        if (shadowPolicy) {
+            authority = backend::RuntimeSubmissionRetirement::submittedFence(
+                shadowFence, generation,
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+                shadowLifetime
+#else
+                std::make_shared<const uint8_t>(0)
+#endif
+            );
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            backend.recordShadowBReturnSubmitted(backendSession, generation);
+            auto owned = std::make_shared<ShadowBReturnResourceLifetime>();
+            owned->endpoint = generationEndpoint;
+            owned->backing = std::move(backing);
+            owned->signal = std::move(signalB);
+            owned->commandPool = std::exchange(bCommandPool, VK_NULL_HANDLE);
+            owned->command = std::exchange(bCommand, VK_NULL_HANDLE);
+            returnResources = std::move(owned);
+#endif
+        }
+        vk::SyncFdPayload sync;
+        try {
+            VkSemaphore exportSemaphore = signalB.handle();
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (shadowPolicy) {
+                exportSemaphore = std::static_pointer_cast<ShadowBReturnResourceLifetime>(
+                    returnResources)->signal.handle();
+            }
+#endif
+            sync = vk::exportSyncFd(generationEndpoint.semaphoreDevice, exportSemaphore);
+        } catch (...) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (shadowPolicy && authority.valid()) {
+                acceptedShadowFailure.emplace(RuntimeGeneratedBReturnPending(
+                    std::move(pending), vk::SyncFdPayload{},
+                    std::move(authority), std::move(fenceOwner),
+                    std::move(returnResources)));
+            }
+#endif
+            throw;
+        }
+        return RuntimeGeneratedBReturnPending(std::move(pending), std::move(sync),
+            std::move(authority), std::move(fenceOwner), std::move(returnResources));
+    } catch (...) {
+        if (shadowPolicy) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (!bSubmitted && !shadowRejectionRecorded && pending.valid()) {
+                try { backend.recordShadowBReturnRejected(
+                    backendSession, generation, false); }
+                catch (...) {}
+            }
+#endif
+            throw;
+        }
+        if (bSubmitted && generationEndpoint.DeviceWaitIdle)
+            static_cast<void>(generationEndpoint.DeviceWaitIdle(
+                generationEndpoint.bufferDevice.device));
+        if (pending.valid()) {
+            try { static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
+                backendSession, std::move(pending))); }
+            catch (...) {}
+        }
+        throw;
+    }
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+RuntimeGeneratedBReturnPending
+GeneratedOutputReturnDiagnosticSession::submitShadowBReturnForTesting(
+        backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    // This seam is test-only. It deliberately returns before A import and
+    // never calls completeGeneratedReturnOnA().
+    try {
+        return submitGeneratedBReturn(std::move(pending),
+            ReturnSubmissionFencePolicy::SHADOW_REAL, backend, backendSession);
+    } catch (...) {
+        if (!acceptedShadowFailure) chainedStates.fail();
+        throw;
+    }
+}
+#endif
+
+void GeneratedOutputReturnDiagnosticSession::completeGeneratedReturnOnA(
+        RuntimeGeneratedBReturnPending&& bPending, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
+    auto& pending = bPending.pending;
+    if (!pending.valid() || !bPending.bToAPayload.valid())
+        throw std::invalid_argument("invalid B-return pending for A completion");
+    const bool boundedShadowSubmission = bPending.bReturn.valid();
+    auto sync = std::move(bPending.bToAPayload);
+    const auto generation = pending.identity();
+    const auto extent = pending.extentValue();
+    const auto format = pending.formatValue();
+    try {
+        auto* returnBacking = &backing;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (boundedShadowSubmission) {
+            if (!bPending.returnResources)
+                throw std::logic_error("shadow B-return resources expired before A import");
+            returnBacking = &std::static_pointer_cast<ShadowBReturnResourceLifetime>(
+                bPending.returnResources)->backing;
+        }
+#endif
+        auto descriptor = returnBacking->exportDescriptor();
         const vk::RuntimeImageBackingInfo info{.extent = descriptor.extent,
             .format = descriptor.format,
             .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -283,11 +469,11 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         importedA = vk::createRuntimeImageEndpoint(renderEndpoint,
             std::move(descriptor.dmaBuf), info);
         importedA = vk::RuntimeImageEndpoint::createExecutionResources(std::move(importedA), 1);
-        chainedStates.advance(GpuChainedReturnState::RETURN_B_SUBMITTED,
-            GpuChainedReturnState::A_SUBMITTED);
         if (handoff.has_value()) {
             aReadbackPending = vk::RuntimeImageEndpoint::submitForeignImageReadback(
                 std::move(importedA), std::move(sync), handoff);
+            chainedStates.advance(GpuChainedReturnState::RETURN_B_SUBMITTED,
+                GpuChainedReturnState::A_SUBMITTED);
             expected = {generation, extent, format,
                 static_cast<size_t>(extent.width) * extent.height * 4U, 0, 0};
             delayedGeneration = std::move(pending);
@@ -297,6 +483,8 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
         }
         const auto bytes = vk::RuntimeImageEndpoint::readForeignImage(importedA, std::move(sync));
         aCompleted = true;
+        chainedStates.advance(GpuChainedReturnState::RETURN_B_SUBMITTED,
+            GpuChainedReturnState::A_SUBMITTED);
         chainedStates.advance(GpuChainedReturnState::A_SUBMITTED,
             GpuChainedReturnState::A_COMPLETED);
 
@@ -332,18 +520,158 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
             << "  Presentation: NONE\n  CPU frame bridge: NONE\n"
             << "DG2X_P4C_D3A2_GPU_CHAINED_GENERATED_OUTPUT_B_TO_A_PASS\n";
     } catch (...) {
-        if (bSubmitted && !aCompleted && generationEndpoint.DeviceWaitIdle)
-            static_cast<void>(generationEndpoint.DeviceWaitIdle(
-                generationEndpoint.bufferDevice.device));
-        if (transportConsumed && pending.valid()) {
+        if (!boundedShadowSubmission && pending.valid()) {
             try { static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
                 backendSession, std::move(pending))); }
             catch (...) {}
         }
-        chainedStates.fail();
         throw;
     }
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+lsfgvk::backend::ReturnedGeneratedOperation
+GeneratedOutputReturnDiagnosticSession::completeShadowGeneratedReturnOnAForTesting(
+        RuntimeGeneratedBReturnPending&& bPending, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        vk::RuntimeForeignImageHandoffInfo handoff) {
+    if (!bPending.valid() || !bPending.bReturn.valid()
+            || handoff.destinationQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED
+            || handoff.signalSemaphore == VK_NULL_HANDLE)
+        throw std::invalid_argument("invalid shadow B-return/A-handoff composition");
+    const auto identity = bPending.identity();
+    try {
+        completeGeneratedReturnOnA(std::move(bPending), backend, backendSession, handoff);
+    } catch (...) {
+        if (bPending.acceptedSubmissionAuthorityForTesting())
+            acceptedShadowFailure.emplace(std::move(bPending));
+        throw;
+    }
+    if (!aReadbackPending.valid() || !delayedGeneration.valid()
+            || aReadbackPending.returnedSignalSemaphore() != handoff.signalSemaphore
+            || aReadbackPending.retirementFence() == VK_NULL_HANDLE
+            || aReadbackPending.importedWaitSemaphore() == VK_NULL_HANDLE)
+        throw std::logic_error("production A-return did not preserve bounded identities");
+
+    const auto generation = identity.generationId;
+    auto aAuthority = backend::RuntimeSubmissionRetirement::submittedFence(
+        aReadbackPending.retirementFence(), generation, shadowLifetime);
+    auto payloadAuthority = backend::RuntimeTemporarySemaphorePayload::submittedWait(
+        aReadbackPending.importedWaitSemaphore(), generation, shadowLifetime);
+    auto generatedAuthority = delayedGeneration.operationRetirementAuthority();
+    backend.recordShadowAReturnSubmitted(backendSession, generation);
+    auto result = backend::ReturnedGeneratedOperation(identity,
+        std::move(bPending.bReturn), std::move(aAuthority),
+        std::move(aReadbackPending), std::move(payloadAuthority),
+        std::move(delayedGeneration), std::move(generatedAuthority),
+        handoff.signalSemaphore, std::move(bPending.fenceOwner),
+        std::move(bPending.returnResources), shadowLifetime);
+    delayedBackend = nullptr;
+    delayedBackendSession = nullptr;
+    return result;
+}
+
+void GeneratedOutputReturnDiagnosticSession::retireShadowBReturnForTesting(
+        backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    const auto generation = operation.identity().generationId;
+    auto& authority = operation.bReturn;
+    if (!operation.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
+            || authority.epoch() != generation || !generationEndpoint.WaitForFences)
+        throw std::logic_error("invalid shadow B-return fence retirement request");
+    const VkFence fence = authority.fenceHandle();
+    const auto result = generationEndpoint.WaitForFences(
+        generationEndpoint.bufferDevice.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        if (result != VK_TIMEOUT) {
+            authority.fail();
+            backend.failShadowBReturnRetirement(
+                backendSession, generation, result == VK_ERROR_DEVICE_LOST);
+        }
+        throw ls::vulkan_error(result, "shadow B-return fence retirement failed");
+    }
+    backend.retireShadowBReturnWait(backendSession, generation);
+    authority.retire(generation);
+}
+
+void GeneratedOutputReturnDiagnosticSession::releaseShadowGeneratedOutputForTesting(
+        backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    const auto generation = operation.identity().generationId;
+    operation.rejectGeneratedOutputRetirement();
+    if (!operation.generatedOutput.valid() || !operation.generatedRetirement.valid()
+            || operation.generatedRetirement.generationId() != generation)
+        throw std::logic_error("generated-output retirement authority is missing");
+    static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
+        backendSession, std::move(operation.generatedOutput)));
+    backend.retireRuntimeGenerateOperation(
+        backendSession, std::move(operation.generatedRetirement));
+    backend.releaseShadowGenerationReady(backendSession, generation);
+    operation.markGeneratedOutputRetired();
+}
+
+void GeneratedOutputReturnDiagnosticSession::retireShadowAReturnForTesting(
+        backend::ReturnedGeneratedOperation& operation) {
+    if (!operation.valid()
+            || operation.aReturnSubmission.state()
+                != backend::RuntimeAuthorityState::SUBMITTED)
+        throw std::logic_error("invalid shadow A-return retirement request");
+    try {
+        static_cast<void>(vk::RuntimeImageEndpoint::completeForeignImageReadback(
+            operation.aReturn));
+        operation.retireAReturn(operation.identity().generationId);
+    } catch (...) {
+        operation.failAReturn();
+        throw;
+    }
+}
+
+std::optional<RuntimeGeneratedBReturnPending>
+GeneratedOutputReturnDiagnosticSession::takeAcceptedShadowFailureForTesting() {
+    if (!acceptedShadowFailure)
+        throw std::logic_error("no accepted shadow B-return failure authority");
+    auto result = std::move(acceptedShadowFailure);
+    acceptedShadowFailure.reset();
+    return result;
+}
+
+void GeneratedOutputReturnDiagnosticSession::retireAcceptedShadowBReturnFailureForTesting(
+        RuntimeGeneratedBReturnPending& pending, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    if (!pending.acceptedSubmissionAuthorityForTesting()
+            || pending.bReturn.state() != backend::RuntimeAuthorityState::SUBMITTED
+            || !generationEndpoint.WaitForFences)
+        throw std::logic_error("invalid accepted shadow failure retirement request");
+    const auto generation = pending.pending.identity();
+    const VkFence fence = pending.bReturn.fenceHandle();
+    const auto result = generationEndpoint.WaitForFences(
+        generationEndpoint.bufferDevice.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        if (result != VK_TIMEOUT) {
+            pending.bReturn.fail();
+            backend.failShadowBReturnRetirement(
+                backendSession, generation, result == VK_ERROR_DEVICE_LOST);
+        }
+        throw ls::vulkan_error(result, "accepted shadow B-return fence retirement failed");
+    }
+    backend.retireShadowBReturnWait(backendSession, generation);
+    pending.bReturn.retire(generation);
+}
+
+void GeneratedOutputReturnDiagnosticSession::releaseAcceptedShadowGeneratedOutputForTesting(
+        RuntimeGeneratedBReturnPending& pending, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    if (pending.bReturn.state() != backend::RuntimeAuthorityState::RETIRED
+            || !pending.pending.valid())
+        throw std::logic_error("accepted shadow output still has an in-flight reader");
+    const auto generation = pending.pending.identity();
+    auto generatedAuthority = pending.pending.operationRetirementAuthority();
+    static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
+        backendSession, std::move(pending.pending)));
+    backend.retireRuntimeGenerateOperation(backendSession, std::move(generatedAuthority));
+    backend.releaseShadowGenerationReady(backendSession, generation);
+}
+#endif
 
 void GeneratedOutputReturnDiagnosticSession::completePresentationDiagnostics() {
     if (!aReadbackPending.valid() || !delayedGeneration.valid()

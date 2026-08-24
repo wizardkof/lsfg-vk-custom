@@ -5,6 +5,19 @@
 
 find_package(Threads REQUIRED)
 
+add_executable(lsfg-vk-test-d3b3-production-state
+    d3b3_production_state_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-d3b3-production-state PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-d3b3-production-state PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-d3b3-production-state PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-d3b3-production-state
+    COMMAND lsfg-vk-test-d3b3-production-state)
+
 function(lsfgvk_add_layer_unit_test target test_source implementation_source)
     add_executable(${target}
         "${test_source}"
@@ -59,6 +72,22 @@ add_test(
     NAME lsfg-vk-test-runtime-generate-diagnostic-state
     COMMAND lsfg-vk-test-runtime-generate-diagnostic-state)
 
+add_executable(lsfg-vk-test-temporal-source-contract
+    temporal_source_contract_test.cpp)
+target_compile_options(lsfg-vk-test-temporal-source-contract PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-temporal-source-contract PRIVATE lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-temporal-source-contract
+    COMMAND lsfg-vk-test-temporal-source-contract)
+
+add_executable(lsfg-vk-test-runtime-operation-authority
+    runtime_operation_authority_test.cpp)
+target_compile_options(lsfg-vk-test-runtime-operation-authority PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-runtime-operation-authority PRIVATE lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-runtime-operation-authority
+    COMMAND lsfg-vk-test-runtime-operation-authority)
+
 add_executable(lsfg-vk-test-generated-output-return-diagnostic
     generated_output_return_diagnostic_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp")
@@ -94,6 +123,21 @@ lsfgvk_add_layer_unit_test(
 target_include_directories(lsfg-vk-test-d3b2-insertion-path PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
 target_link_libraries(lsfg-vk-test-d3b2-insertion-path PRIVATE lsfg-vk-common)
+
+add_executable(lsfg-vk-test-d3b3-production-seams
+    d3b3_production_seams_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_compile_options(lsfg-vk-test-d3b3-production-seams PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-d3b3-production-seams
+    COMMAND lsfg-vk-test-d3b3-production-seams)
+target_include_directories(lsfg-vk-test-d3b3-production-seams PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_link_libraries(lsfg-vk-test-d3b3-production-seams PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+target_compile_definitions(lsfg-vk-test-d3b3-production-seams PRIVATE
+    LSFGVK_D3B3_FINITE_TESTING)
 
 add_executable(lsfg-vk-test-graphics-final-queue graphics_final_queue_test.cpp)
 target_include_directories(lsfg-vk-test-graphics-final-queue PRIVATE
@@ -345,6 +389,22 @@ target_link_libraries(lsfg-vk-test-external-semaphore-sync PRIVATE
     lsfg-vk-common)
 add_test(NAME lsfg-vk-test-external-semaphore-sync
     COMMAND lsfg-vk-test-external-semaphore-sync)
+
+add_executable(lsfg-vk-test-shadow-b-return-execution-harness
+    shadow_b_return_execution_harness_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+target_compile_definitions(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
+    LSFGVK_D3B3_FINITE_TESTING)
+add_test(NAME lsfg-vk-test-shadow-b-return-execution-harness
+    COMMAND lsfg-vk-test-shadow-b-return-execution-harness)
 
 add_executable(lsfg-vk-test-interop-sync-fd-probe
     interop_sync_fd_probe_test.cpp

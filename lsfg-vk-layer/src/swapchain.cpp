@@ -138,6 +138,12 @@ namespace {
     }
 }
 
+PrePresentGateResult Swapchain::prePresentGate() noexcept {
+    if (!d3b3ProductionState)
+        return PrePresentGateResult::READY;
+    return d3b3ProductionState->prePresentGate();
+}
+
 void Swapchain::captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
         uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores) {
     if (!captureDiagnosticFormatSupported(this->info.format))
@@ -307,8 +313,7 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
 
     // P4C-B0 deliberately exposes only the application-side capture boundary.
     // Do not construct backend/LSFG resources until real-frame transport exists.
-    if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY)
-    {
+    if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY) {
         auto backing = RuntimeDmaBufBacking::createImage(
             this->devicePair.render.identity, this->info.extent);
         auto endpointA = vk::makeRuntimeExchangeEndpoint(vk);

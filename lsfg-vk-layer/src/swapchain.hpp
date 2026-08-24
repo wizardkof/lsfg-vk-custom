@@ -4,6 +4,7 @@
 
 #include "d3b1_present_path.hpp"
 #include "d3b2_insertion_path.hpp"
+#include "d3b3_production_seams.hpp"
 
 #include "fixed_frame_scheduler.hpp"
 #include "fixed_output_pacer.hpp"
@@ -43,11 +44,15 @@ enum class SwapchainReleaseBackend : uint8_t { None, Khr, Ext };
 enum class GeneratedOutputTerminalConsumer : uint8_t {
     DiagnosticOnly,
     D3B1,
-    D3B2
+    D3B2,
+    D3B3
 };
 
 [[nodiscard]] constexpr GeneratedOutputTerminalConsumer
-selectGeneratedOutputTerminalConsumer(bool d3b1Eligible, bool d3b2Eligible) noexcept {
+selectGeneratedOutputTerminalConsumer(
+        bool d3b1Eligible, bool d3b2Eligible, bool d3b3Eligible = false) noexcept {
+    if (d3b3Eligible)
+        return GeneratedOutputTerminalConsumer::D3B3;
     if (d3b2Eligible)
         return GeneratedOutputTerminalConsumer::D3B2;
     if (d3b1Eligible)
@@ -137,6 +142,8 @@ selectGeneratedOutputTerminalConsumer(bool d3b1Eligible, bool d3b2Eligible) noex
             return this->devicePair;
         }
 
+        [[nodiscard]] PrePresentGateResult prePresentGate() noexcept;
+
         /// present a frame
         /// @param vk vulkan instance
         /// @param queue presentation queue
@@ -206,6 +213,7 @@ selectGeneratedOutputTerminalConsumer(bool d3b1Eligible, bool d3b2Eligible) noex
         std::optional<vk::Semaphore> returnedForGraphics;
         D3B1PresentationState d3b1State{D3B1PresentationState::IDLE};
         D3B2InsertionState d3b2State{D3B2InsertionState::INACTIVE};
+        std::unique_ptr<D3B3ProductionState> d3b3ProductionState;
 
         void ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family);
 

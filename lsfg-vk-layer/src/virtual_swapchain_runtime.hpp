@@ -9,6 +9,7 @@
 #include "virtual_swapchain_image_spec.hpp"
 #include "virtual_swapchain_state.hpp"
 #include "graphics_final_queue.hpp"
+#include "d3b3_production_seams.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -33,6 +34,7 @@ namespace lsfgvk::layer {
     /// VkImage handles already returned to the application.
     class VirtualSwapchainRuntime {
     public:
+        using PrePresentGate = std::function<PrePresentGateResult()>;
         using Presenter = std::function<VkResult(
             uint32_t imageIndex,
             VkSemaphore readySemaphore,
@@ -60,6 +62,11 @@ namespace lsfgvk::layer {
 
         /// Start the single consumer that owns virtual presentation work.
         void startWorker(Presenter presenter);
+
+        /// Install the owner-driven retirement gate. The callback is invoked
+        /// on the application thread before a new lease or bridge submit.
+        /// The default gate is a no-op for frozen D3B2/D3B1 paths.
+        void setPrePresentGate(PrePresentGate gate);
 
         /// Consume the application's present wait semaphores on the source
         /// presentation queue, then publish the virtual image to the worker.
@@ -131,6 +138,7 @@ namespace lsfgvk::layer {
         std::unordered_map<uint64_t, Job> jobs;
         Presenter presenter;
         std::jthread worker;
+        PrePresentGate prePresentGate;
     };
 
 }

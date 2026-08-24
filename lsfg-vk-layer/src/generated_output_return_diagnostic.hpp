@@ -1,14 +1,31 @@
 #pragma once
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
+#include "lsfg-vk-backend/runtime_operation_authority.hpp"
 #include "lsfg-vk-common/vulkan/runtime_device_pair.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 #include "lsfg-vk-common/vulkan/vulkan_native_external_image_backing.hpp"
 
 #include <optional>
+#include <memory>
 #include <vector>
 
 namespace lsfgvk::layer {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    struct ShadowReturnExecutionForTesting final {};
+#endif
+
+    enum class ReturnSubmissionFencePolicy : uint8_t {
+        ACTIVE_COMPATIBLE,
+        SHADOW_REAL
+    };
+
+    [[nodiscard]] constexpr VkFence returnSubmissionFence(
+            ReturnSubmissionFencePolicy policy, VkFence shadowFence) noexcept {
+        return policy == ReturnSubmissionFencePolicy::SHADOW_REAL
+            ? shadowFence : VK_NULL_HANDLE;
+    }
+
     enum class GeneratedOutputReturnState {
         EMPTY, D2_VALIDATED, TOKEN_CONSUMED, B_BACKING_READY, B_COPY_SUBMITTED,
         B_SYNC_EXPORTED, A_IMPORTED, A_COPY_SUBMITTED, A_VALIDATED, PASS, FAILED
@@ -33,6 +50,55 @@ namespace lsfgvk::layer {
         size_t byteCount{};
         size_t nonzeroByteCount{};
         uint64_t checksum{};
+    };
+
+    // Move-only boundary between the existing B-return submission/export and
+    // the existing A-side import/handoff phase.  C1A exposes the boundary;
+    // C1B will be the first caller allowed to stop at it.
+    class RuntimeGeneratedBReturnPending {
+    public:
+        RuntimeGeneratedBReturnPending() noexcept = default;
+        RuntimeGeneratedBReturnPending(const RuntimeGeneratedBReturnPending&) = delete;
+        RuntimeGeneratedBReturnPending& operator=(const RuntimeGeneratedBReturnPending&) = delete;
+        RuntimeGeneratedBReturnPending(RuntimeGeneratedBReturnPending&&) noexcept = default;
+        RuntimeGeneratedBReturnPending& operator=(RuntimeGeneratedBReturnPending&&) noexcept = default;
+        [[nodiscard]] bool valid() const noexcept { return bToAPayload.valid() && pending.valid(); }
+        [[nodiscard]] backend::RuntimeTemporalPairIdentity identity() const noexcept {
+            return pending.temporalPair();
+        }
+        [[nodiscard]] const vk::SyncFdPayload& payload() const noexcept { return bToAPayload; }
+        [[nodiscard]] const backend::RuntimeSubmissionRetirement& bReturnAuthority() const noexcept {
+            return bReturn;
+        }
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        [[nodiscard]] bool acceptedSubmissionAuthorityForTesting() const noexcept {
+            return pending.valid() && bReturn.valid() && fenceOwner && returnResources;
+        }
+        [[nodiscard]] VkFence bReturnFenceForTesting() const noexcept {
+            return bReturn.fenceHandle();
+        }
+        [[nodiscard]] VkSemaphore generationReadyForTesting() const noexcept {
+            return pending.readinessSemaphore();
+        }
+        [[nodiscard]] bool payloadOwnedForTesting() const noexcept {
+            return bToAPayload.valid();
+        }
+#endif
+    private:
+        friend class GeneratedOutputReturnDiagnosticSession;
+        RuntimeGeneratedBReturnPending(backend::RuntimeGenerateDiagnosticPending&& value,
+                vk::SyncFdPayload&& exported,
+                backend::RuntimeSubmissionRetirement&& authority = {},
+                std::shared_ptr<VkFence> fence = {},
+                std::shared_ptr<void> resources = {}) :
+            pending(std::move(value)), bToAPayload(std::move(exported)),
+            bReturn(std::move(authority)), fenceOwner(std::move(fence)),
+            returnResources(std::move(resources)) {}
+        backend::RuntimeGenerateDiagnosticPending pending;
+        vk::SyncFdPayload bToAPayload;
+        backend::RuntimeSubmissionRetirement bReturn;
+        std::shared_ptr<VkFence> fenceOwner;
+        std::shared_ptr<void> returnResources;
     };
 
     enum class GeneratedOutputCleanupState { NO_SUBMIT, B_SUBMITTED, A_SUBMITTED, A_COMPLETED };
@@ -100,6 +166,11 @@ namespace lsfgvk::layer {
             const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
             vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly,
             std::optional<vk::RuntimeForeignImageHandoffInfo> handoff = std::nullopt);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        GeneratedOutputReturnDiagnosticSession(ShadowReturnExecutionForTesting,
+            const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
+            vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly);
+#endif
         GeneratedOutputReturnDiagnosticSession(const GeneratedOutputReturnDiagnosticSession&) = delete;
         GeneratedOutputReturnDiagnosticSession& operator=(const GeneratedOutputReturnDiagnosticSession&) = delete;
         ~GeneratedOutputReturnDiagnosticSession();
@@ -113,10 +184,43 @@ namespace lsfgvk::layer {
             return aReadbackPending.imageView();
         }
         void completePresentationDiagnostics();
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        [[nodiscard]] RuntimeGeneratedBReturnPending submitShadowBReturnForTesting(
+            backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,
+            backend::RuntimeGenerateDiagnosticSession&);
+        [[nodiscard]] backend::ReturnedGeneratedOperation
+            completeShadowGeneratedReturnOnAForTesting(
+                RuntimeGeneratedBReturnPending&&, backend::Instance&,
+                backend::RuntimeGenerateDiagnosticSession&,
+                vk::RuntimeForeignImageHandoffInfo);
+        void retireShadowBReturnForTesting(backend::ReturnedGeneratedOperation&,
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
+        void releaseShadowGeneratedOutputForTesting(backend::ReturnedGeneratedOperation&,
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
+        void retireShadowAReturnForTesting(backend::ReturnedGeneratedOperation&);
+        [[nodiscard]] std::optional<RuntimeGeneratedBReturnPending>
+            takeAcceptedShadowFailureForTesting();
+        void retireAcceptedShadowBReturnFailureForTesting(
+            RuntimeGeneratedBReturnPending&, backend::Instance&,
+            backend::RuntimeGenerateDiagnosticSession&);
+        void releaseAcceptedShadowGeneratedOutputForTesting(
+            RuntimeGeneratedBReturnPending&, backend::Instance&,
+            backend::RuntimeGenerateDiagnosticSession&);
+        [[nodiscard]] GpuChainedReturnState gpuChainedStateForTesting() const noexcept {
+            return chainedStates.state();
+        }
+#endif
     private:
         void advance(GeneratedOutputReturnState expected, GeneratedOutputReturnState next);
         void execute(backend::RuntimeGenerateDiagnosticResult&&);
         void executeGpuChained(backend::RuntimeGenerateDiagnosticPending&&,
+            backend::Instance&, backend::RuntimeGenerateDiagnosticSession&,
+            std::optional<vk::RuntimeForeignImageHandoffInfo>);
+        [[nodiscard]] RuntimeGeneratedBReturnPending submitGeneratedBReturn(
+            backend::RuntimeGenerateDiagnosticPending&&,
+            ReturnSubmissionFencePolicy, backend::Instance&,
+            backend::RuntimeGenerateDiagnosticSession&, VkFence = VK_NULL_HANDLE);
+        void completeGeneratedReturnOnA(RuntimeGeneratedBReturnPending&&,
             backend::Instance&, backend::RuntimeGenerateDiagnosticSession&,
             std::optional<vk::RuntimeForeignImageHandoffInfo>);
         [[nodiscard]] std::vector<uint8_t> transportGeneratedImage(
@@ -140,5 +244,9 @@ namespace lsfgvk::layer {
         backend::Instance* delayedBackend{};
         backend::RuntimeGenerateDiagnosticSession* delayedBackendSession{};
         GeneratedOutputIntegrity expected{};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        std::optional<RuntimeGeneratedBReturnPending> acceptedShadowFailure;
+        std::shared_ptr<const uint8_t> shadowLifetime{std::make_shared<const uint8_t>(0)};
+#endif
     };
 }

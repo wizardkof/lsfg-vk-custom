@@ -7,6 +7,8 @@
 
 using lsfgvk::backend::RuntimeGenerateDiagnosticAction;
 using lsfgvk::backend::RuntimeGenerateDiagnosticState;
+using lsfgvk::backend::RuntimeGenerateSerialPhase;
+using lsfgvk::backend::RuntimeGenerateSerialState;
 
 int main() {
     RuntimeGenerateDiagnosticState state;
@@ -75,4 +77,34 @@ int main() {
     try { failed.issueCompletionResult(); }
     catch (const std::logic_error&) { rejectedFailedResult = true; }
     assert(rejectedFailedResult);
+
+    RuntimeGenerateSerialState serial;
+    for (uint64_t epoch = 1; epoch <= 3; ++epoch) {
+        assert(serial.canSubmit());
+        serial.submit(epoch);
+        assert(!serial.canSubmit());
+        bool rejectedOverlap = false;
+        try { serial.submit(epoch + 1); }
+        catch (const std::logic_error&) { rejectedOverlap = true; }
+        assert(rejectedOverlap);
+        serial.sourceReadsRetired(epoch);
+        assert(!serial.canSubmit());
+        serial.outputInUse(epoch);
+        serial.retireOperation(epoch);
+        assert(serial.currentPhase() == RuntimeGenerateSerialPhase::READY_NEXT);
+    }
+    assert(serial.currentEpoch() == 3);
+    bool rejectedStale = false;
+    try { serial.retireOperation(2); }
+    catch (const std::logic_error&) { rejectedStale = true; }
+    assert(rejectedStale);
+
+    RuntimeGenerateSerialState serialFailure;
+    serialFailure.submit(1);
+    serialFailure.fail();
+    assert(!serialFailure.canSubmit());
+    bool rejectedFailedSerial = false;
+    try { serialFailure.submit(2); }
+    catch (const std::logic_error&) { rejectedFailedSerial = true; }
+    assert(rejectedFailedSerial);
 }

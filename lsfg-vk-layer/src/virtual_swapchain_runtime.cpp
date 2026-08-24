@@ -143,6 +143,12 @@ void VirtualSwapchainRuntime::startWorker(Presenter presenter) {
     });
 }
 
+void VirtualSwapchainRuntime::setPrePresentGate(PrePresentGate gate) {
+    if (this->worker.joinable())
+        throw ls::error("virtual swapchain pre-present gate must be installed before worker start");
+    this->prePresentGate = std::move(gate);
+}
+
 VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
         uint32_t imageIndex,
         const std::vector<VkSemaphore>& waitSemaphores) const noexcept {
@@ -194,6 +200,20 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
     const auto pending = this->asyncResult.load();
     if (pending != VK_SUCCESS && pending != VK_SUBOPTIMAL_KHR)
         return pending;
+
+    // This is deliberately before both lease construction and bridge submission.
+    // D3B2/D3B1 leave the gate empty, preserving their existing ordering.
+    if (this->prePresentGate) {
+        const auto gate = this->prePresentGate();
+        if (gate != PrePresentGateResult::READY) {
+            switch (gate) {
+            case PrePresentGateResult::TIMEOUT: return VK_TIMEOUT;
+            case PrePresentGateResult::DEVICE_LOST: return VK_ERROR_DEVICE_LOST;
+            case PrePresentGateResult::FAILED: return VK_ERROR_INITIALIZATION_FAILED;
+            case PrePresentGateResult::READY: break;
+            }
+        }
+    }
 
     const auto serial = this->presentSerial.fetch_add(1);
     const bool d3bSingleSwapchainEligible = !synchronous;

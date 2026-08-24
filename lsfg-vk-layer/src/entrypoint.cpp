@@ -1712,6 +1712,10 @@ namespace {
 
                 if (virtualRuntime) {
                     const auto workerSwapchain = *swapchain;
+                    auto* root = &layer_info->root;
+                    virtualRuntime->setPrePresentGate([root, workerSwapchain]() {
+                        return root->getSwapchainContext(workerSwapchain).prePresentGate();
+                    });
                     const auto borrowedQueueMutex = std::make_shared<std::mutex>();
                     virtualRuntime->startWorker(
                         [workerSwapchain, borrowedQueueMutex, device](

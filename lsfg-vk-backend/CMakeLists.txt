@@ -18,6 +18,10 @@ set(BACKEND_SOURCES
 
 add_library(lsfg-vk-backend STATIC ${BACKEND_SOURCES})
 
+if(LSFGVK_BUILD_TESTS)
+    target_compile_definitions(lsfg-vk-backend PUBLIC LSFGVK_TESTING_SHADOW_SPLIT)
+endif()
+
 target_include_directories(lsfg-vk-backend
     PUBLIC include)
 

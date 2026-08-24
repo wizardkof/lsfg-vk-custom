@@ -22,6 +22,12 @@ enum class D3B2ImageState : uint8_t {
     RELEASED_WITH_MAINTENANCE1
 };
 
+struct D3B2PresentFencePolicy {
+    VkFence generated{};
+    VkFence original{};
+    [[nodiscard]] bool enabled() const noexcept { return generated && original; }
+};
+
 [[nodiscard]] constexpr bool d3b2InsertionRequested(const char* value) noexcept {
     return value && value[0] == '1' && value[1] == '\0';
 }
@@ -61,6 +67,7 @@ struct D3B2InsertionPath {
     bool fifo{};
     bool hiddenBlitDestinationSupported{};
     bool maintenanceReleaseCapable{};
+    D3B2PresentFencePolicy presentFences{};
     bool distinctHiddenImages{};
     D3B2InsertionState* state{};
 
@@ -68,6 +75,7 @@ struct D3B2InsertionPath {
     std::function<void(const D3B2HiddenImage&, const D3B2HiddenImage&)> record;
     std::function<VkResult()> submit;
     std::function<VkResult(const D3B2HiddenImage&, VkSemaphore)> present;
+    std::function<VkResult(const D3B2HiddenImage&, VkSemaphore, VkFence)> presentWithFence;
     std::function<bool()> waitGraphicsFence;
     std::function<bool()> generatedIntegrity;
     std::function<bool()> originalIdentity;
@@ -75,8 +83,31 @@ struct D3B2InsertionPath {
     std::function<void()> emitMarker;
     // Must dispatch vkReleaseSwapchainImagesKHR/EXT on this swapchain.
     std::function<VkResult(const std::vector<uint32_t>&)> releaseAcquiredImages;
+
+    // The first terminal consumer is the transfer blit recorded by the shared
+    // path.  Keep this explicit so a PairOperation can verify the wait stage
+    // from the command contract instead of from semaphore naming.
+    VkPipelineStageFlags returnedForGraphicsWaitStage{
+        VK_PIPELINE_STAGE_TRANSFER_BIT};
+    std::function<VkResult(VkPipelineStageFlags)> submitWithWaitStage;
+
+    // Optional lifecycle observations used by D3B3PairOperation.  They are
+    // deliberately callbacks: the D3B2 algorithm remains the sole owner of
+    // hidden-image acquisition, recording, submission and present ordering.
+    std::function<void()> onDestinationsAcquired;
+    std::function<void()> onRecordBegin;
+    std::function<void()> onRecordEnd;
+    std::function<void()> onTerminalSubmitAccepted;
+    std::function<void()> onGeneratedPresentAccepted;
+    std::function<void()> onOriginalPresentAccepted;
+    std::function<void()> onGraphicsFenceRetired;
 };
 
+[[nodiscard]] constexpr VkPipelineStageFlags d3b2FirstTerminalConsumerStage() noexcept {
+    return VK_PIPELINE_STAGE_TRANSFER_BIT;
+}
+
+void validateD3B2InsertionPreflight(const D3B2InsertionPath&);
 VkResult executeD3B2Insertion(D3B2InsertionPath&);
 
 }

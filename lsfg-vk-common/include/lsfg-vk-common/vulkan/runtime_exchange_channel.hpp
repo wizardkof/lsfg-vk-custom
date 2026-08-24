@@ -66,6 +66,14 @@ namespace vk {
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] bool completed() const noexcept { return completionConsumed; }
         [[nodiscard]] RuntimeForeignImageView imageView() const noexcept;
+        [[nodiscard]] VkFence retirementFence() const noexcept { return fence; }
+        [[nodiscard]] VkSemaphore importedWaitSemaphore() const noexcept {
+            return imported.handle();
+        }
+        [[nodiscard]] VkSemaphore returnedSignalSemaphore() const noexcept {
+            return borrowedSignalSemaphore;
+        }
+        [[nodiscard]] bool submissionAccepted() const noexcept { return submitted; }
         [[nodiscard]] bool handoffRequested() const noexcept { return handoffRequestedValue; }
         [[nodiscard]] bool ownershipReleaseRequired() const noexcept { return releaseRequired; }
     private:

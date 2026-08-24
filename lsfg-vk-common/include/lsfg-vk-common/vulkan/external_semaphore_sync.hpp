@@ -55,8 +55,8 @@ namespace vk {
         SyncFdPayload() noexcept = default;
         SyncFdPayload(const SyncFdPayload&) = delete;
         SyncFdPayload& operator=(const SyncFdPayload&) = delete;
-        SyncFdPayload(SyncFdPayload&&) noexcept = default;
-        SyncFdPayload& operator=(SyncFdPayload&&) noexcept = default;
+        SyncFdPayload(SyncFdPayload&&) noexcept;
+        SyncFdPayload& operator=(SyncFdPayload&&) noexcept;
 
         [[nodiscard]] bool valid() const noexcept { return this->validPayload; }
         [[nodiscard]] bool sentinel() const noexcept {
