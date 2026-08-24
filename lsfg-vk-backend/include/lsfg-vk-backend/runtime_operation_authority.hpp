@@ -264,15 +264,64 @@ public:
         return !generatedRetired && generatedOutput.valid() && generatedRetirement.valid();
     }
     [[nodiscard]] bool generatedOutputRetired() const noexcept { return generatedRetired; }
+    // Terminal readiness is the submitted ownership phase. It accepts either
+    // a still-pending or already-retired A fence without weakening retirement.
+    [[nodiscard]] bool terminalReady() const noexcept {
+        if (!valid() || !generatedRetired || !returnedForGraphicsOutstanding()
+                || !aReturn.terminalReady())
+            return false;
+        const auto generation = pair.generationId;
+        if (bReturn.epoch() != generation || aReturnSubmission.epoch() != generation
+                || payload.epoch() != generation
+                || bReturn.state() != RuntimeAuthorityState::RETIRED
+                || aReturn.retirementFence() != aReturnSubmission.fenceHandle()
+                || aReturn.importedWaitSemaphore() != payload.semaphoreHandle()
+                || aReturn.returnedSignalSemaphore() != returnedForGraphics)
+            return false;
+        const bool submitted = aReturnSubmission.state() == RuntimeAuthorityState::SUBMITTED
+            && payload.state() == RuntimeTemporaryPayloadState::WAIT_SUBMITTED
+            && !aReturn.retirementObserved();
+        const bool retired = aReturnSubmission.state() == RuntimeAuthorityState::RETIRED
+            && payload.state() == RuntimeTemporaryPayloadState::WAIT_RETIRED
+            && aReturn.retirementObserved();
+        return submitted || retired;
+    }
+    [[nodiscard]] bool aReturnRetired() const noexcept {
+        return validTemporalPair(pair) && aReturn.retirementObserved()
+            && aReturnSubmission.epoch() == pair.generationId
+            && payload.epoch() == pair.generationId
+            && aReturnSubmission.state() == RuntimeAuthorityState::RETIRED
+            && payload.state() == RuntimeTemporaryPayloadState::WAIT_RETIRED;
+    }
     void rejectGeneratedOutputRetirement() const {
         if (bReturn.state() != RuntimeAuthorityState::RETIRED)
             throw std::logic_error("generated output still has an in-flight B-return reader");
     }
     void retireAReturn(uint64_t epoch) {
-        if (!aReturn.completed())
+        if (!aReturn.retirementObserved())
             throw std::logic_error("A-return fence has not retired");
         aReturnSubmission.retire(epoch);
         payload.waitRetired(epoch);
+    }
+    [[nodiscard]] bool tryRetireAReturn() {
+        if (aReturnRetired())
+            return true;
+        if (!validTemporalPair(pair) || !aReturn.valid()
+                || aReturnSubmission.epoch() != pair.generationId
+                || payload.epoch() != pair.generationId
+                || aReturnSubmission.state() != RuntimeAuthorityState::SUBMITTED
+                || payload.state() != RuntimeTemporaryPayloadState::WAIT_SUBMITTED)
+            throw std::logic_error("A-return retirement authority is not pending");
+        try {
+            if (!aReturn.retirementObserved()
+                    && !vk::RuntimeImageEndpoint::tryRetireForeignImageReadback(aReturn))
+                return false;
+            retireAReturn(pair.generationId);
+            return true;
+        } catch (...) {
+            failAReturn();
+            throw;
+        }
     }
     void failAReturn() noexcept {
         aReturnSubmission.fail();

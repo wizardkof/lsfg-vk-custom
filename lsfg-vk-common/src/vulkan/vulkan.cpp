@@ -477,6 +477,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .UpdateDescriptorSets = dpa<PFN_vkUpdateDescriptorSets>(f, d, "vkUpdateDescriptorSets"),
         .CreateFence = dpa<PFN_vkCreateFence>(f, d, "vkCreateFence"),
         .DestroyFence = dpa<PFN_vkDestroyFence>(f, d, "vkDestroyFence"),
+        .GetFenceStatus = dpa<PFN_vkGetFenceStatus>(f, d, "vkGetFenceStatus"),
         .ResetFences = dpa<PFN_vkResetFences>(f, d, "vkResetFences"),
         .WaitForFences = dpa<PFN_vkWaitForFences>(f, d, "vkWaitForFences"),
         .CreateImage = dpa<PFN_vkCreateImage>(f, d, "vkCreateImage"),

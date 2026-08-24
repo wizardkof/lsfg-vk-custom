@@ -203,6 +203,15 @@ public:
         return returnedForGraphics.state()
             == backend::RuntimeBinarySemaphoreState::WAIT_RETIRED;
     }
+    [[nodiscard]] bool aReturnRetired() const noexcept {
+        return returned.aReturnRetired();
+    }
+    [[nodiscard]] backend::RuntimeAuthorityState aReturnState() const noexcept {
+        return returned.aReturnAuthority().state();
+    }
+    [[nodiscard]] backend::RuntimeTemporaryPayloadState aReturnPayloadState() const noexcept {
+        return returned.payloadAuthority().state();
+    }
     [[nodiscard]] bool returnedImageAlive() const noexcept {
         return returned.valid() && returned.aReturnPending().imageView().valid();
     }
@@ -221,6 +230,7 @@ public:
 
     void preflight();
     void submitTerminal();
+    [[nodiscard]] bool tryRetireAReturn();
     void retirePresentWaits();
     void retirePair();
     void rejectReturnedForGraphicsReuse() const;

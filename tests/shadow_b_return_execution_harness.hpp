@@ -260,6 +260,7 @@ public:
         result.QueueSubmit = queueSubmit;
         result.CreateFence = createFence;
         result.DestroyFence = destroyFence;
+        result.GetFenceStatus = getFenceStatus;
         result.WaitForFences = waitForFences;
         result.ResetFences = resetFences;
         result.DeviceWaitIdle = deviceWaitIdle;
@@ -297,6 +298,7 @@ public:
         result.QueueSubmit = queueSubmit;
         result.CreateFence = createFence;
         result.DestroyFence = destroyFence;
+        result.GetFenceStatus = getFenceStatus;
         result.WaitForFences = waitForFences;
         result.ResetFences = resetFences;
         result.DeviceWaitIdle = deviceWaitIdle;
@@ -359,7 +361,7 @@ public:
             && render.BeginCommandBuffer && render.EndCommandBuffer
             && render.CmdPipelineBarrier && render.CmdCopyImageToBuffer
             && render.QueueSubmit && render.CreateFence && render.DestroyFence
-            && render.WaitForFences
+            && render.GetFenceStatus && render.WaitForFences
             && render.semaphoreDevice.funcs.CreateSemaphore
             && render.semaphoreDevice.funcs.DestroySemaphore
             && render.semaphoreDevice.funcs.ImportSemaphoreFdKHR;
@@ -458,6 +460,7 @@ public:
     VkResult sourceFenceWaitResult{VK_TIMEOUT};
     VkResult aSubmitResult{VK_SUCCESS};
     VkResult aFenceWaitResult{VK_TIMEOUT};
+    VkResult aFenceStatusResult{VK_NOT_READY};
     VkResult aImportResult{VK_SUCCESS};
     ShadowHarnessFailurePoint failurePoint{ShadowHarnessFailurePoint::NONE};
     ShadowAHarnessFailurePoint aFailurePoint{ShadowAHarnessFailurePoint::NONE};
@@ -501,6 +504,7 @@ public:
     uint32_t fenceWaitCalls{};
     uint32_t sourceFenceWaitCalls{};
     uint32_t aFenceWaitCalls{};
+    uint32_t aFenceStatusCalls{};
     uint32_t deviceIdleCalls{};
     uint32_t productionBReturnCalls{};
     uint32_t productionBReturnExportCalls{};
@@ -748,6 +752,7 @@ public:
     void retireAFence() noexcept {
         aFenceRetired = true;
         aFenceWaitResult = VK_SUCCESS;
+        aFenceStatusResult = VK_SUCCESS;
     }
 
 private:
@@ -877,6 +882,7 @@ private:
         result.UpdateDescriptorSets = updateDescriptorSets;
         result.CreateFence = createFence;
         result.DestroyFence = destroyFence;
+        result.GetFenceStatus = getFenceStatus;
         result.ResetFences = resetFences;
         result.WaitForFences = waitForFences;
         result.CreateImage = createImage;
@@ -920,11 +926,14 @@ private:
             self.aObserved = call;
             self.aObserved.calls = previousCalls + 1;
             self.aQueueSubmitCalls = self.aObserved.calls;
-            if (self.aSubmitResult == VK_SUCCESS && call.signalCount == 1
-                    && call.signal == self.returnedForGraphics)
-                ++self.returnedForGraphicsCalls;
-            if (self.aSubmitResult == VK_SUCCESS)
+            if (self.aSubmitResult == VK_SUCCESS) {
+                self.aFenceRetired = false;
+                self.aFenceWaitResult = VK_TIMEOUT;
+                self.aFenceStatusResult = VK_NOT_READY;
+                if (call.signalCount == 1 && call.signal == self.returnedForGraphics)
+                    ++self.returnedForGraphicsCalls;
                 ++self.foreignReadbackPendingCalls;
+            }
             return self.aSubmitResult;
         }
         {
@@ -1717,6 +1726,13 @@ private:
         if (active->fullBackendMode && fence != active->returnFence)
             return;
         ++active->fenceDestroyCalls;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL getFenceStatus(VkDevice, VkFence fence) {
+        if (fence == active->aReturnFence) {
+            ++active->aFenceStatusCalls;
+            return active->aFenceStatusResult;
+        }
+        return VK_NOT_READY;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL waitForFences(VkDevice, uint32_t count,
             const VkFence* fences, VkBool32, uint64_t) {

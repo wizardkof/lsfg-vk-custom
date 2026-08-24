@@ -16,10 +16,12 @@ struct Trace {
     std::vector<VkSemaphore> waits, signals;
     std::vector<VkSemaphore> destroyedSemaphores;
     uint32_t submits{}, waitsOnFence{}, destroys{}, imagesDestroyed{}, memoriesFreed{},
-        buffersDestroyed{}, poolsDestroyed{}, commandsFreed{}, fencesDestroyed{};
+        buffersDestroyed{}, poolsDestroyed{}, commandsFreed{}, fencesDestroyed{},
+        fenceStatusChecks{};
     VkResult submitResult{VK_SUCCESS};
     VkResult fenceResult{VK_SUCCESS};
     VkResult waitResult{VK_SUCCESS};
+    VkResult fenceStatusResult{VK_NOT_READY};
     VkResult invalidateResult{VK_SUCCESS};
     uint8_t* mapped{};
 } *trace;
@@ -35,6 +37,7 @@ void barrier(VkCommandBuffer, VkPipelineStageFlags s, VkPipelineStageFlags d, Vk
 void copy(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, uint32_t, const VkBufferImageCopy*) { trace->events.emplace_back("copy"); }
 VkResult fence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* f) { if (trace->fenceResult == VK_SUCCESS) *f=h<VkFence>(0xf1); return trace->fenceResult; }
 void destroyFence(VkDevice, VkFence, const VkAllocationCallbacks*) { ++trace->fencesDestroyed; }
+VkResult fenceStatus(VkDevice, VkFence) { ++trace->fenceStatusChecks; return trace->fenceStatusResult; }
 VkResult wait(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t) { ++trace->waitsOnFence; trace->events.emplace_back("wait"); return trace->waitResult; }
 VkResult submit(VkQueue, uint32_t n, const VkSubmitInfo* s, VkFence) {
     ++trace->submits; trace->submit=*s; trace->waits.assign(s->pWaitSemaphores,s->pWaitSemaphores+s->waitSemaphoreCount); trace->signals.assign(s->pSignalSemaphores,s->pSignalSemaphores+s->signalSemaphoreCount); trace->events.emplace_back("submit"); return trace->submitResult;
@@ -64,6 +67,7 @@ vk::RuntimeExchangeEndpoint endpoint(uint32_t family) {
         .QueueSubmit=submit,
         .CreateFence=fence,
         .DestroyFence=destroyFence,
+        .GetFenceStatus=fenceStatus,
         .WaitForFences=wait,
         .DestroyCommandPool=destroyPool,
         .FreeCommandBuffers=freeCommands,
@@ -101,7 +105,7 @@ int main() {
         Trace t{}; auto ep=endpoint(3); auto image=vk::RuntimeImageEndpointTestAccess::make(ep,3,t);
         const auto consumer=h<VkSemaphore>(0xc1); auto pending=vk::RuntimeImageEndpoint::submitForeignImageReadback(
             std::move(image),makePayload(ep),vk::RuntimeForeignImageHandoffInfo{7,consumer});
-        assert(pending.valid()); auto view=pending.imageView(); assert(view.handoffPendingAcquire() && view.queueFamily()==VK_QUEUE_FAMILY_IGNORED); assert(view.sourceQueueFamily()==3 && view.destinationQueueFamily()==7);
+        assert(pending.valid() && pending.terminalReady()); auto view=pending.imageView(); assert(view.handoffPendingAcquire() && view.queueFamily()==VK_QUEUE_FAMILY_IGNORED); assert(view.sourceQueueFamily()==3 && view.destinationQueueFamily()==7);
         assert(t.submits==1 && t.submit.waitSemaphoreCount==1 && t.submit.signalSemaphoreCount==1 && t.waits.size()==1 && t.signals[0]==consumer); assert(t.submit.pWaitDstStageMask[0]==VK_PIPELINE_STAGE_TRANSFER_BIT);
         assert(t.events.size()==7 && t.events[0]=="begin" && t.events[1]=="barrier" && t.events[2]=="copy" && t.events[3]=="barrier" && t.events[4]=="barrier" && t.events[5]=="end" && t.events[6]=="submit");
         assert(t.barriers.back().srcQueueFamilyIndex==3 && t.barriers.back().dstQueueFamilyIndex==7 && t.barriers.back().srcAccessMask==VK_ACCESS_TRANSFER_READ_BIT && t.barriers.back().dstAccessMask==0 && t.srcStage==VK_PIPELINE_STAGE_TRANSFER_BIT && t.dstStage==VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -117,7 +121,31 @@ int main() {
     {
         Trace t{}; auto ep=endpoint(5); auto image=vk::RuntimeImageEndpointTestAccess::make(ep,5,t);
         auto pending=vk::RuntimeImageEndpoint::submitForeignImageReadback(std::move(image),makePayload(ep),vk::RuntimeForeignImageHandoffInfo{5,h<VkSemaphore>(0xc2)});
-        assert(pending.valid() && pending.imageView().queueFamily()==5 && !pending.imageView().handoffPendingAcquire()); assert(t.barriers.size()==1 && t.submit.signalSemaphoreCount==1);
+        assert(pending.valid() && pending.terminalReady() && pending.imageView().queueFamily()==5 && !pending.imageView().handoffPendingAcquire()); assert(t.barriers.size()==1 && t.submit.signalSemaphoreCount==1);
+        static_cast<void>(vk::RuntimeImageEndpoint::completeForeignImageReadback(pending));
+    }
+    {
+        Trace t{}; auto ep=endpoint(3); auto image=vk::RuntimeImageEndpointTestAccess::make(ep,3,t);
+        auto pending=vk::RuntimeImageEndpoint::submitForeignImageReadback(std::move(image),makePayload(ep),vk::RuntimeForeignImageHandoffInfo{7,h<VkSemaphore>(0xc7)});
+        assert(pending.terminalReady() && !pending.completed());
+        assert(!vk::RuntimeImageEndpoint::tryRetireForeignImageReadback(pending));
+        assert(t.fenceStatusChecks==1 && t.waitsOnFence==0 && !pending.completed()
+            && !pending.retirementObserved());
+        t.fenceStatusResult=VK_SUCCESS;
+        assert(vk::RuntimeImageEndpoint::tryRetireForeignImageReadback(pending));
+        assert(t.fenceStatusChecks==2 && t.waitsOnFence==0 && !pending.completed()
+            && pending.retirementObserved());
+        assert(pending.terminalReady());
+        assert(vk::RuntimeImageEndpoint::tryRetireForeignImageReadback(pending));
+        assert(t.fenceStatusChecks==2 && t.waitsOnFence==0);
+        const auto bytes=vk::RuntimeImageEndpoint::completeForeignImageReadback(pending);
+        assert(bytes.size()==4 && pending.completed() && pending.retirementObserved());
+        assert(t.fenceStatusChecks==2 && t.waitsOnFence==0);
+    }
+    {
+        Trace t{}; auto ep=endpoint(3); auto image=vk::RuntimeImageEndpointTestAccess::make(ep,3,t);
+        auto pending=vk::RuntimeImageEndpoint::submitForeignImageReadback(std::move(image),makePayload(ep));
+        assert(pending.valid() && !pending.terminalReady());
         static_cast<void>(vk::RuntimeImageEndpoint::completeForeignImageReadback(pending));
     }
     {

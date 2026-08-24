@@ -52,6 +52,7 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         .QueueSubmit = vk.df().QueueSubmit,
         .CreateFence = vk.df().CreateFence,
         .DestroyFence = vk.df().DestroyFence,
+        .GetFenceStatus = vk.df().GetFenceStatus,
         .WaitForFences = vk.df().WaitForFences,
         .ResetFences = vk.df().ResetFences,
         .DeviceWaitIdle = vk.df().DeviceWaitIdle,

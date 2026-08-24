@@ -286,6 +286,7 @@ RuntimeForeignImageReadbackPending::RuntimeForeignImageReadbackPending(
     fence(std::exchange(other.fence, VK_NULL_HANDLE)), lifetime(std::move(other.lifetime)),
     submitted(std::exchange(other.submitted, false)),
     completionConsumed(std::exchange(other.completionConsumed, false)),
+    fenceRetired(std::exchange(other.fenceRetired, false)),
     failed(std::exchange(other.failed, false)),
     handoffRequestedValue(std::exchange(other.handoffRequestedValue, false)),
     releaseRequired(std::exchange(other.releaseRequired, false)),
@@ -303,6 +304,7 @@ RuntimeForeignImageReadbackPending& RuntimeForeignImageReadbackPending::operator
         lifetime = std::move(other.lifetime);
         submitted = std::exchange(other.submitted, false);
         completionConsumed = std::exchange(other.completionConsumed, false);
+        fenceRetired = std::exchange(other.fenceRetired, false);
         failed = std::exchange(other.failed, false);
         handoffRequestedValue = std::exchange(other.handoffRequestedValue, false);
         releaseRequired = std::exchange(other.releaseRequired, false);
@@ -317,6 +319,19 @@ RuntimeForeignImageReadbackPending::~RuntimeForeignImageReadbackPending() { rese
 
 bool RuntimeForeignImageReadbackPending::valid() const noexcept {
     return owner && submitted && !failed && fence != VK_NULL_HANDLE && !lifetime.expired();
+}
+
+bool RuntimeForeignImageReadbackPending::terminalReady() const noexcept {
+    const auto view = imageView();
+    return valid() && handoffRequestedValue
+        && owner->endpoint.GetFenceStatus
+        && borrowedSignalSemaphore != VK_NULL_HANDLE
+        && view.valid() && view.format() != VK_FORMAT_UNDEFINED
+        && view.extent().width != 0 && view.extent().height != 0
+        && view.layout() == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        && view.sourceQueueFamily() != VK_QUEUE_FAMILY_IGNORED
+        && view.destinationQueueFamily() != VK_QUEUE_FAMILY_IGNORED
+        && view.handoffPendingAcquire() == releaseRequired;
 }
 
 RuntimeForeignImageView RuntimeForeignImageReadbackPending::imageView() const noexcept {
@@ -336,7 +351,7 @@ RuntimeForeignImageView RuntimeForeignImageReadbackPending::imageView() const no
 }
 
 void RuntimeForeignImageReadbackPending::reset() noexcept {
-    if (owner && submitted && !completionConsumed && !lifetime.expired()
+    if (owner && submitted && !fenceRetired && !lifetime.expired()
             && owner->endpoint.DeviceWaitIdle) {
         static_cast<void>(owner->endpoint.DeviceWaitIdle(owner->endpoint.bufferDevice.device));
     }
@@ -348,6 +363,7 @@ void RuntimeForeignImageReadbackPending::reset() noexcept {
     lifetime.reset();
     submitted = false;
     completionConsumed = false;
+    fenceRetired = false;
     failed = false;
     handoffRequestedValue = false;
     releaseRequired = false;
@@ -364,6 +380,7 @@ RuntimeImageEndpoint RuntimeForeignImageReadbackPending::releaseOwner() noexcept
     imported = {};
     submitted = false;
     completionConsumed = false;
+    fenceRetired = false;
     failed = false;
     handoffRequestedValue = false;
     releaseRequired = false;
@@ -1046,11 +1063,16 @@ std::vector<uint8_t> RuntimeImageEndpoint::completeForeignImageReadback(
         throw std::logic_error("foreign image readback pending is invalid or already completed");
     auto& imageA = *pending.owner;
     try {
-        if (!imageA.endpoint.WaitForFences)
-            throw std::runtime_error("foreign image readback completion dispatch incomplete");
-        auto result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
-            &pending.fence, VK_TRUE, UINT64_MAX);
-        if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 final A fence wait");
+        VkResult result = VK_SUCCESS;
+        if (!pending.fenceRetired) {
+            if (!imageA.endpoint.WaitForFences)
+                throw std::runtime_error("foreign image readback completion dispatch incomplete");
+            result = imageA.endpoint.WaitForFences(imageA.endpoint.bufferDevice.device, 1,
+                &pending.fence, VK_TRUE, UINT64_MAX);
+            if (result != VK_SUCCESS)
+                throw ls::vulkan_error(result, "D3A1 final A fence wait");
+            pending.fenceRetired = true;
+        }
         if (!imageA.stagingHostCoherent) {
         VkMappedMemoryRange invalidate{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
         invalidate.memory = imageA.stagingMemory; invalidate.size = VK_WHOLE_SIZE;
@@ -1065,6 +1087,29 @@ std::vector<uint8_t> RuntimeImageEndpoint::completeForeignImageReadback(
         pending.failed = true;
         throw;
     }
+}
+
+bool RuntimeImageEndpoint::tryRetireForeignImageReadback(
+        RuntimeForeignImageReadbackPending& pending) {
+    if (!pending.valid() || pending.failed)
+        throw std::logic_error("foreign image readback pending is invalid");
+    if (pending.fenceRetired)
+        return true;
+    auto& imageA = *pending.owner;
+    if (!imageA.endpoint.GetFenceStatus) {
+        pending.failed = true;
+        throw std::runtime_error("foreign image readback retirement dispatch incomplete");
+    }
+    const auto result = imageA.endpoint.GetFenceStatus(
+        imageA.endpoint.bufferDevice.device, pending.fence);
+    if (result == VK_NOT_READY)
+        return false;
+    if (result != VK_SUCCESS) {
+        pending.failed = true;
+        throw ls::vulkan_error(result, "D3A1 final A fence status failed");
+    }
+    pending.fenceRetired = true;
+    return true;
 }
 
 std::vector<uint8_t> RuntimeImageEndpoint::readForeignImage(

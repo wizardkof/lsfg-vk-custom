@@ -16,6 +16,23 @@ using lsfgvk::test::ShadowBReturnExecutionHarness;
 using lsfgvk::test::ShadowHarnessFailurePoint;
 using lsfgvk::test::ShadowAHarnessFailurePoint;
 
+namespace lsfgvk::backend {
+struct RuntimeOperationAuthorityTestAccess {
+    static void setAReturnEpoch(ReturnedGeneratedOperation& operation, uint64_t epoch) {
+        operation.aReturnSubmission.operationEpoch = epoch;
+    }
+    static void setPayloadEpoch(ReturnedGeneratedOperation& operation, uint64_t epoch) {
+        operation.payload.operationEpoch = epoch;
+    }
+    static void setReturnedReady(ReturnedGeneratedOperation& operation, VkSemaphore value) {
+        operation.returnedForGraphics = value;
+    }
+    static void setReturnedConsumed(ReturnedGeneratedOperation& operation, bool value) {
+        operation.returnedConsumed = value;
+    }
+};
+}
+
 namespace {
 
 void assertFdClosed(int fd) {
@@ -99,6 +116,7 @@ void testCompleteResourceAndCommandSurface() {
     assert(render.BindImageMemory != nullptr);
     assert(render.CreateCommandPool != nullptr);
     assert(render.QueueSubmit != nullptr);
+    assert(render.GetFenceStatus != nullptr);
 
     harness.exerciseResourceAndCommandPath();
 
@@ -1170,9 +1188,11 @@ template<class T> T pairHandle(uintptr_t value) {
     return reinterpret_cast<T>(value);
 }
 
-lsfgvk::backend::ReturnedGeneratedOperation makeRetiredB0COperation(
+lsfgvk::backend::ReturnedGeneratedOperation makeSubmittedB0COperation(
         RealShadowPairFixture& fixture,
         lsfgvk::layer::GeneratedOutputReturnDiagnosticSession& returnSession) {
+    const auto aWaitCallsBefore = fixture.harness.aFenceWaitCalls;
+    const auto aStatusCallsBefore = fixture.harness.aFenceStatusCalls;
     auto pending = fixture.take();
     auto bPending = fixture.harness.submitProductionBReturn(
         returnSession, std::move(pending), *fixture.backend, *fixture.backendSession);
@@ -1185,9 +1205,16 @@ lsfgvk::backend::ReturnedGeneratedOperation makeRetiredB0COperation(
         operation, *fixture.backend, *fixture.backendSession);
     returnSession.releaseShadowGeneratedOutputForTesting(
         operation, *fixture.backend, *fixture.backendSession);
-    fixture.harness.retireAFence();
-    returnSession.retireShadowAReturnForTesting(operation);
-    assert(operation.valid() && operation.returnedForGraphicsOutstanding());
+    assert(operation.valid() && operation.terminalReady());
+    assert(operation.returnedForGraphicsOutstanding());
+    assert(operation.aReturnAuthority().state()
+        == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
+    assert(operation.payloadAuthority().state()
+        == lsfgvk::backend::RuntimeTemporaryPayloadState::WAIT_SUBMITTED);
+    assert(!operation.aReturnPending().completed());
+    assert(!operation.aReturnPending().retirementObserved());
+    assert(fixture.harness.aFenceWaitCalls == aWaitCallsBefore);
+    assert(fixture.harness.aFenceStatusCalls == aStatusCallsBefore);
     return operation;
 }
 
@@ -1204,7 +1231,11 @@ struct PairTerminalMock {
     uint32_t acquireCalls{};
     uint32_t releaseCalls{};
     uint32_t releasedImages{};
+    uint32_t terminalSubmitCalls{};
+    VkSemaphore terminalWaitSemaphore{};
+    VkImage terminalGeneratedSource{};
     bool hiddenReusable{true};
+    std::function<void()> beforeGraphicsFenceRetirement;
 
     lsfgvk::layer::D3B2InsertionPath build(
             lsfgvk::layer::D3B2Source generated,
@@ -1214,6 +1245,8 @@ struct PairTerminalMock {
         path.generated = generated;
         path.original = original;
         path.returnedForGraphics = returnedForGraphics;
+        terminalWaitSemaphore = returnedForGraphics;
+        terminalGeneratedSource = generated.image;
         path.acquireGenerated = pairHandle<VkSemaphore>(0xD301);
         path.acquireOriginal = pairHandle<VkSemaphore>(0xD302);
         path.generatedPresentReady = pairHandle<VkSemaphore>(0xD303);
@@ -1268,6 +1301,7 @@ struct PairTerminalMock {
         };
         path.submitWithWaitStage = [&](VkPipelineStageFlags stage) {
             assert(stage == VK_PIPELINE_STAGE_TRANSFER_BIT);
+            ++terminalSubmitCalls;
             events.emplace_back("TERMINAL_SUBMIT_WAIT_RETURNED_FOR_GRAPHICS");
             if (failure == PairTerminalFailure::DEVICE_LOST)
                 return VK_ERROR_DEVICE_LOST;
@@ -1293,6 +1327,8 @@ struct PairTerminalMock {
             return VK_SUCCESS;
         };
         path.waitGraphicsFence = [&] {
+            if (beforeGraphicsFenceRetirement)
+                beforeGraphicsFenceRetirement();
             events.emplace_back("TERMINAL_GRAPHICS_FENCE_WAIT");
             return failure != PairTerminalFailure::GRAPHICS_FENCE;
         };
@@ -1312,9 +1348,12 @@ struct PairTerminalMock {
 
 lsfgvk::layer::D3B3PairOperation makePairOperation(
         RealShadowPairFixture& fixture, PairTerminalMock& terminalMock,
-        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>& session) {
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>& session,
+        const std::function<void(lsfgvk::backend::ReturnedGeneratedOperation&)>& mutate = {}) {
     session = makeReturnSession(fixture);
-    auto returned = makeRetiredB0COperation(fixture, *session);
+    auto returned = makeSubmittedB0COperation(fixture, *session);
+    if (mutate)
+        mutate(returned);
     const auto pairIdentity = returned.identity();
     auto originalLifetime = std::make_shared<const uint8_t>(0);
     lsfgvk::layer::D3B3OriginalSourceAuthority original(
@@ -1343,8 +1382,15 @@ lsfgvk::layer::D3B3PairOperation makePairOperation(
             return terminalMock.hiddenReusable
                 && terminalMock.failure != PairTerminalFailure::HIDDEN_REACQUIRE;
         }};
-    return lsfgvk::layer::D3B3PairOperation(
+    auto pair = lsfgvk::layer::D3B3PairOperation(
         std::move(returned), std::move(original), std::move(dispatch));
+    assert(!returned.valid() && !returned.aReturnPending().valid());
+    assert(pair.returnedOperation().terminalReady());
+    assert(pair.returnedOperation().aReturnPending().retirementFence()
+        == fixture.harness.aReturnFence);
+    assert(pair.returnedOperation().payloadAuthority().semaphoreHandle()
+        == fixture.harness.aImportedWait);
+    return pair;
 }
 
 lsfgvk::layer::D3B3PairTerminalDispatch makeFiniteTerminalDispatch(
@@ -1400,7 +1446,7 @@ struct FiniteRealD3B3Run {
             },
             .returnGenerated = [&](const auto& identity) {
                 auto returnSession = makeReturnSession(fixture);
-                auto operation = makeRetiredB0COperation(fixture, *returnSession);
+                auto operation = makeSubmittedB0COperation(fixture, *returnSession);
                 const auto actual = operation.identity();
                 assert(actual.olderSlot == identity.olderSlot
                     && actual.newerSlot == identity.newerSlot
@@ -1423,6 +1469,9 @@ struct FiniteRealD3B3Run {
                     lifetime);
             },
             .makeTerminal = [&](const auto& identity) {
+                terminal.beforeGraphicsFenceRetirement = [&] {
+                    fixture.harness.retireAFence();
+                };
                 return makeFiniteTerminalDispatch(terminal, identity);
             },
             .stopWorkerAndJoin = [&] {
@@ -1489,8 +1538,14 @@ void testD3B3FiniteABCDEFProductionState() {
     assert(presents == expectedPresents);
     assert(run.fixture.harness.productionBReturnCalls == 3);
     assert(run.fixture.harness.aPhaseCalls == 3);
+    assert(run.fixture.harness.aQueueSubmitCalls == 3);
+    assert(run.fixture.harness.aFenceWaitCalls == 0);
+    assert(run.fixture.harness.aFenceStatusCalls == 3);
     assert(run.fixture.harness.deviceIdleCalls == 0);
     assert(run.fixture.harness.frontFenceWaitCount() == run.fixture.hostWaitsBeforeGraph);
+    assert(run.terminal.terminalSubmitCalls == 3);
+    assert(run.terminal.terminalWaitSemaphore == run.fixture.harness.returnedForGraphics);
+    assert(run.terminal.terminalGeneratedSource == run.fixture.harness.aImportedImage);
     assert(run.terminal.acquireCalls == 6);
     assert(std::ranges::count(run.terminal.events, "BLIT_GENERATED_G_TO_HIDDEN") == 3);
     assert(std::ranges::count(run.terminal.events, "BLIT_ORIGINAL_C_TO_HIDDEN") == 3);
@@ -1547,18 +1602,33 @@ void testD3B3PairOperationTerminalRetirementContract() {
     assert(pair.returnedForGraphicsState()
         == lsfgvk::backend::RuntimeBinarySemaphoreState::SIGNAL_SUBMITTED);
     assert(pair.returnedOperation().returnedForGraphicsOutstanding());
+    assert(pair.returnedOperation().terminalReady());
     assert(pair.returnedImageAlive());
+    assert(pair.aReturnState() == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
+    assert(pair.aReturnPayloadState()
+        == lsfgvk::backend::RuntimeTemporaryPayloadState::WAIT_SUBMITTED);
+    assert(!pair.aReturnRetired());
     assert(pair.originalState() == lsfgvk::layer::D3B3OriginalSourceState::AVAILABLE);
+    const auto aWaitsBeforeTerminal = fixture.harness.aFenceWaitCalls;
+    const auto aStatusBeforeTerminal = fixture.harness.aFenceStatusCalls;
 
     pair.preflight();
     assert(pair.state() == lsfgvk::layer::D3B3PairState::TERMINAL_PREFLIGHTED);
     assert(mock.acquireCalls == 0 && fixture.harness.returnedForGraphicsCalls == 1);
+    assert(mock.terminalWaitSemaphore == fixture.harness.aObserved.signal);
+    assert(mock.terminalWaitSemaphore == pair.returnedOperation().returnedReady());
+    assert(mock.terminalGeneratedSource
+        == pair.returnedOperation().aReturnPending().imageView().image());
+    assert(mock.terminalGeneratedSource == fixture.harness.aImportedImage);
     bool prematureReuseRejected{};
     try { pair.rejectReturnedForGraphicsReuse(); }
     catch (const std::logic_error&) { prematureReuseRejected = true; }
     assert(prematureReuseRejected);
 
     pair.submitTerminal();
+    assert(mock.terminalSubmitCalls == 1);
+    assert(fixture.harness.aFenceWaitCalls == aWaitsBeforeTerminal);
+    assert(fixture.harness.aFenceStatusCalls == aStatusBeforeTerminal);
     assert(pair.state() == lsfgvk::layer::D3B3PairState::GRAPHICS_RETIRED);
     assert(pair.returnedForGraphicsState()
         == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
@@ -1573,6 +1643,21 @@ void testD3B3PairOperationTerminalRetirementContract() {
     assert(pair.state() == lsfgvk::layer::D3B3PairState::PRESENTS_RETIRED);
     assert(pair.generatedPresentRetired() && pair.originalPresentRetired());
     assert(pair.hiddenLedgerEmpty());
+    bool pendingAReturnBlockedPairRetirement{};
+    try { pair.retirePair(); }
+    catch (const std::logic_error&) { pendingAReturnBlockedPairRetirement = true; }
+    assert(pendingAReturnBlockedPairRetirement);
+    assert(!pair.tryRetireAReturn());
+    assert(fixture.harness.aFenceStatusCalls == aStatusBeforeTerminal + 1);
+    assert(fixture.harness.aFenceWaitCalls == aWaitsBeforeTerminal);
+    fixture.harness.retireAFence();
+    assert(pair.tryRetireAReturn());
+    assert(pair.aReturnRetired());
+    assert(pair.aReturnState() == lsfgvk::backend::RuntimeAuthorityState::RETIRED);
+    assert(pair.aReturnPayloadState()
+        == lsfgvk::backend::RuntimeTemporaryPayloadState::WAIT_RETIRED);
+    assert(fixture.harness.aFenceStatusCalls == aStatusBeforeTerminal + 2);
+    assert(fixture.harness.aFenceWaitCalls == aWaitsBeforeTerminal);
     pair.retirePair();
     assert(pair.state() == lsfgvk::layer::D3B3PairState::PAIR_RETIRED);
     assert(pair.pairRetired() && pair.originalState() == lsfgvk::layer::D3B3OriginalSourceState::RELEASED);
@@ -1584,6 +1669,133 @@ void testD3B3PairOperationTerminalRetirementContract() {
         "PRESENT_GENERATED", "PRESENT_ORIGINAL", "TERMINAL_GRAPHICS_FENCE_WAIT",
         "PRESENT_FENCE_GENERATED_RETIRED", "PRESENT_FENCE_ORIGINAL_RETIRED",
         "HIDDEN_DESTINATIONS_REACQUIRE_CHECK"}));
+}
+
+void testD3B3SubmittedAReturnTerminalReadinessFirewall() {
+    lsfgvk::backend::ReturnedGeneratedOperation empty;
+    assert(!empty.terminalReady());
+
+    RealShadowPairFixture fixture;
+    auto session = makeReturnSession(fixture);
+    auto returned = makeSubmittedB0COperation(fixture, *session);
+    const auto generation = returned.identity().generationId;
+    const auto ready = returned.returnedReady();
+    assert(returned.terminalReady());
+
+    lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setAReturnEpoch(
+        returned, generation + 1);
+    assert(!returned.terminalReady());
+    lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setAReturnEpoch(
+        returned, generation);
+    assert(returned.terminalReady());
+
+    lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setReturnedReady(
+        returned, VK_NULL_HANDLE);
+    assert(!returned.terminalReady());
+    lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setReturnedReady(
+        returned, ready);
+    assert(returned.terminalReady());
+
+    returned.consumeReturnedForGraphics();
+    assert(!returned.terminalReady());
+    lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setReturnedConsumed(
+        returned, false);
+    assert(returned.terminalReady());
+
+    fixture.harness.retireAFence();
+    assert(returned.tryRetireAReturn());
+    assert(returned.aReturnRetired());
+    assert(returned.terminalReady());
+    assert(fixture.harness.aFenceWaitCalls == 0);
+    assert(fixture.harness.aFenceStatusCalls == 1);
+}
+
+void testD3B3PairConstructionRejectsInvalidSubmittedState() {
+    using Returned = lsfgvk::backend::ReturnedGeneratedOperation;
+    const std::vector<std::function<void(Returned&)>> invalidStates{
+        [](Returned& returned) { returned.failAReturn(); },
+        [](Returned& returned) {
+            lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setReturnedReady(
+                returned, VK_NULL_HANDLE);
+        },
+        [](Returned& returned) { returned.consumeReturnedForGraphics(); },
+        [](Returned& returned) {
+            lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setAReturnEpoch(
+                returned, returned.identity().generationId + 1);
+        },
+        [](Returned& returned) {
+            lsfgvk::backend::RuntimeOperationAuthorityTestAccess::setPayloadEpoch(
+                returned, returned.identity().generationId + 1);
+        },
+        [](Returned& returned) { returned.aReturnPending() = {}; }};
+
+    for (const auto& mutate : invalidStates) {
+        RealShadowPairFixture fixture;
+        PairTerminalMock mock;
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+        bool rejected{};
+        try { static_cast<void>(makePairOperation(fixture, mock, session, mutate)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+        assert(mock.terminalSubmitCalls == 0);
+        assert(fixture.harness.aFenceWaitCalls == 0);
+        assert(fixture.harness.aFenceStatusCalls == 0);
+    }
+}
+
+void testD3B3AReturnObservedBeforeTerminalFence() {
+    RealShadowPairFixture fixture;
+    PairTerminalMock mock;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    auto pair = makePairOperation(fixture, mock, session);
+    const auto aWaitsBeforeTerminal = fixture.harness.aFenceWaitCalls;
+    bool aObservedBeforeTerminalFence{};
+    mock.beforeGraphicsFenceRetirement = [&] {
+        assert(mock.terminalSubmitCalls == 1);
+        assert(pair.state() == lsfgvk::layer::D3B3PairState::PRESENTS_SUBMITTED);
+        assert(pair.returnedForGraphicsState()
+            == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+        fixture.harness.retireAFence();
+        assert(pair.tryRetireAReturn());
+        assert(pair.aReturnRetired());
+        assert(pair.returnedForGraphicsState()
+            == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+        aObservedBeforeTerminalFence = true;
+    };
+
+    pair.preflight();
+    pair.submitTerminal();
+    assert(aObservedBeforeTerminalFence);
+    assert(pair.state() == lsfgvk::layer::D3B3PairState::GRAPHICS_RETIRED);
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
+    assert(fixture.harness.aFenceWaitCalls == aWaitsBeforeTerminal);
+    assert(fixture.harness.aFenceStatusCalls == 1);
+    pair.retirePresentWaits();
+    pair.retirePair();
+}
+
+void testD3B3LateAReturnFailureIsConservative() {
+    RealShadowPairFixture fixture;
+    PairTerminalMock mock;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    auto pair = makePairOperation(fixture, mock, session);
+    pair.preflight();
+    pair.submitTerminal();
+    fixture.harness.aFenceStatusResult = VK_ERROR_DEVICE_LOST;
+    bool deviceLost{};
+    try { static_cast<void>(pair.tryRetireAReturn()); }
+    catch (const ls::vulkan_error& error) {
+        deviceLost = error.error() == VK_ERROR_DEVICE_LOST;
+    }
+    assert(deviceLost && pair.state() == lsfgvk::layer::D3B3PairState::FAILED);
+    assert(pair.aReturnState() == lsfgvk::backend::RuntimeAuthorityState::FAILED);
+    assert(pair.aReturnPayloadState()
+        == lsfgvk::backend::RuntimeTemporaryPayloadState::FAILED);
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
+    assert(fixture.harness.aFenceWaitCalls == 0);
+    assert(fixture.harness.aFenceStatusCalls == 1);
 }
 
 void testD3B3PairOperationFailureBoundaries() {
@@ -1615,6 +1827,9 @@ void testD3B3PairOperationFailureBoundaries() {
                 : lsfgvk::backend::RuntimeBinarySemaphoreState::SIGNAL_SUBMITTED));
         assert(pair.returnedOperation().returnedForGraphicsOutstanding()
             == !submitWasAccepted);
+        assert(pair.aReturnState() == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
+        assert(pair.aReturnPayloadState()
+            == lsfgvk::backend::RuntimeTemporaryPayloadState::WAIT_SUBMITTED);
         if (failure == PairTerminalFailure::ACQUIRE_ORIGINAL)
             assert(mock.releaseCalls == 1 && mock.releasedImages == 1);
         if (failure == PairTerminalFailure::ACQUIRE_GENERATED
@@ -1625,6 +1840,9 @@ void testD3B3PairOperationFailureBoundaries() {
             assert(mock.releaseCalls == 1 || mock.releaseCalls == 0);
         if (failure == PairTerminalFailure::DEVICE_LOST)
             assert(mock.releaseCalls == 0);
+        fixture.harness.retireAFence();
+        assert(pair.tryRetireAReturn());
+        assert(pair.state() == lsfgvk::layer::D3B3PairState::FAILED);
     }
 
     RealShadowPairFixture fixture;
@@ -1646,6 +1864,8 @@ void testD3B3PairOperationFailureBoundaries() {
     assert(earlyPairRetirementRejected);
     mock.hiddenReusable = true;
     pair.retirePresentWaits();
+    fixture.harness.retireAFence();
+    assert(pair.tryRetireAReturn());
     pair.retirePair();
 }
 
@@ -1673,7 +1893,11 @@ int main() {
     testAReturnFenceRetirementFailure();
     testD3B3FiniteABCDEFProductionState();
     testD3B3FinitePrePresentTimeoutAndEpochFirewall();
+    testD3B3SubmittedAReturnTerminalReadinessFirewall();
+    testD3B3PairConstructionRejectsInvalidSubmittedState();
     testD3B3PairOperationTerminalRetirementContract();
+    testD3B3AReturnObservedBeforeTerminalFence();
+    testD3B3LateAReturnFailureIsConservative();
     testD3B3PairOperationFailureBoundaries();
     return 0;
 }

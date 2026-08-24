@@ -64,7 +64,11 @@ namespace vk {
         RuntimeForeignImageReadbackPending& operator=(RuntimeForeignImageReadbackPending&&) noexcept;
         ~RuntimeForeignImageReadbackPending();
         [[nodiscard]] bool valid() const noexcept;
+        // completed() remains the diagnostic readback-consumption state.
+        // Fence retirement is independent so terminal ownership need not wait.
         [[nodiscard]] bool completed() const noexcept { return completionConsumed; }
+        [[nodiscard]] bool retirementObserved() const noexcept { return fenceRetired; }
+        [[nodiscard]] bool terminalReady() const noexcept;
         [[nodiscard]] RuntimeForeignImageView imageView() const noexcept;
         [[nodiscard]] VkFence retirementFence() const noexcept { return fence; }
         [[nodiscard]] VkSemaphore importedWaitSemaphore() const noexcept {
@@ -84,6 +88,7 @@ namespace vk {
         std::weak_ptr<const uint8_t> lifetime;
         bool submitted{};
         bool completionConsumed{};
+        bool fenceRetired{};
         bool failed{};
         bool handoffRequestedValue{};
         bool releaseRequired{};
@@ -105,6 +110,7 @@ namespace vk {
         PFN_vkQueueSubmit QueueSubmit{};
         PFN_vkCreateFence CreateFence{};
         PFN_vkDestroyFence DestroyFence{};
+        PFN_vkGetFenceStatus GetFenceStatus{};
         PFN_vkWaitForFences WaitForFences{};
         PFN_vkResetFences ResetFences{};
         PFN_vkDeviceWaitIdle DeviceWaitIdle{};
@@ -199,6 +205,9 @@ namespace vk {
             RuntimeImageEndpoint&& imageA, SyncFdPayload payload,
             std::optional<RuntimeForeignImageHandoffInfo> handoff = std::nullopt);
         [[nodiscard]] static std::vector<uint8_t> completeForeignImageReadback(
+            RuntimeForeignImageReadbackPending& pending);
+        // Single nonblocking fence observation for lifecycle retirement.
+        [[nodiscard]] static bool tryRetireForeignImageReadback(
             RuntimeForeignImageReadbackPending& pending);
     private:
         friend struct RuntimeImageEndpointTestAccess;

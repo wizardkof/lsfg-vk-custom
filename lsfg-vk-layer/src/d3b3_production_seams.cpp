@@ -24,14 +24,8 @@ D3B3PairOperation::D3B3PairOperation(
     const auto pair = returned.identity();
     if (!backend::validTemporalPair(pair)
             || pair.newerFrameId != original.source().frameId
-            || returned.bReturnAuthority().state() != backend::RuntimeAuthorityState::RETIRED
-            || returned.aReturnAuthority().state() != backend::RuntimeAuthorityState::RETIRED
-            || returned.payloadAuthority().state()
-                != backend::RuntimeTemporaryPayloadState::WAIT_RETIRED
-            || !returned.aReturnPending().completed()
-            || !returned.generatedOutputRetired()
-            || !returned.returnedForGraphicsOutstanding())
-        throw std::invalid_argument("D3B3 Pair1 requires complete B0C authorities");
+            || !returned.terminalReady())
+        throw std::invalid_argument("D3B3 Pair1 requires terminal-ready B0C authorities");
 
     returnedForGraphics.signalSubmitted(pair.generationId);
 }
@@ -137,6 +131,17 @@ void D3B3PairOperation::submitTerminal() {
     }
 }
 
+bool D3B3PairOperation::tryRetireAReturn() {
+    if (current == D3B3PairState::PAIR_RETIRED || !returned.valid())
+        throw std::logic_error("D3B3 Pair1 has no live A-return authority");
+    try {
+        return returned.tryRetireAReturn();
+    } catch (...) {
+        fail();
+        throw;
+    }
+}
+
 void D3B3PairOperation::retirePresentWaits() {
     if (current == D3B3PairState::GRAPHICS_RETIRED) {
         try {
@@ -163,6 +168,7 @@ void D3B3PairOperation::retirePair() {
     if (current != D3B3PairState::PRESENTS_RETIRED
             || !generatedPresentRetiredValue || !originalPresentRetiredValue
             || !hiddenEmpty || !returnedForGraphicsReusable()
+            || !returned.aReturnRetired()
             || original.state() != D3B3OriginalSourceState::TERMINAL_RETIRED)
         throw std::logic_error("D3B3 Pair1 retirement domains are incomplete");
     try {
@@ -571,9 +577,11 @@ bool D3B3ProductionState::presentFinite(uint64_t frameId) {
             slots[newerIndex] = {D3B3TemporalState::CURRENT,
                 identity.newerFrameId, generationId};
             operation.domains = {
-                true, true, true, true,
+                true, true, finitePair->aReturnRetired(), true,
                 finitePair->generatedPresentRetired(),
-                finitePair->originalPresentRetired(), true,
+                finitePair->originalPresentRetired(),
+                finitePair->aReturnPayloadState()
+                    == backend::RuntimeTemporaryPayloadState::WAIT_RETIRED,
                 finitePair->hiddenLedgerEmpty(), true};
             operation.state = D3B3PendingState::PENDING_RETIREMENT;
             finiteCurrent = D3B3FiniteProductionState::READY_NEXT;
@@ -634,6 +642,15 @@ D3B3RetirementStatus D3B3ProductionState::retireFinitePair() {
         finitePair->retirePresentWaits();
         if (!finitePair->hiddenLedgerEmpty())
             return D3B3RetirementStatus::TIMEOUT;
+        if (!finitePair->tryRetireAReturn())
+            return D3B3RetirementStatus::TIMEOUT;
+        {
+            std::scoped_lock lock(mutex);
+            operation.domains.aReturnComplete = finitePair->aReturnRetired();
+            operation.domains.temporaryPayloadRetired =
+                finitePair->aReturnPayloadState()
+                    == backend::RuntimeTemporaryPayloadState::WAIT_RETIRED;
+        }
         finitePair->retirePair();
         const auto pendingOperation = operation;
         {
