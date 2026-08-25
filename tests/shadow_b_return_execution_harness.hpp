@@ -461,6 +461,7 @@ public:
     VkResult aSubmitResult{VK_SUCCESS};
     VkResult aFenceWaitResult{VK_TIMEOUT};
     VkResult aFenceStatusResult{VK_NOT_READY};
+    VkResult backendFenceStatusResult{VK_SUCCESS};
     VkResult aImportResult{VK_SUCCESS};
     ShadowHarnessFailurePoint failurePoint{ShadowHarnessFailurePoint::NONE};
     ShadowAHarnessFailurePoint aFailurePoint{ShadowAHarnessFailurePoint::NONE};
@@ -715,7 +716,7 @@ public:
             backend::Instance& backendInstance,
             backend::RuntimeGenerateDiagnosticSession& backendSession) {
         ++productionBReturnCalls;
-        return returnSession.submitShadowBReturnForTesting(
+        return returnSession.submitProductionBReturn(
             std::move(pending), backendInstance, backendSession);
     }
 
@@ -725,7 +726,7 @@ public:
             backend::Instance& backendInstance,
             backend::RuntimeGenerateDiagnosticSession& backendSession) {
         ++aPhaseCalls;
-        return returnSession.completeShadowGeneratedReturnOnAForTesting(
+        return returnSession.completeProductionGeneratedReturnOnA(
             std::move(pending), backendInstance, backendSession,
             vk::RuntimeForeignImageHandoffInfo{
                 terminalQueueFamily, returnedForGraphics});
@@ -1732,6 +1733,8 @@ private:
             ++active->aFenceStatusCalls;
             return active->aFenceStatusResult;
         }
+        if (active->fullBackendMode && !active->returnResourcesArmed)
+            return active->backendFenceStatusResult;
         return VK_NOT_READY;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL waitForFences(VkDevice, uint32_t count,

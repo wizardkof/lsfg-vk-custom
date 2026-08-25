@@ -321,6 +321,7 @@ struct D3B3FiniteProductionCounters {
 // own and retire the real move-only PairOperation.
 struct D3B3FiniteProductionOperations {
     std::function<bool(uint64_t, backend::TemporalSourceSlot, bool)> ingest;
+    std::function<D3B3RetirementStatus()> retireWarmupIngest;
     std::function<bool(uint64_t, uint64_t, backend::TemporalSourceSlot,
         backend::TemporalSourceSlot, uint64_t)> generate;
     std::function<bool(uint64_t)> presentWarmupOriginal;

@@ -27,6 +27,7 @@ D3B3NormalPresentContext readyContext() {
 D3B3FiniteProductionOperations operations() {
         D3B3FiniteProductionOperations value;
         value.ingest = [](uint64_t, backend::TemporalSourceSlot, bool) { return true; };
+        value.retireWarmupIngest = [] { return D3B3RetirementStatus::RETIRED; };
         value.generate = [](uint64_t, uint64_t, backend::TemporalSourceSlot,
                 backend::TemporalSourceSlot, uint64_t) { return true; };
         value.presentWarmupOriginal = [](uint64_t) { return true; };

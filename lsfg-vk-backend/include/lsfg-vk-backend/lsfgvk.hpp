@@ -6,9 +6,7 @@
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
-#endif
 
 #include <exception>
 #include <filesystem>
@@ -40,7 +38,6 @@ namespace lsfgvk::backend {
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
     using RuntimeGenerateDiagnosticSession = RuntimeGenerateDiagnosticSessionImpl;
 
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
     struct RuntimeShadowSplitResourceSnapshot {
         VkCommandBuffer ingestCommand{};
         VkCommandBuffer generateCommand{};
@@ -95,10 +92,11 @@ namespace lsfgvk::backend {
         uint32_t bReturnSubmitCount{};
         uint32_t aReturnSubmitCount{};
     };
-#endif
 
     using RuntimeGenerationId = uint64_t;
     enum class RuntimeGenerateMode : uint8_t { OneShot, SerialReusable };
+    enum class RuntimeIngestIntent : uint8_t { WARMUP_TEMPORAL, GENERATE_SOURCE };
+    enum class RuntimeIngestRetirementStatus : uint8_t { NOT_READY, RETIRED };
 
     enum class TemporalSourceSlot : uint8_t { Slot0 = 0, Slot1 = 1 };
 
@@ -330,6 +328,36 @@ namespace lsfgvk::backend {
             RuntimeGenerationOperationRetirement&& authority);
         void closeRuntimeGenerateDiagnosticSession(
             const RuntimeGenerateDiagnosticSession& session);
+        [[nodiscard]] RuntimeShadowSplitResourceSnapshot inspectRuntimeSplitResources(
+            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+        [[nodiscard]] RuntimeShadowIngestSnapshot submitRuntimeIngest(
+            RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+            vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+            uint64_t frameId, RuntimeIngestIntent intent);
+        [[nodiscard]] RuntimeIngestRetirementStatus tryRetireRuntimeIngest(
+            RuntimeGenerateDiagnosticSession& session);
+        [[nodiscard]] RuntimeShadowIngestSnapshot inspectRuntimeIngest(
+            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+        [[nodiscard]] RuntimeShadowGenerateSnapshot submitRuntimePrepassGenerate(
+            RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair);
+        [[nodiscard]] RuntimeShadowGenerateSnapshot retireRuntimePrepassGenerate(
+            RuntimeGenerateDiagnosticSession& session);
+        [[nodiscard]] RuntimeShadowGenerateSnapshot inspectRuntimePrepassGenerate(
+            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+        [[nodiscard]] std::optional<RuntimeGenerateDiagnosticPending>
+            takeRuntimePrepassGeneratePending(RuntimeGenerateDiagnosticSession& session);
+        void recordRuntimeBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation);
+        void recordRuntimeBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation, bool deviceLost);
+        void retireRuntimeBReturnWait(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation);
+        void failRuntimeBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation, bool deviceLost);
+        void releaseRuntimeGenerationReady(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation);
+        void recordRuntimeAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerationId generation);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeShadowSplitResourceSnapshot inspectShadowSplitResources(
             const RuntimeGenerateDiagnosticSession& session) const noexcept;

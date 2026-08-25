@@ -382,7 +382,8 @@ void D3B3ProductionState::setFiniteStopped(bool value) noexcept {
 void D3B3ProductionState::setEligibleFrameCount(uint32_t value) noexcept { std::scoped_lock lock(mutex); eligibleFrames = value; }
 
 void D3B3ProductionState::configureFinite(D3B3FiniteProductionOperations operations) {
-    if (!operations.ingest || !operations.generate || !operations.presentWarmupOriginal
+    if (!operations.ingest || !operations.retireWarmupIngest
+            || !operations.generate || !operations.presentWarmupOriginal
             || !operations.returnGenerated || !operations.makeOriginal
             || !operations.makeTerminal || !operations.stopWorkerAndJoin
             || !operations.record || !operations.emitMarker)
@@ -397,7 +398,8 @@ void D3B3ProductionState::configureFinite(D3B3FiniteProductionOperations operati
 }
 
 bool D3B3ProductionState::finiteOperationsComplete() const noexcept {
-    return finiteOperations.ingest && finiteOperations.generate
+    return finiteOperations.ingest && finiteOperations.retireWarmupIngest
+        && finiteOperations.generate
         && finiteOperations.presentWarmupOriginal && finiteOperations.returnGenerated
         && finiteOperations.makeOriginal && finiteOperations.makeTerminal
         && finiteOperations.stopWorkerAndJoin && finiteOperations.record
@@ -420,6 +422,22 @@ bool D3B3ProductionState::presentFinite(uint64_t frameId) {
     }
 
     try {
+        // A/B share one bounded ingest command/fence/transport resource set.
+        // Poll its retirement before consuming the next logical frame.
+        if (frameNumber == 2 || frameNumber == 3) {
+            const auto ingestRetirement = operations.retireWarmupIngest();
+            if (ingestRetirement != D3B3RetirementStatus::RETIRED) {
+                std::scoped_lock lock(mutex);
+                if (ingestRetirement == D3B3RetirementStatus::TIMEOUT) {
+                    ++finiteTotals.gateTimeouts;
+                    finiteCurrent = D3B3FiniteProductionState::WAITING_REUSE;
+                } else {
+                    finiteCurrent = D3B3FiniteProductionState::FAILED;
+                }
+                return false;
+            }
+        }
+
         // The P1D3 gate is consulted before the next frame can create any
         // ingest, bridge, return, or terminal work. A timeout is retryable and
         // does not consume the application frame.

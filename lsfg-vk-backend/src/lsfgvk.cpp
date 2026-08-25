@@ -89,9 +89,7 @@ public:
     bool retirementAuthorityIssued{};
     bool operationRetired{};
     RuntimeTemporalPairIdentity temporalPair{};
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
     RuntimeBinarySemaphoreEpoch generationReadyEpoch;
-#endif
 };
 
 RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
@@ -361,7 +359,6 @@ namespace lsfgvk::backend {
         RuntimeGenerateDiagnosticResult complete(RuntimeGenerateDiagnosticPending&& pending);
         void retireOperation(RuntimeGenerationOperationRetirement&& authority);
         [[nodiscard]] bool hasPending() const noexcept { return pendingGeneration != nullptr; }
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeShadowSplitResourceSnapshot shadowSnapshot() const noexcept {
             if (!shadowSplit) return {};
             return {shadowSplit->ingestCommand.handle(), shadowSplit->generateCommand.handle(),
@@ -370,8 +367,8 @@ namespace lsfgvk::backend {
                 shadowSplit->ingestReadyEpoch.canSignalAgain()};
         }
         RuntimeShadowIngestSnapshot submitShadowIngest(VkImage, vk::SyncFdPayload,
-            TemporalSourceSlot, uint64_t);
-        RuntimeShadowIngestSnapshot retireShadowIngest();
+            TemporalSourceSlot, uint64_t, RuntimeIngestIntent);
+        RuntimeIngestRetirementStatus tryRetireShadowIngest();
         [[nodiscard]] RuntimeShadowIngestSnapshot shadowIngestSnapshot() const noexcept;
         RuntimeShadowGenerateSnapshot submitShadowGenerate(RuntimeTemporalPairIdentity);
         RuntimeShadowGenerateSnapshot retireShadowGenerate();
@@ -383,7 +380,6 @@ namespace lsfgvk::backend {
         void failShadowBReturnRetirement(RuntimeGenerationId, bool deviceLost);
         void releaseShadowGenerationReady(RuntimeGenerationId);
         void recordShadowAReturnSubmitted(RuntimeGenerationId);
-#endif
     private:
         struct ShadowSplitResources {
             explicit ShadowSplitResources(const vk::Vulkan& vk) :
@@ -398,7 +394,10 @@ namespace lsfgvk::backend {
             std::optional<RuntimeGenerateDiagnosticPending> generatePending;
             std::shared_ptr<RuntimeGenerateDiagnosticPendingState> generateState;
             uint64_t nextEpoch{1};
+            uint64_t nextWarmupEpoch{1};
+            RuntimeIngestIntent ingestIntent{RuntimeIngestIntent::WARMUP_TEMPORAL};
             VkSemaphore submittedWait{};
+            bool ingestFenceNeedsReset{};
             bool frameTransportReusable{true};
             bool failed{};
             bool deviceLost{};
@@ -805,6 +804,74 @@ void Instance::closeRuntimeGenerateDiagnosticSession(
         m_runtimeGenerateDiagnosticSessions.erase(it);
 }
 
+RuntimeShadowSplitResourceSnapshot Instance::inspectRuntimeSplitResources(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowSnapshot();
+}
+
+RuntimeShadowIngestSnapshot Instance::submitRuntimeIngest(
+        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+        uint64_t frameId, RuntimeIngestIntent intent) {
+    return session.submitShadowIngest(transportImage, std::move(payload),
+        destinationSlot, frameId, intent);
+}
+
+RuntimeIngestRetirementStatus Instance::tryRetireRuntimeIngest(
+        RuntimeGenerateDiagnosticSession& session) {
+    return session.tryRetireShadowIngest();
+}
+
+RuntimeShadowIngestSnapshot Instance::inspectRuntimeIngest(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowIngestSnapshot();
+}
+
+RuntimeShadowGenerateSnapshot Instance::submitRuntimePrepassGenerate(
+        RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair) {
+    return session.submitShadowGenerate(pair);
+}
+
+RuntimeShadowGenerateSnapshot Instance::retireRuntimePrepassGenerate(
+        RuntimeGenerateDiagnosticSession& session) {
+    return session.retireShadowGenerate();
+}
+
+RuntimeShadowGenerateSnapshot Instance::inspectRuntimePrepassGenerate(
+        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+    return session.shadowGenerateSnapshot();
+}
+
+std::optional<RuntimeGenerateDiagnosticPending>
+Instance::takeRuntimePrepassGeneratePending(RuntimeGenerateDiagnosticSession& session) {
+    return session.takeShadowGeneratePending();
+}
+
+void Instance::recordRuntimeBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.recordShadowBReturnSubmitted(generation);
+}
+void Instance::recordRuntimeBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation, bool lost) {
+    session.recordShadowBReturnRejected(generation, lost);
+}
+void Instance::retireRuntimeBReturnWait(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.retireShadowBReturnWait(generation);
+}
+void Instance::failRuntimeBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation, bool lost) {
+    session.failShadowBReturnRetirement(generation, lost);
+}
+void Instance::releaseRuntimeGenerationReady(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.releaseShadowGenerationReady(generation);
+}
+void Instance::recordRuntimeAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerationId generation) {
+    session.recordShadowAReturnSubmitted(generation);
+}
+
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 RuntimeShadowSplitResourceSnapshot Instance::inspectShadowSplitResources(
         const RuntimeGenerateDiagnosticSession& session) const noexcept {
@@ -816,12 +883,14 @@ RuntimeShadowIngestSnapshot Instance::submitShadowTemporalIngest(
         vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
         uint64_t frameId) {
     return session.submitShadowIngest(transportImage, std::move(payload),
-        destinationSlot, frameId);
+        destinationSlot, frameId, RuntimeIngestIntent::GENERATE_SOURCE);
 }
 
 RuntimeShadowIngestSnapshot Instance::retireShadowTemporalIngest(
         RuntimeGenerateDiagnosticSession& session) {
-    return session.retireShadowIngest();
+    if (session.tryRetireShadowIngest() != RuntimeIngestRetirementStatus::RETIRED)
+        throw backend::error("shadow ingest retirement is not ready");
+    return session.shadowIngestSnapshot();
 }
 
 RuntimeShadowIngestSnapshot Instance::inspectShadowTemporalIngest(
@@ -1410,7 +1479,6 @@ void RuntimeGenerateDiagnosticSessionImpl::recordTemporalIngestCommands(
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
 RuntimeShadowIngestSnapshot
 RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
     RuntimeShadowIngestSnapshot result{};
@@ -1430,7 +1498,8 @@ RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
     result.waitSemaphore = shadow.submittedWait;
     result.waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     result.commandBuffer = shadow.ingestCommand.handle();
-    result.signalSemaphore = shadow.ingestReady.handle();
+    result.signalSemaphore = shadow.ingestIntent == RuntimeIngestIntent::GENERATE_SOURCE
+        ? shadow.ingestReady.handle() : VK_NULL_HANDLE;
     result.fence = shadow.ingestFence.handle();
     result.frameTransportReusable = shadow.frameTransportReusable;
     result.ingestReadyReusable = shadow.ingestReadyEpoch.canSignalAgain();
@@ -1443,7 +1512,8 @@ RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
 
 RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIngest(
         VkImage transportImage, vk::SyncFdPayload payload,
-        TemporalSourceSlot destinationSlot, uint64_t frameId) {
+        TemporalSourceSlot destinationSlot, uint64_t frameId,
+        RuntimeIngestIntent intent) {
     if (!shadowSplit) throw std::logic_error("shadow split resources unavailable");
     auto& shadow = *shadowSplit;
     if (transportImage == VK_NULL_HANDLE || frameId == 0
@@ -1453,10 +1523,15 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
         throw std::logic_error("shadow ingest resources are not reusable");
 
     const auto& vk = instance.getVulkan();
-    const uint64_t epoch = shadow.nextEpoch++;
+    const uint64_t epoch = intent == RuntimeIngestIntent::GENERATE_SOURCE
+        ? shadow.nextEpoch++ : shadow.nextWarmupEpoch++;
     bool epochReserved{};
     bool submitAccepted{};
     try {
+        if (shadow.ingestFenceNeedsReset) {
+            shadow.ingestFence.reset(vk);
+            shadow.ingestFenceNeedsReset = false;
+        }
         shadow.importedWait = std::make_unique<vk::Semaphore>(vk);
         const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
             vk.df().CreateSemaphore, vk.df().DestroySemaphore,
@@ -1469,12 +1544,16 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
             temporalSourceSlotIndex(destinationSlot), false, vk.queueFamilyIndex());
         shadow.ingestCommand.end(vk);
 
-        shadow.ingestReadyEpoch.reserveSignal(epoch);
-        epochReserved = true;
+        shadow.ingestIntent = intent;
+        if (intent == RuntimeIngestIntent::GENERATE_SOURCE) {
+            shadow.ingestReadyEpoch.reserveSignal(epoch);
+            epochReserved = true;
+        }
         const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         const VkSemaphore waitSemaphore = shadow.importedWait->handle();
         const VkCommandBuffer commandBuffer = shadow.ingestCommand.handle();
-        const VkSemaphore signalSemaphore = shadow.ingestReady.handle();
+        const VkSemaphore signalSemaphore = intent == RuntimeIngestIntent::GENERATE_SOURCE
+            ? shadow.ingestReady.handle() : VK_NULL_HANDLE;
         const VkSubmitInfo submit{
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = 1,
@@ -1482,8 +1561,8 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
             .pWaitDstStageMask = &waitStage,
             .commandBufferCount = 1,
             .pCommandBuffers = &commandBuffer,
-            .signalSemaphoreCount = 1,
-            .pSignalSemaphores = &signalSemaphore
+            .signalSemaphoreCount = signalSemaphore == VK_NULL_HANDLE ? 0U : 1U,
+            .pSignalSemaphores = signalSemaphore == VK_NULL_HANDLE ? nullptr : &signalSemaphore
         };
         const VkResult submitResult = vk.df().QueueSubmit(
             vk.queue(), 1, &submit, shadow.ingestFence.handle());
@@ -1493,7 +1572,8 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
         }
         submitAccepted = true;
 
-        shadow.ingestReadyEpoch.producerSubmitted(epoch);
+        if (intent == RuntimeIngestIntent::GENERATE_SOURCE)
+            shadow.ingestReadyEpoch.producerSubmitted(epoch);
         shadow.pending.emplace(RuntimeShadowIngestAuthorityAccess::accepted(
             frameId, destinationSlot, epoch, shadow.ingestFence.handle(),
             shadow.importedWait->handle(), sessionLifetime));
@@ -1511,23 +1591,33 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
     }
 }
 
-RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowIngest() {
+RuntimeIngestRetirementStatus
+RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowIngest() {
     if (!shadowSplit || !shadowSplit->pending)
         throw std::logic_error("no accepted shadow ingest to retire");
     auto& shadow = *shadowSplit;
     const auto epoch = shadow.pending->epoch();
-    if (!shadow.ingestFence.wait(instance.getVulkan())) {
+    const auto& vk = instance.getVulkan();
+    const auto result = vk.df().GetFenceStatus(vk.dev(), shadow.ingestFence.handle());
+    if (result == VK_NOT_READY)
+        return RuntimeIngestRetirementStatus::NOT_READY;
+    if (result != VK_SUCCESS) {
         shadow.pending->submissionAuthority().fail();
         shadow.pending->payloadAuthority().fail();
-        shadow.ingestReadyEpoch.producerFailed();
+        if (shadow.ingestIntent == RuntimeIngestIntent::GENERATE_SOURCE)
+            shadow.ingestReadyEpoch.producerFailed();
+        shadow.deviceLost = result == VK_ERROR_DEVICE_LOST;
         shadow.failed = true;
-        throw backend::error("shadow ingest fence wait failed");
+        throw ls::vulkan_error(result, "runtime ingest vkGetFenceStatus() failed");
     }
     shadow.pending->submissionAuthority().retire(epoch);
     shadow.pending->payloadAuthority().waitRetired(epoch);
     shadow.frameTransportReusable = true;
     shadow.importedWait.reset();
-    return shadowIngestSnapshot();
+    shadow.ingestFenceNeedsReset = true;
+    if (shadow.ingestIntent == RuntimeIngestIntent::WARMUP_TEMPORAL)
+        shadow.pending.reset();
+    return RuntimeIngestRetirementStatus::RETIRED;
 }
 
 RuntimeShadowGenerateSnapshot
@@ -1686,6 +1776,7 @@ RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadow
     shadow.pending->submissionAuthority().retire(epoch);
     shadow.pending->payloadAuthority().waitRetired(epoch);
     shadow.frameTransportReusable = true;
+    shadow.ingestFenceNeedsReset = true;
     shadow.pending.reset();
     shadow.importedWait.reset();
     if (serialState.currentPhase() == RuntimeGenerateSerialPhase::IN_FLIGHT)
@@ -1774,7 +1865,6 @@ void RuntimeGenerateDiagnosticSessionImpl::recordShadowAReturnSubmitted(
         throw std::logic_error("invalid shadow A-return submit authority");
     ++shadowSplit->aReturnSubmitCount;
 }
-#endif
 
 void RuntimeGenerateDiagnosticSessionImpl::recordPrepassGenerateCommands(
         const vk::Vulkan& vk, const vk::CommandBuffer& command,

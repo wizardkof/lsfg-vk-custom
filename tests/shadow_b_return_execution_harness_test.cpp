@@ -661,6 +661,56 @@ void testRealB0B3PendingStaging() {
     assertFirewall(harness);
 }
 
+void testProductionWarmupNoSignalAndBCTransition() {
+    ShadowBReturnExecutionHarness harness;
+    auto backend = harness.createB0B3Instance();
+    auto& session = backend->openRuntimeGenerateDiagnosticSession(
+        {64, 64}, VK_FORMAT_B8G8R8A8_UNORM, 0, 1.0F, false,
+        lsfgvk::backend::RuntimeGenerateMode::SerialReusable);
+    const auto hostWaitsBeforeWarmup = harness.frontFenceWaitCount();
+    const auto transport = reinterpret_cast<VkImage>(uintptr_t{0xC100});
+
+    const auto warmup = [&](uint64_t frame, auto slot) {
+        auto payload = harness.exportTestPayload();
+        const auto submitted = backend->submitRuntimeIngest(session, transport,
+            std::move(payload), slot, frame,
+            lsfgvk::backend::RuntimeIngestIntent::WARMUP_TEMPORAL);
+        assert(submitted.submitAccepted && submitted.signalSemaphore == VK_NULL_HANDLE);
+        assert(submitted.ingestReadyReusable && !submitted.frameTransportReusable);
+        const auto& observed = harness.frontSubmit(harness.frontSubmitCount() - 1);
+        assert(observed.waitCount == 1
+            && observed.waitStage == VK_PIPELINE_STAGE_TRANSFER_BIT);
+        assert(observed.signalCount == 0);
+        assert(backend->tryRetireRuntimeIngest(session)
+            == lsfgvk::backend::RuntimeIngestRetirementStatus::RETIRED);
+        const auto retired = backend->inspectRuntimeIngest(session);
+        assert(retired.frameTransportReusable && retired.ingestReadyReusable);
+    };
+
+    warmup(static_cast<uint64_t>('A'),
+        lsfgvk::backend::TemporalSourceSlot::Slot0);
+    warmup(static_cast<uint64_t>('B'),
+        lsfgvk::backend::TemporalSourceSlot::Slot1);
+
+    auto payload = harness.exportTestPayload();
+    const auto c = backend->submitRuntimeIngest(session, transport, std::move(payload),
+        lsfgvk::backend::TemporalSourceSlot::Slot0, static_cast<uint64_t>('C'),
+        lsfgvk::backend::RuntimeIngestIntent::GENERATE_SOURCE);
+    assert(c.signalSemaphore != VK_NULL_HANDLE && !c.ingestReadyReusable);
+    const auto generated = backend->submitRuntimePrepassGenerate(session, {
+        .olderSlot = lsfgvk::backend::TemporalSourceSlot::Slot1,
+        .newerSlot = lsfgvk::backend::TemporalSourceSlot::Slot0,
+        .olderFrameId = static_cast<uint64_t>('B'),
+        .newerFrameId = static_cast<uint64_t>('C'),
+        .generationId = c.epoch});
+    const auto& generateSubmit = harness.frontSubmit(harness.frontSubmitCount() - 1);
+    assert(generateSubmit.wait == c.signalSemaphore);
+    assert(generateSubmit.waitStage == VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    assert(generated.olderFrameId == static_cast<uint64_t>('B')
+        && generated.newerFrameId == static_cast<uint64_t>('C'));
+    assert(harness.frontFenceWaitCount() == hostWaitsBeforeWarmup);
+}
+
 struct RealShadowPairFixture {
     ShadowBReturnExecutionHarness harness;
     std::unique_ptr<lsfgvk::backend::Instance> backend;
@@ -668,6 +718,8 @@ struct RealShadowPairFixture {
     lsfgvk::backend::RuntimeShadowGenerateSnapshot generated{};
     uint32_t hostWaitsBeforeGraph{};
     std::optional<std::pair<uint64_t, lsfgvk::backend::TemporalSourceSlot>> preparedIngest;
+    uint32_t productionWarmupIngests{};
+    uint32_t productionGenerateSourceIngests{};
 
     explicit RealShadowPairFixture(bool prepareInitialPair = true) {
         backend = harness.createB0B3Instance();
@@ -694,12 +746,24 @@ struct RealShadowPairFixture {
     void ingestCurrent(uint64_t newerFrameId,
             lsfgvk::backend::TemporalSourceSlot newerSlot) {
         auto payload = harness.exportTestPayload();
-        const auto ingest = backend->submitShadowTemporalIngest(*backendSession,
+        const auto ingest = backend->submitRuntimeIngest(*backendSession,
             reinterpret_cast<VkImage>(uintptr_t{0xC100}), std::move(payload),
-            newerSlot, newerFrameId);
+            newerSlot, newerFrameId,
+            lsfgvk::backend::RuntimeIngestIntent::GENERATE_SOURCE);
         assert(ingest.submitAccepted && !payload.valid());
+        ++productionGenerateSourceIngests;
         preparedIngest = std::pair<uint64_t, lsfgvk::backend::TemporalSourceSlot>{
             ingest.epoch, newerSlot};
+    }
+
+    void ingestWarmup(uint64_t frameId, lsfgvk::backend::TemporalSourceSlot slot) {
+        auto payload = harness.exportTestPayload();
+        const auto ingest = backend->submitRuntimeIngest(*backendSession,
+            reinterpret_cast<VkImage>(uintptr_t{0xC100}), std::move(payload),
+            slot, frameId, lsfgvk::backend::RuntimeIngestIntent::WARMUP_TEMPORAL);
+        assert(ingest.submitAccepted && ingest.signalSemaphore == VK_NULL_HANDLE
+            && ingest.ingestReadyReusable);
+        ++productionWarmupIngests;
     }
 
     void generateCurrent(uint64_t olderFrameId,
@@ -713,13 +777,13 @@ struct RealShadowPairFixture {
             .olderFrameId = olderFrameId,
             .newerFrameId = newerFrameId,
             .generationId = preparedIngest->first};
-        generated = backend->submitShadowPrepassGenerate(*backendSession, pair);
+        generated = backend->submitRuntimePrepassGenerate(*backendSession, pair);
         assert(generated.submitAccepted && generated.generationReadySignalOutstanding);
         assert(!generated.generationReadyWaitSubmitted
             && !generated.generationReadyWaitRetired
             && !generated.generationReadyReusable);
-        const auto producer = backend->inspectShadowPrepassGenerate(*backendSession);
-        auto pending = backend->takeShadowPrepassGeneratePending(*backendSession);
+        const auto producer = backend->inspectRuntimePrepassGenerate(*backendSession);
+        auto pending = backend->takeRuntimePrepassGeneratePending(*backendSession);
         assert(pending && pending->valid());
         harness.stageProductionPending(
             std::move(*pending), producer, backend->runtimeExchangeEndpoint());
@@ -746,7 +810,7 @@ void testCompleteOnePairNonTerminalProductionGraph() {
     assert(!harness.hasStagedPending() && pending.valid());
 
     lsfgvk::layer::GeneratedOutputReturnDiagnosticSession returnSession(
-        lsfgvk::layer::ShadowReturnExecutionForTesting{}, harness.devicePair(),
+        lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
         harness.endpoint(), harness.renderEndpoint(), true);
 
     auto bPending = harness.submitProductionBReturn(
@@ -968,7 +1032,7 @@ void testCompleteOnePairNonTerminalProductionGraph() {
 std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>
 makeReturnSession(RealShadowPairFixture& fixture) {
     return std::make_unique<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>(
-        lsfgvk::layer::ShadowReturnExecutionForTesting{}, fixture.harness.devicePair(),
+        lsfgvk::layer::ProductionReturnExecution{}, fixture.harness.devicePair(),
         fixture.harness.endpoint(), fixture.harness.renderEndpoint(), true);
 }
 
@@ -1417,10 +1481,18 @@ struct FiniteRealD3B3Run {
     lsfgvk::layer::D3B3FiniteProductionOperations operations() {
         return {
             .ingest = [&](uint64_t frame, lsfgvk::backend::TemporalSourceSlot slot, bool seed) {
-                if (!seed && frame >= static_cast<uint64_t>('C'))
+                if (frame < static_cast<uint64_t>('C'))
+                    fixture.ingestWarmup(frame, slot);
+                else
                     fixture.ingestCurrent(frame, slot);
                 events.emplace_back(seed ? "REAL_INGEST_SEED" : "REAL_INGEST");
                 return true;
+            },
+            .retireWarmupIngest = [&] {
+                return fixture.backend->tryRetireRuntimeIngest(*fixture.backendSession)
+                        == lsfgvk::backend::RuntimeIngestRetirementStatus::RETIRED
+                    ? lsfgvk::layer::D3B3RetirementStatus::RETIRED
+                    : lsfgvk::layer::D3B3RetirementStatus::TIMEOUT;
             },
             .generate = [&](uint64_t older, uint64_t newer,
                     lsfgvk::backend::TemporalSourceSlot olderSlot,
@@ -1528,6 +1600,8 @@ void testD3B3FiniteABCDEFProductionState() {
             presents.push_back(event);
     assert(presents == expectedPresents);
     assert(run.fixture.harness.productionBReturnCalls == 3);
+    assert(run.fixture.productionWarmupIngests == 2);
+    assert(run.fixture.productionGenerateSourceIngests == 3);
     assert(run.fixture.harness.aPhaseCalls == 3);
     assert(run.fixture.harness.aQueueSubmitCalls == 3);
     assert(run.fixture.harness.aFenceWaitCalls == 0);
@@ -1576,10 +1650,42 @@ void testD3B3FiniteABCDEFThroughProductionAdapter() {
     assert(adapter.ownership() == lsfgvk::layer::D3B3PresentOwnership::D3B3_ROUTE);
     assert(adapter.frameSerial() == 6);
     assert(run.fixture.harness.productionBReturnCalls == 3);
+    assert(run.fixture.productionWarmupIngests == 2);
+    assert(run.fixture.productionGenerateSourceIngests == 3);
     assert(run.fixture.harness.aPhaseCalls == 3);
     assert(run.fixture.harness.aFenceWaitCalls == 0);
     assert(run.terminal.terminalSubmitCalls == 3);
     assert(run.terminal.acquireCalls == 6);
+}
+
+void testD3B3ProductionWarmupBlockedRetryDoesNotConsumeB() {
+    FiniteRealD3B3Run run;
+    constexpr uint64_t swapchainGeneration = 12;
+    auto runtime = std::make_unique<lsfgvk::layer::D3B3ProductionRuntimeSession>(
+        swapchainGeneration, run.operations());
+    lsfgvk::layer::D3B3NormalPresentAdapter adapter({
+        .swapchain = pairHandle<VkSwapchainKHR>(0xA611),
+        .sourceImage = pairHandle<VkImage>(0xA612),
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {8, 8},
+        .presentQueue = pairHandle<VkQueue>(0xA613),
+        .presentQueueFamily = ShadowBReturnExecutionHarness::terminalQueueFamily,
+        .originalReady = pairHandle<VkSemaphore>(0xA614),
+        .swapchainGeneration = swapchainGeneration,
+        .runtimeDevicePairReady = true, .exchangeChannelReady = true,
+        .terminalReady = true}, std::move(runtime));
+    assert(adapter.structurallyReady() && adapter.constructOperations());
+    assert(adapter.processFrame(static_cast<uint64_t>('A'))
+        == lsfgvk::layer::D3B3NormalAdapterResult::READY);
+    run.fixture.harness.backendFenceStatusResult = VK_NOT_READY;
+    assert(adapter.processFrame(static_cast<uint64_t>('B'))
+        == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
+    assert(adapter.controller()->finiteCounters().applicationFrames == 1);
+    assert(run.fixture.productionWarmupIngests == 1);
+    run.fixture.harness.backendFenceStatusResult = VK_SUCCESS;
+    assert(adapter.processFrame(static_cast<uint64_t>('B'))
+        == lsfgvk::layer::D3B3NormalAdapterResult::READY);
+    assert(adapter.controller()->finiteCounters().applicationFrames == 2);
+    assert(run.fixture.productionWarmupIngests == 2);
 }
 
 void testD3B3PairOperationTerminalRetirementContract() {
@@ -1960,6 +2066,7 @@ int main() {
     testSyncFdPayloadMoveRegression();
     testIndependentFenceRetirement();
     testRealB0B3PendingStaging();
+    testProductionWarmupNoSignalAndBCTransition();
     testCompleteOnePairNonTerminalProductionGraph();
     testBReturnSubmitFailures();
     testBReturnExportFailureAfterAcceptedSubmit();
@@ -1968,6 +2075,7 @@ int main() {
     testAReturnFenceRetirementFailure();
     testD3B3FiniteABCDEFProductionState();
     testD3B3FiniteABCDEFThroughProductionAdapter();
+    testD3B3ProductionWarmupBlockedRetryDoesNotConsumeB();
     testD3B3SubmittedAReturnTerminalReadinessFirewall();
     testD3B3PairConstructionRejectsInvalidSubmittedState();
     testD3B3PairOperationTerminalRetirementContract();

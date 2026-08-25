@@ -14,6 +14,7 @@ namespace lsfgvk::layer {
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
     struct ShadowReturnExecutionForTesting final {};
 #endif
+    struct ProductionReturnExecution final {};
 
     enum class ReturnSubmissionFencePolicy : uint8_t {
         ACTIVE_COMPATIBLE,
@@ -166,6 +167,9 @@ namespace lsfgvk::layer {
             const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
             vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly,
             std::optional<vk::RuntimeForeignImageHandoffInfo> handoff = std::nullopt);
+        GeneratedOutputReturnDiagnosticSession(ProductionReturnExecution,
+            const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
+            vk::RuntimeExchangeEndpoint renderEndpoint, bool captureOnly);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         GeneratedOutputReturnDiagnosticSession(ShadowReturnExecutionForTesting,
             const vk::RuntimeDevicePair&, vk::RuntimeExchangeEndpoint generationEndpoint,
@@ -184,6 +188,14 @@ namespace lsfgvk::layer {
             return aReadbackPending.imageView();
         }
         void completePresentationDiagnostics();
+        [[nodiscard]] RuntimeGeneratedBReturnPending submitProductionBReturn(
+            backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,
+            backend::RuntimeGenerateDiagnosticSession&);
+        [[nodiscard]] backend::ReturnedGeneratedOperation
+            completeProductionGeneratedReturnOnA(
+                RuntimeGeneratedBReturnPending&&, backend::Instance&,
+                backend::RuntimeGenerateDiagnosticSession&,
+                vk::RuntimeForeignImageHandoffInfo);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeGeneratedBReturnPending submitShadowBReturnForTesting(
             backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,
@@ -244,9 +256,7 @@ namespace lsfgvk::layer {
         backend::Instance* delayedBackend{};
         backend::RuntimeGenerateDiagnosticSession* delayedBackendSession{};
         GeneratedOutputIntegrity expected{};
-#ifdef LSFGVK_TESTING_SHADOW_SPLIT
         std::optional<RuntimeGeneratedBReturnPending> acceptedShadowFailure;
-        std::shared_ptr<const uint8_t> shadowLifetime{std::make_shared<const uint8_t>(0)};
-#endif
+        std::shared_ptr<const uint8_t> operationLifetime{std::make_shared<const uint8_t>(0)};
     };
 }
