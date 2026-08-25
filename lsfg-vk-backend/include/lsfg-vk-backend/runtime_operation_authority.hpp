@@ -8,7 +8,7 @@
 #include <utility>
 
 namespace lsfgvk::layer {
-class GeneratedOutputReturnDiagnosticSession;
+class GeneratedOutputReturnSession;
 }
 
 namespace lsfgvk::backend {
@@ -344,7 +344,7 @@ public:
     }
 private:
     friend struct RuntimeOperationAuthorityTestAccess;
-    friend class ::lsfgvk::layer::GeneratedOutputReturnDiagnosticSession;
+    friend class ::lsfgvk::layer::GeneratedOutputReturnSession;
     ReturnedGeneratedOperation(RuntimeTemporalPairIdentity identity,
             RuntimeSubmissionRetirement&& bSubmission,
             RuntimeSubmissionRetirement&& aSubmission,

@@ -55,7 +55,7 @@ void GpuChainedReturnStateMachine::advance(
     current = next;
 }
 
-GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+GeneratedOutputReturnSession::GeneratedOutputReturnSession(
         backend::RuntimeGenerateDiagnosticResult&& result, const vk::RuntimeDevicePair& pair,
         vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
         bool captureOnly) : generationEndpoint(std::move(generation)),
@@ -68,9 +68,9 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
     execute(std::move(result));
 }
 
-GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+GeneratedOutputReturnSession::GeneratedOutputReturnSession(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& session,
+        backend::RuntimeGenerateSession& session,
         const vk::RuntimeDevicePair& pair, vk::RuntimeExchangeEndpoint generation,
         vk::RuntimeExchangeEndpoint render, bool captureOnly,
         std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) :
@@ -84,7 +84,7 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
 }
 
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
-GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+GeneratedOutputReturnSession::GeneratedOutputReturnSession(
         ShadowReturnExecutionForTesting, const vk::RuntimeDevicePair& pair,
         vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
         bool captureOnly) : generationEndpoint(std::move(generation)),
@@ -97,7 +97,7 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
 }
 #endif
 
-GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
+GeneratedOutputReturnSession::GeneratedOutputReturnSession(
         ProductionReturnExecution, const vk::RuntimeDevicePair& pair,
         vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
         bool captureOnly) : generationEndpoint(std::move(generation)),
@@ -109,11 +109,11 @@ GeneratedOutputReturnDiagnosticSession::GeneratedOutputReturnDiagnosticSession(
         throw std::invalid_argument("production return endpoint role mismatch");
 }
 
-GeneratedOutputReturnDiagnosticSession::~GeneratedOutputReturnDiagnosticSession() {
+GeneratedOutputReturnSession::~GeneratedOutputReturnSession() {
     resetBCommands();
 }
 
-void GeneratedOutputReturnDiagnosticSession::resetBCommands() noexcept {
+void GeneratedOutputReturnSession::resetBCommands() noexcept {
     if (bCommand && bCommandPool && generationEndpoint.FreeCommandBuffers)
         generationEndpoint.FreeCommandBuffers(generationEndpoint.bufferDevice.device,
             bCommandPool, 1, &bCommand);
@@ -123,12 +123,12 @@ void GeneratedOutputReturnDiagnosticSession::resetBCommands() noexcept {
     bCommand = VK_NULL_HANDLE; bCommandPool = VK_NULL_HANDLE;
 }
 
-void GeneratedOutputReturnDiagnosticSession::advance(
+void GeneratedOutputReturnSession::advance(
         GeneratedOutputReturnState expected, GeneratedOutputReturnState next) {
     states.advance(expected, next);
 }
 
-void GeneratedOutputReturnDiagnosticSession::execute(
+void GeneratedOutputReturnSession::execute(
         backend::RuntimeGenerateDiagnosticResult&& result) {
     try {
         if (!result.frame.valid() || result.metadata.generation != result.frame.identity()
@@ -245,9 +245,9 @@ void GeneratedOutputReturnDiagnosticSession::execute(
     }
 }
 
-void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
+void GeneratedOutputReturnSession::executeGpuChained(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        backend::RuntimeGenerateSession& backendSession,
         std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
     try {
         auto bPending = submitGeneratedBReturn(std::move(pending),
@@ -259,10 +259,10 @@ void GeneratedOutputReturnDiagnosticSession::executeGpuChained(
     }
 }
 
-RuntimeGeneratedBReturnPending GeneratedOutputReturnDiagnosticSession::submitGeneratedBReturn(
+RuntimeGeneratedBReturnPending GeneratedOutputReturnSession::submitGeneratedBReturn(
         backend::RuntimeGenerateDiagnosticPending&& pending,
         ReturnSubmissionFencePolicy fencePolicy, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession, VkFence shadowFence) {
+        backend::RuntimeGenerateSession& backendSession, VkFence shadowFence) {
     if (!pending.valid() || pending.identity() == 0
             || pending.layoutValue() != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
             || pending.queueFamily() != generationEndpoint.queueFamilyIndex
@@ -415,16 +415,16 @@ RuntimeGeneratedBReturnPending GeneratedOutputReturnDiagnosticSession::submitGen
 
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 RuntimeGeneratedBReturnPending
-GeneratedOutputReturnDiagnosticSession::submitShadowBReturnForTesting(
+GeneratedOutputReturnSession::submitShadowBReturnForTesting(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     return submitProductionBReturn(std::move(pending), backend, backendSession);
 }
 #endif
 
-void GeneratedOutputReturnDiagnosticSession::completeGeneratedReturnOnA(
+void GeneratedOutputReturnSession::completeGeneratedReturnOnA(
         RuntimeGeneratedBReturnPending&& bPending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        backend::RuntimeGenerateSession& backendSession,
         std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
     auto& pending = bPending.pending;
     if (!pending.valid() || !bPending.bToAPayload.valid())
@@ -514,9 +514,9 @@ void GeneratedOutputReturnDiagnosticSession::completeGeneratedReturnOnA(
 }
 
 RuntimeGeneratedBReturnPending
-GeneratedOutputReturnDiagnosticSession::submitProductionBReturn(
+GeneratedOutputReturnSession::submitProductionBReturn(
         backend::RuntimeGenerateDiagnosticPending&& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     try {
         return submitGeneratedBReturn(std::move(pending),
             ReturnSubmissionFencePolicy::SHADOW_REAL, backend, backendSession);
@@ -527,9 +527,9 @@ GeneratedOutputReturnDiagnosticSession::submitProductionBReturn(
 }
 
 lsfgvk::backend::ReturnedGeneratedOperation
-GeneratedOutputReturnDiagnosticSession::completeProductionGeneratedReturnOnA(
+GeneratedOutputReturnSession::completeProductionGeneratedReturnOnA(
         RuntimeGeneratedBReturnPending&& bPending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        backend::RuntimeGenerateSession& backendSession,
         vk::RuntimeForeignImageHandoffInfo handoff) {
     if (!bPending.valid() || !bPending.bReturn.valid()
             || handoff.destinationQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED
@@ -567,9 +567,37 @@ GeneratedOutputReturnDiagnosticSession::completeProductionGeneratedReturnOnA(
 }
 
 lsfgvk::backend::RuntimeRetirementStatus
-GeneratedOutputReturnDiagnosticSession::tryRetireProductionBReturn(
+GeneratedOutputReturnSession::tryRetireProductionBReturn(
+        RuntimeGeneratedBReturnPending& pending, backend::Instance& backend,
+        backend::RuntimeGenerateSession& backendSession) {
+    const auto generation = pending.identity().generationId;
+    auto& authority = pending.bReturn;
+    if (authority.state() == backend::RuntimeAuthorityState::RETIRED)
+        return backend::RuntimeRetirementStatus::RETIRED;
+    if (!pending.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
+            || authority.epoch() != generation || !generationEndpoint.GetFenceStatus)
+        throw std::logic_error("invalid production pending B-return retirement request");
+    const auto result = generationEndpoint.GetFenceStatus(
+        generationEndpoint.bufferDevice.device, authority.fenceHandle());
+    if (result == VK_NOT_READY)
+        return backend::RuntimeRetirementStatus::NOT_READY;
+    if (result != VK_SUCCESS) {
+        authority.fail();
+        backend.failRuntimeBReturnRetirement(
+            backendSession, generation, result == VK_ERROR_DEVICE_LOST);
+        return result == VK_ERROR_DEVICE_LOST
+            ? backend::RuntimeRetirementStatus::DEVICE_LOST
+            : backend::RuntimeRetirementStatus::FAILED;
+    }
+    backend.retireRuntimeBReturnWait(backendSession, generation);
+    authority.retire(generation);
+    return backend::RuntimeRetirementStatus::RETIRED;
+}
+
+lsfgvk::backend::RuntimeRetirementStatus
+GeneratedOutputReturnSession::tryRetireProductionBReturn(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     const auto generation = operation.identity().generationId;
     auto& authority = operation.bReturnAuthority();
     if (authority.state() == backend::RuntimeAuthorityState::RETIRED)
@@ -595,9 +623,9 @@ GeneratedOutputReturnDiagnosticSession::tryRetireProductionBReturn(
 }
 
 lsfgvk::backend::RuntimeRetirementStatus
-GeneratedOutputReturnDiagnosticSession::releaseProductionGeneratedOutput(
+GeneratedOutputReturnSession::releaseProductionGeneratedOutput(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     if (operation.generatedOutputRetired())
         return backend::RuntimeRetirementStatus::RETIRED;
     if (!operation.valid())
@@ -625,17 +653,17 @@ GeneratedOutputReturnDiagnosticSession::releaseProductionGeneratedOutput(
 
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 lsfgvk::backend::ReturnedGeneratedOperation
-GeneratedOutputReturnDiagnosticSession::completeShadowGeneratedReturnOnAForTesting(
+GeneratedOutputReturnSession::completeShadowGeneratedReturnOnAForTesting(
         RuntimeGeneratedBReturnPending&& bPending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession,
+        backend::RuntimeGenerateSession& backendSession,
         vk::RuntimeForeignImageHandoffInfo handoff) {
     return completeProductionGeneratedReturnOnA(
         std::move(bPending), backend, backendSession, handoff);
 }
 
-void GeneratedOutputReturnDiagnosticSession::retireShadowBReturnForTesting(
+void GeneratedOutputReturnSession::retireShadowBReturnForTesting(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     const auto generation = operation.identity().generationId;
     auto& authority = operation.bReturnAuthority();
     if (!operation.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
@@ -657,15 +685,15 @@ void GeneratedOutputReturnDiagnosticSession::retireShadowBReturnForTesting(
         throw backend::error("shadow B-return retirement did not complete");
 }
 
-void GeneratedOutputReturnDiagnosticSession::releaseShadowGeneratedOutputForTesting(
+void GeneratedOutputReturnSession::releaseShadowGeneratedOutputForTesting(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     const auto result = releaseProductionGeneratedOutput(operation, backend, backendSession);
     if (result != backend::RuntimeRetirementStatus::RETIRED)
         throw backend::error("shadow generated-output release did not complete");
 }
 
-void GeneratedOutputReturnDiagnosticSession::retireShadowAReturnForTesting(
+void GeneratedOutputReturnSession::retireShadowAReturnForTesting(
         backend::ReturnedGeneratedOperation& operation) {
     if (!operation.valid()
             || operation.aReturnSubmission.state()
@@ -682,7 +710,7 @@ void GeneratedOutputReturnDiagnosticSession::retireShadowAReturnForTesting(
 }
 
 std::optional<RuntimeGeneratedBReturnPending>
-GeneratedOutputReturnDiagnosticSession::takeAcceptedShadowFailureForTesting() {
+GeneratedOutputReturnSession::takeAcceptedShadowFailureForTesting() {
     if (!acceptedShadowFailure)
         throw std::logic_error("no accepted shadow B-return failure authority");
     auto result = std::move(acceptedShadowFailure);
@@ -690,9 +718,9 @@ GeneratedOutputReturnDiagnosticSession::takeAcceptedShadowFailureForTesting() {
     return result;
 }
 
-void GeneratedOutputReturnDiagnosticSession::retireAcceptedShadowBReturnFailureForTesting(
+void GeneratedOutputReturnSession::retireAcceptedShadowBReturnFailureForTesting(
         RuntimeGeneratedBReturnPending& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     if (!pending.acceptedSubmissionAuthorityForTesting()
             || pending.bReturn.state() != backend::RuntimeAuthorityState::SUBMITTED
             || !generationEndpoint.WaitForFences)
@@ -713,9 +741,9 @@ void GeneratedOutputReturnDiagnosticSession::retireAcceptedShadowBReturnFailureF
     pending.bReturn.retire(generation);
 }
 
-void GeneratedOutputReturnDiagnosticSession::releaseAcceptedShadowGeneratedOutputForTesting(
+void GeneratedOutputReturnSession::releaseAcceptedShadowGeneratedOutputForTesting(
         RuntimeGeneratedBReturnPending& pending, backend::Instance& backend,
-        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+        backend::RuntimeGenerateSession& backendSession) {
     if (pending.bReturn.state() != backend::RuntimeAuthorityState::RETIRED
             || !pending.pending.valid())
         throw std::logic_error("accepted shadow output still has an in-flight reader");
@@ -728,7 +756,7 @@ void GeneratedOutputReturnDiagnosticSession::releaseAcceptedShadowGeneratedOutpu
 }
 #endif
 
-void GeneratedOutputReturnDiagnosticSession::completePresentationDiagnostics() {
+void GeneratedOutputReturnSession::completePresentationDiagnostics() {
     if (!aReadbackPending.valid() || !delayedGeneration.valid()
             || !delayedBackend || !delayedBackendSession)
         throw std::logic_error("D3B1 presentation diagnostics are not pending");

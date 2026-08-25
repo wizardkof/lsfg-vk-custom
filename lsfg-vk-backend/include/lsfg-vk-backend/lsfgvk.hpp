@@ -26,7 +26,7 @@ namespace lsfgvk::backend {
     class [[gnu::visibility("default")]] ContextImpl;
     class [[gnu::visibility("default")]] InstanceImpl;
     class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
-    class [[gnu::visibility("default")]] RuntimeGenerateDiagnosticSessionImpl;
+    class [[gnu::visibility("default")]] RuntimeGenerateSessionImpl;
     class RuntimeGenerateDiagnosticPendingState;
     class RuntimeGenerationOperationRetirement;
     class RuntimeIngestPending;
@@ -36,7 +36,7 @@ namespace lsfgvk::backend {
 
     using Context = ContextImpl;
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
-    using RuntimeGenerateDiagnosticSession = RuntimeGenerateDiagnosticSessionImpl;
+    using RuntimeGenerateSession = RuntimeGenerateSessionImpl;
 
     struct RuntimeShadowSplitResourceSnapshot {
         VkCommandBuffer ingestCommand{};
@@ -148,7 +148,7 @@ namespace lsfgvk::backend {
         [[nodiscard]] uint32_t queueFamily() const noexcept { return family; }
         void consume();
     private:
-        friend class RuntimeGenerateDiagnosticSessionImpl;
+        friend class RuntimeGenerateSessionImpl;
         friend struct RuntimeGeneratedFrameTokenTestAccess;
         RuntimeGeneratedFrameToken(RuntimeGenerationId id, VkImage image, VkExtent2D extent,
             VkFormat format, VkImageLayout layout, uint32_t family,
@@ -202,7 +202,7 @@ namespace lsfgvk::backend {
         [[nodiscard]] RuntimeGenerationOperationRetirement operationRetirementAuthority();
         void consumeTransport();
     private:
-        friend class RuntimeGenerateDiagnosticSessionImpl;
+        friend class RuntimeGenerateSessionImpl;
         friend struct RuntimeGenerateDiagnosticPendingTestAccess;
         explicit RuntimeGenerateDiagnosticPending(
             std::shared_ptr<RuntimeGenerateDiagnosticPendingState>) noexcept;
@@ -223,7 +223,7 @@ namespace lsfgvk::backend {
         [[nodiscard]] RuntimeGenerationId generationId() const noexcept;
     private:
         friend class RuntimeGenerateDiagnosticPending;
-        friend class RuntimeGenerateDiagnosticSessionImpl;
+        friend class RuntimeGenerateSessionImpl;
         explicit RuntimeGenerationOperationRetirement(
             std::shared_ptr<RuntimeGenerateDiagnosticPendingState> value) : pending(std::move(value)) {}
         std::shared_ptr<RuntimeGenerateDiagnosticPendingState> pending;
@@ -310,90 +310,90 @@ namespace lsfgvk::backend {
         void processRuntimePrepass(RuntimePrepassSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
         void closeRuntimePrepassSession(const RuntimePrepassSession& session);
-        RuntimeGenerateDiagnosticSession& openRuntimeGenerateDiagnosticSession(
+        RuntimeGenerateSession& openRuntimeGenerateSession(
             VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
             float flow, bool perf,
             RuntimeGenerateMode mode = RuntimeGenerateMode::OneShot);
         std::optional<RuntimeGenerateDiagnosticResult> processRuntimeGenerateDiagnostic(
-            RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerateSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
         std::optional<RuntimeGenerateDiagnosticPending> submitRuntimeGenerateDiagnostic(
-            RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerateSession& session,
             VkImage transportImage, vk::SyncFdPayload payload);
         std::optional<RuntimeGenerateDiagnosticPending> submitRuntimeGenerateExplicit(
-            RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+            RuntimeGenerateSession& session, VkImage transportImage,
             vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
             uint64_t frameId, std::optional<RuntimeTemporalPairIdentity> pair = std::nullopt);
         RuntimeGenerateDiagnosticResult completeRuntimeGenerateDiagnostic(
-            RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerateSession& session,
             RuntimeGenerateDiagnosticPending&& pending);
-        void retireRuntimeGenerateOperation(RuntimeGenerateDiagnosticSession& session,
+        void retireRuntimeGenerateOperation(RuntimeGenerateSession& session,
             RuntimeGenerationOperationRetirement&& authority);
-        void closeRuntimeGenerateDiagnosticSession(
-            const RuntimeGenerateDiagnosticSession& session);
+        void closeRuntimeGenerateSession(
+            const RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowSplitResourceSnapshot inspectRuntimeSplitResources(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowIngestSnapshot submitRuntimeIngest(
-            RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+            RuntimeGenerateSession& session, VkImage transportImage,
             vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
             uint64_t frameId, RuntimeIngestIntent intent);
         [[nodiscard]] RuntimeIngestRetirementStatus tryRetireRuntimeIngest(
-            RuntimeGenerateDiagnosticSession& session);
+            RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowIngestSnapshot inspectRuntimeIngest(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowGenerateSnapshot submitRuntimePrepassGenerate(
-            RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair);
+            RuntimeGenerateSession& session, RuntimeTemporalPairIdentity pair);
         [[nodiscard]] RuntimeRetirementStatus tryRetireRuntimePrepassGenerate(
-            RuntimeGenerateDiagnosticSession& session);
+            RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowGenerateSnapshot retireRuntimePrepassGenerate(
-            RuntimeGenerateDiagnosticSession& session);
+            RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowGenerateSnapshot inspectRuntimePrepassGenerate(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] std::optional<RuntimeGenerateDiagnosticPending>
-            takeRuntimePrepassGeneratePending(RuntimeGenerateDiagnosticSession& session);
-        void recordRuntimeBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+            takeRuntimePrepassGeneratePending(RuntimeGenerateSession& session);
+        void recordRuntimeBReturnSubmitted(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void recordRuntimeBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+        void recordRuntimeBReturnRejected(RuntimeGenerateSession& session,
             RuntimeGenerationId generation, bool deviceLost);
-        void retireRuntimeBReturnWait(RuntimeGenerateDiagnosticSession& session,
+        void retireRuntimeBReturnWait(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void failRuntimeBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+        void failRuntimeBReturnRetirement(RuntimeGenerateSession& session,
             RuntimeGenerationId generation, bool deviceLost);
-        void releaseRuntimeGenerationReady(RuntimeGenerateDiagnosticSession& session,
+        void releaseRuntimeGenerationReady(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void recordRuntimeAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        void recordRuntimeAReturnSubmitted(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeShadowSplitResourceSnapshot inspectShadowSplitResources(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowIngestSnapshot submitShadowTemporalIngest(
-            RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+            RuntimeGenerateSession& session, VkImage transportImage,
             vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
             uint64_t frameId);
         [[nodiscard]] RuntimeShadowIngestSnapshot retireShadowTemporalIngest(
-            RuntimeGenerateDiagnosticSession& session);
+            RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowIngestSnapshot inspectShadowTemporalIngest(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowGenerateSnapshot submitShadowPrepassGenerate(
-            RuntimeGenerateDiagnosticSession& session,
+            RuntimeGenerateSession& session,
             RuntimeTemporalPairIdentity pair);
         [[nodiscard]] RuntimeShadowGenerateSnapshot retireShadowPrepassGenerate(
-            RuntimeGenerateDiagnosticSession& session);
+            RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowGenerateSnapshot inspectShadowPrepassGenerate(
-            const RuntimeGenerateDiagnosticSession& session) const noexcept;
+            const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] std::optional<RuntimeGenerateDiagnosticPending>
-            takeShadowPrepassGeneratePending(RuntimeGenerateDiagnosticSession& session);
-        void recordShadowBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+            takeShadowPrepassGeneratePending(RuntimeGenerateSession& session);
+        void recordShadowBReturnSubmitted(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void recordShadowBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+        void recordShadowBReturnRejected(RuntimeGenerateSession& session,
             RuntimeGenerationId generation, bool deviceLost);
-        void retireShadowBReturnWait(RuntimeGenerateDiagnosticSession& session,
+        void retireShadowBReturnWait(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void failShadowBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+        void failShadowBReturnRetirement(RuntimeGenerateSession& session,
             RuntimeGenerationId generation, bool deviceLost);
-        void releaseShadowGenerationReady(RuntimeGenerateDiagnosticSession& session,
+        void releaseShadowGenerationReady(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
-        void recordShadowAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+        void recordShadowAReturnSubmitted(RuntimeGenerateSession& session,
             RuntimeGenerationId generation);
 #endif
 
@@ -468,7 +468,7 @@ namespace lsfgvk::backend {
 
         std::vector<std::unique_ptr<Context>> m_contexts;
         std::vector<std::unique_ptr<RuntimePrepassSession>> m_runtimePrepassSessions;
-        std::vector<std::unique_ptr<RuntimeGenerateDiagnosticSession>>
+        std::vector<std::unique_ptr<RuntimeGenerateSession>>
             m_runtimeGenerateDiagnosticSessions;
     };
 

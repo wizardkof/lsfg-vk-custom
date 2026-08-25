@@ -14,14 +14,14 @@ int main() {
     static_assert(std::is_move_constructible_v<RuntimeGenerationOperationRetirement>);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
     using ShadowSubmit = RuntimeShadowIngestSnapshot (Instance::*)(
-        RuntimeGenerateDiagnosticSession&, VkImage, vk::SyncFdPayload,
+        RuntimeGenerateSession&, VkImage, vk::SyncFdPayload,
         TemporalSourceSlot, uint64_t);
     using ShadowRetire = RuntimeShadowIngestSnapshot (Instance::*)(
-        RuntimeGenerateDiagnosticSession&);
+        RuntimeGenerateSession&);
     using ShadowGenerate = RuntimeShadowGenerateSnapshot (Instance::*)(
-        RuntimeGenerateDiagnosticSession&, RuntimeTemporalPairIdentity);
+        RuntimeGenerateSession&, RuntimeTemporalPairIdentity);
     using ShadowGenerateRetire = RuntimeShadowGenerateSnapshot (Instance::*)(
-        RuntimeGenerateDiagnosticSession&);
+        RuntimeGenerateSession&);
     const ShadowSubmit shadowSubmit = &Instance::submitShadowTemporalIngest;
     const ShadowRetire shadowRetire = &Instance::retireShadowTemporalIngest;
     const ShadowGenerate shadowGenerate = &Instance::submitShadowPrepassGenerate;

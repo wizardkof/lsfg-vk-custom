@@ -343,9 +343,9 @@ namespace lsfgvk::backend {
         size_t rotations{};
     };
 
-    class RuntimeGenerateDiagnosticSessionImpl {
+    class RuntimeGenerateSessionImpl {
     public:
-        RuntimeGenerateDiagnosticSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
+        RuntimeGenerateSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
             VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf,
             RuntimeGenerateMode mode);
         std::optional<RuntimeGenerateDiagnosticResult> process(
@@ -756,29 +756,29 @@ void Instance::closeRuntimePrepassSession(const RuntimePrepassSession& session) 
     if (it != m_runtimePrepassSessions.end()) m_runtimePrepassSessions.erase(it);
 }
 
-RuntimeGenerateDiagnosticSession& Instance::openRuntimeGenerateDiagnosticSession(
+RuntimeGenerateSession& Instance::openRuntimeGenerateSession(
         VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
         float flow, bool perf, RuntimeGenerateMode mode) {
     validateRuntimeGenerateFormats(*m_impl, transportFormat, transportModifier);
     return *m_runtimeGenerateDiagnosticSessions.emplace_back(
-        std::make_unique<RuntimeGenerateDiagnosticSessionImpl>(*m_impl, extent,
+        std::make_unique<RuntimeGenerateSessionImpl>(*m_impl, extent,
             transportFormat, transportModifier, flow, perf, mode));
 }
 
 std::optional<RuntimeGenerateDiagnosticResult> Instance::processRuntimeGenerateDiagnostic(
-        RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerateSession& session,
         VkImage transportImage, vk::SyncFdPayload payload) {
     return session.process(transportImage, std::move(payload));
 }
 
 std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateDiagnostic(
-        RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerateSession& session,
         VkImage transportImage, vk::SyncFdPayload payload) {
     return session.submit(transportImage, std::move(payload));
 }
 
 std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateExplicit(
-        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        RuntimeGenerateSession& session, VkImage transportImage,
         vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
         uint64_t frameId, std::optional<RuntimeTemporalPairIdentity> pair) {
     return session.submitExplicit(transportImage, std::move(payload),
@@ -786,18 +786,18 @@ std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateE
 }
 
 RuntimeGenerateDiagnosticResult Instance::completeRuntimeGenerateDiagnostic(
-        RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerateSession& session,
         RuntimeGenerateDiagnosticPending&& pending) {
     return session.complete(std::move(pending));
 }
 
-void Instance::retireRuntimeGenerateOperation(RuntimeGenerateDiagnosticSession& session,
+void Instance::retireRuntimeGenerateOperation(RuntimeGenerateSession& session,
         RuntimeGenerationOperationRetirement&& authority) {
     session.retireOperation(std::move(authority));
 }
 
-void Instance::closeRuntimeGenerateDiagnosticSession(
-        const RuntimeGenerateDiagnosticSession& session) {
+void Instance::closeRuntimeGenerateSession(
+        const RuntimeGenerateSession& session) {
     if (session.hasPending())
         throw std::logic_error("cannot close runtime Generate diagnostic with pending generation");
     const auto it = std::ranges::find_if(m_runtimeGenerateDiagnosticSessions,
@@ -807,12 +807,12 @@ void Instance::closeRuntimeGenerateDiagnosticSession(
 }
 
 RuntimeShadowSplitResourceSnapshot Instance::inspectRuntimeSplitResources(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowSnapshot();
 }
 
 RuntimeShadowIngestSnapshot Instance::submitRuntimeIngest(
-        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        RuntimeGenerateSession& session, VkImage transportImage,
         vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
         uint64_t frameId, RuntimeIngestIntent intent) {
     return session.submitShadowIngest(transportImage, std::move(payload),
@@ -820,73 +820,73 @@ RuntimeShadowIngestSnapshot Instance::submitRuntimeIngest(
 }
 
 RuntimeIngestRetirementStatus Instance::tryRetireRuntimeIngest(
-        RuntimeGenerateDiagnosticSession& session) {
+        RuntimeGenerateSession& session) {
     return session.tryRetireShadowIngest();
 }
 
 RuntimeShadowIngestSnapshot Instance::inspectRuntimeIngest(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowIngestSnapshot();
 }
 
 RuntimeShadowGenerateSnapshot Instance::submitRuntimePrepassGenerate(
-        RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair) {
+        RuntimeGenerateSession& session, RuntimeTemporalPairIdentity pair) {
     return session.submitShadowGenerate(pair);
 }
 
 RuntimeRetirementStatus Instance::tryRetireRuntimePrepassGenerate(
-        RuntimeGenerateDiagnosticSession& session) {
+        RuntimeGenerateSession& session) {
     return session.tryRetireShadowGenerate();
 }
 
 RuntimeShadowGenerateSnapshot Instance::retireRuntimePrepassGenerate(
-        RuntimeGenerateDiagnosticSession& session) {
+        RuntimeGenerateSession& session) {
     return session.retireShadowGenerate();
 }
 
 RuntimeShadowGenerateSnapshot Instance::inspectRuntimePrepassGenerate(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowGenerateSnapshot();
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
-Instance::takeRuntimePrepassGeneratePending(RuntimeGenerateDiagnosticSession& session) {
+Instance::takeRuntimePrepassGeneratePending(RuntimeGenerateSession& session) {
     return session.takeShadowGeneratePending();
 }
 
-void Instance::recordRuntimeBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordRuntimeBReturnSubmitted(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.recordShadowBReturnSubmitted(generation);
 }
-void Instance::recordRuntimeBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordRuntimeBReturnRejected(RuntimeGenerateSession& session,
         RuntimeGenerationId generation, bool lost) {
     session.recordShadowBReturnRejected(generation, lost);
 }
-void Instance::retireRuntimeBReturnWait(RuntimeGenerateDiagnosticSession& session,
+void Instance::retireRuntimeBReturnWait(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.retireShadowBReturnWait(generation);
 }
-void Instance::failRuntimeBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+void Instance::failRuntimeBReturnRetirement(RuntimeGenerateSession& session,
         RuntimeGenerationId generation, bool lost) {
     session.failShadowBReturnRetirement(generation, lost);
 }
-void Instance::releaseRuntimeGenerationReady(RuntimeGenerateDiagnosticSession& session,
+void Instance::releaseRuntimeGenerationReady(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.releaseShadowGenerationReady(generation);
 }
-void Instance::recordRuntimeAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordRuntimeAReturnSubmitted(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.recordShadowAReturnSubmitted(generation);
 }
 
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 RuntimeShadowSplitResourceSnapshot Instance::inspectShadowSplitResources(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowSnapshot();
 }
 
 RuntimeShadowIngestSnapshot Instance::submitShadowTemporalIngest(
-        RuntimeGenerateDiagnosticSession& session, VkImage transportImage,
+        RuntimeGenerateSession& session, VkImage transportImage,
         vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
         uint64_t frameId) {
     return session.submitShadowIngest(transportImage, std::move(payload),
@@ -894,64 +894,64 @@ RuntimeShadowIngestSnapshot Instance::submitShadowTemporalIngest(
 }
 
 RuntimeShadowIngestSnapshot Instance::retireShadowTemporalIngest(
-        RuntimeGenerateDiagnosticSession& session) {
+        RuntimeGenerateSession& session) {
     if (session.tryRetireShadowIngest() != RuntimeIngestRetirementStatus::RETIRED)
         throw backend::error("shadow ingest retirement is not ready");
     return session.shadowIngestSnapshot();
 }
 
 RuntimeShadowIngestSnapshot Instance::inspectShadowTemporalIngest(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowIngestSnapshot();
 }
 
 RuntimeShadowGenerateSnapshot Instance::submitShadowPrepassGenerate(
-        RuntimeGenerateDiagnosticSession& session,
+        RuntimeGenerateSession& session,
         RuntimeTemporalPairIdentity pair) {
     return session.submitShadowGenerate(pair);
 }
 
 RuntimeShadowGenerateSnapshot Instance::retireShadowPrepassGenerate(
-        RuntimeGenerateDiagnosticSession& session) {
+        RuntimeGenerateSession& session) {
     return session.retireShadowGenerate();
 }
 
 RuntimeShadowGenerateSnapshot Instance::inspectShadowPrepassGenerate(
-        const RuntimeGenerateDiagnosticSession& session) const noexcept {
+        const RuntimeGenerateSession& session) const noexcept {
     return session.shadowGenerateSnapshot();
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
-Instance::takeShadowPrepassGeneratePending(RuntimeGenerateDiagnosticSession& session) {
+Instance::takeShadowPrepassGeneratePending(RuntimeGenerateSession& session) {
     return session.takeShadowGeneratePending();
 }
 
-void Instance::recordShadowBReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordShadowBReturnSubmitted(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.recordShadowBReturnSubmitted(generation);
 }
 
-void Instance::recordShadowBReturnRejected(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordShadowBReturnRejected(RuntimeGenerateSession& session,
         RuntimeGenerationId generation, bool deviceLost) {
     session.recordShadowBReturnRejected(generation, deviceLost);
 }
 
-void Instance::retireShadowBReturnWait(RuntimeGenerateDiagnosticSession& session,
+void Instance::retireShadowBReturnWait(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.retireShadowBReturnWait(generation);
 }
 
-void Instance::failShadowBReturnRetirement(RuntimeGenerateDiagnosticSession& session,
+void Instance::failShadowBReturnRetirement(RuntimeGenerateSession& session,
         RuntimeGenerationId generation, bool deviceLost) {
     session.failShadowBReturnRetirement(generation, deviceLost);
 }
 
-void Instance::releaseShadowGenerationReady(RuntimeGenerateDiagnosticSession& session,
+void Instance::releaseShadowGenerationReady(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.releaseShadowGenerationReady(generation);
 }
 
-void Instance::recordShadowAReturnSubmitted(RuntimeGenerateDiagnosticSession& session,
+void Instance::recordShadowAReturnSubmitted(RuntimeGenerateSession& session,
         RuntimeGenerationId generation) {
     session.recordShadowAReturnSubmitted(generation);
 }
@@ -1306,7 +1306,7 @@ void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayloa
     }
 }
 
-RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
+RuntimeGenerateSessionImpl::RuntimeGenerateSessionImpl(
         const InstanceImpl& instance, VkExtent2D extent, VkFormat transportFormat,
         uint64_t transportModifier, float flow, bool perf, RuntimeGenerateMode sessionMode) :
     instance(instance), extent(extent), transportFormat(transportFormat),
@@ -1430,7 +1430,7 @@ RuntimeGenerateDiagnosticSessionImpl::RuntimeGenerateDiagnosticSessionImpl(
     std::cerr << "Black image zero initialization: PASS\n";
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::recordTemporalIngestCommands(
+void RuntimeGenerateSessionImpl::recordTemporalIngestCommands(
         const vk::Vulkan& vk, const vk::CommandBuffer& command,
         VkImage transportImage, size_t frameIndex, bool seed, uint32_t family) {
     const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -1487,7 +1487,7 @@ void RuntimeGenerateDiagnosticSessionImpl::recordTemporalIngestCommands(
 }
 
 RuntimeShadowIngestSnapshot
-RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
+RuntimeGenerateSessionImpl::shadowIngestSnapshot() const noexcept {
     RuntimeShadowIngestSnapshot result{};
     if (!shadowSplit) return result;
     const auto& shadow = *shadowSplit;
@@ -1517,7 +1517,7 @@ RuntimeGenerateDiagnosticSessionImpl::shadowIngestSnapshot() const noexcept {
     return result;
 }
 
-RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIngest(
+RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
         VkImage transportImage, vk::SyncFdPayload payload,
         TemporalSourceSlot destinationSlot, uint64_t frameId,
         RuntimeIngestIntent intent) {
@@ -1599,7 +1599,7 @@ RuntimeShadowIngestSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowIn
 }
 
 RuntimeIngestRetirementStatus
-RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowIngest() {
+RuntimeGenerateSessionImpl::tryRetireShadowIngest() {
     if (!shadowSplit || !shadowSplit->pending)
         throw std::logic_error("no accepted shadow ingest to retire");
     auto& shadow = *shadowSplit;
@@ -1628,7 +1628,7 @@ RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowIngest() {
 }
 
 RuntimeShadowGenerateSnapshot
-RuntimeGenerateDiagnosticSessionImpl::shadowGenerateSnapshot() const noexcept {
+RuntimeGenerateSessionImpl::shadowGenerateSnapshot() const noexcept {
     RuntimeShadowGenerateSnapshot result{};
     if (!shadowSplit) return result;
     const auto& shadow = *shadowSplit;
@@ -1682,7 +1682,7 @@ RuntimeGenerateDiagnosticSessionImpl::shadowGenerateSnapshot() const noexcept {
     return result;
 }
 
-RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadowGenerate(
+RuntimeShadowGenerateSnapshot RuntimeGenerateSessionImpl::submitShadowGenerate(
         RuntimeTemporalPairIdentity pair) {
     if (!shadowSplit) throw std::logic_error("shadow split resources unavailable");
     auto& shadow = *shadowSplit;
@@ -1770,7 +1770,7 @@ RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadow
     }
 }
 
-RuntimeRetirementStatus RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowGenerate() {
+RuntimeRetirementStatus RuntimeGenerateSessionImpl::tryRetireShadowGenerate() {
     if (!shadowSplit || !shadowSplit->generateState)
         throw std::logic_error("no accepted shadow Generate to retire");
     auto& shadow = *shadowSplit;
@@ -1808,7 +1808,7 @@ RuntimeRetirementStatus RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowGen
     return RuntimeRetirementStatus::RETIRED;
 }
 
-RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowGenerate() {
+RuntimeShadowGenerateSnapshot RuntimeGenerateSessionImpl::retireShadowGenerate() {
     if (!shadowSplit || !shadowSplit->generateState)
         throw std::logic_error("no accepted shadow Generate to retire");
     if (!shadowSplit->generateExecutionRetired
@@ -1823,7 +1823,7 @@ RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadow
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
-RuntimeGenerateDiagnosticSessionImpl::takeShadowGeneratePending() {
+RuntimeGenerateSessionImpl::takeShadowGeneratePending() {
     if (!shadowSplit || !shadowSplit->generatePending || shadowSplit->failed)
         throw std::logic_error("no usable shadow Generate pending capability");
     auto result = std::move(shadowSplit->generatePending);
@@ -1832,7 +1832,7 @@ RuntimeGenerateDiagnosticSessionImpl::takeShadowGeneratePending() {
     return result;
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnSubmitted(
+void RuntimeGenerateSessionImpl::recordShadowBReturnSubmitted(
         RuntimeGenerationId generation) {
     if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
             || shadowSplit->generateState->generation != generation
@@ -1842,7 +1842,7 @@ void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnSubmitted(
     ++shadowSplit->bReturnSubmitCount;
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnRejected(
+void RuntimeGenerateSessionImpl::recordShadowBReturnRejected(
         RuntimeGenerationId generation, bool lost) {
     if (!shadowSplit || !shadowSplit->generateState
             || shadowSplit->generateState->generation != generation
@@ -1854,7 +1854,7 @@ void RuntimeGenerateDiagnosticSessionImpl::recordShadowBReturnRejected(
     serialState.fail();
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::retireShadowBReturnWait(
+void RuntimeGenerateSessionImpl::retireShadowBReturnWait(
         RuntimeGenerationId generation) {
     if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
             || shadowSplit->generateState->generation != generation
@@ -1863,7 +1863,7 @@ void RuntimeGenerateDiagnosticSessionImpl::retireShadowBReturnWait(
     shadowSplit->generateState->generationReadyEpoch.waitRetired(generation);
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::failShadowBReturnRetirement(
+void RuntimeGenerateSessionImpl::failShadowBReturnRetirement(
         RuntimeGenerationId generation, bool lost) {
     if (!shadowSplit || !shadowSplit->generateState
             || shadowSplit->generateState->generation != generation
@@ -1875,7 +1875,7 @@ void RuntimeGenerateDiagnosticSessionImpl::failShadowBReturnRetirement(
     serialState.fail();
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::releaseShadowGenerationReady(
+void RuntimeGenerateSessionImpl::releaseShadowGenerationReady(
         RuntimeGenerationId generation) {
     if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
             || shadowSplit->generateState->generation != generation
@@ -1894,7 +1894,7 @@ void RuntimeGenerateDiagnosticSessionImpl::releaseShadowGenerationReady(
     shadowSplit->generateExecutionRetired = false;
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::recordShadowAReturnSubmitted(
+void RuntimeGenerateSessionImpl::recordShadowAReturnSubmitted(
         RuntimeGenerationId generation) {
     if (!shadowSplit || !shadowSplit->generateState || shadowSplit->failed
             || shadowSplit->generateState->generation != generation
@@ -1904,7 +1904,7 @@ void RuntimeGenerateDiagnosticSessionImpl::recordShadowAReturnSubmitted(
     ++shadowSplit->aReturnSubmitCount;
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::recordPrepassGenerateCommands(
+void RuntimeGenerateSessionImpl::recordPrepassGenerateCommands(
         const vk::Vulkan& vk, const vk::CommandBuffer& command,
         size_t frameIndex, bool runGammaDelta, bool runGenerate) {
     mipmaps.render(vk, command, frameIndex);
@@ -1949,7 +1949,7 @@ void RuntimeGenerateDiagnosticSessionImpl::recordPrepassGenerateCommands(
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
-RuntimeGenerateDiagnosticSessionImpl::processSubmission(
+RuntimeGenerateSessionImpl::processSubmission(
         VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion,
         std::optional<TemporalSourceSlot> explicitDestination, uint64_t frameId,
         std::optional<RuntimeTemporalPairIdentity> explicitPair) {
@@ -2078,7 +2078,7 @@ RuntimeGenerateDiagnosticSessionImpl::processSubmission(
 }
 
 RuntimeGenerateDiagnosticResult
-RuntimeGenerateDiagnosticSessionImpl::validateCompletedGeneration(
+RuntimeGenerateSessionImpl::validateCompletedGeneration(
         const std::shared_ptr<RuntimeGenerateDiagnosticPendingState>& pending) {
     const auto& vk = instance.getVulkan();
     if (!pending || pending != pendingGeneration || pending->completionConsumed)
@@ -2132,7 +2132,7 @@ RuntimeGenerateDiagnosticSessionImpl::validateCompletedGeneration(
     };
 }
 
-std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionImpl::process(
+std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateSessionImpl::process(
         VkImage transportImage, vk::SyncFdPayload payload) {
     const auto step = state.nextStep();
     const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
@@ -2147,7 +2147,7 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateDiagnosticSessionI
     return complete(std::move(*pending));
 }
 
-std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateDiagnosticSessionImpl::submit(
+std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateSessionImpl::submit(
         VkImage transportImage, vk::SyncFdPayload payload) {
     const auto step = state.nextStep();
     const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
@@ -2160,7 +2160,7 @@ std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateDiagnosticSession
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
-RuntimeGenerateDiagnosticSessionImpl::submitExplicit(
+RuntimeGenerateSessionImpl::submitExplicit(
         VkImage transportImage, vk::SyncFdPayload payload,
         TemporalSourceSlot destinationSlot, uint64_t frameId,
         std::optional<RuntimeTemporalPairIdentity> pair) {
@@ -2168,7 +2168,7 @@ RuntimeGenerateDiagnosticSessionImpl::submitExplicit(
         destinationSlot, frameId, pair);
 }
 
-RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
+RuntimeGenerateDiagnosticResult RuntimeGenerateSessionImpl::complete(
         RuntimeGenerateDiagnosticPending&& capability) {
     const auto pending = capability.pending;
     if (!pending || pending != pendingGeneration || !capability.valid()
@@ -2209,7 +2209,7 @@ RuntimeGenerateDiagnosticResult RuntimeGenerateDiagnosticSessionImpl::complete(
     }
 }
 
-void RuntimeGenerateDiagnosticSessionImpl::retireOperation(
+void RuntimeGenerateSessionImpl::retireOperation(
         RuntimeGenerationOperationRetirement&& authority) {
     const auto pending = authority.pending;
     if (mode != RuntimeGenerateMode::SerialReusable || !pending

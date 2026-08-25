@@ -566,16 +566,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         }
         if (this->captureOnlyPhase <= 5) {
             if (this->captureOnlyPhase == 3) {
-                auto& session = this->instance.get().openRuntimeGenerateDiagnosticSession(
+                auto& session = this->instance.get().openRuntimeGenerateSession(
                     this->info.extent, VK_FORMAT_B8G8R8A8_UNORM,
                     this->frameTransportBacking.modifier(),
                     1.0F / this->profile.flow_scale, this->profile.performance_mode);
                 this->runtimeGenerateDiagnosticSession =
-                    ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>(
-                        new ls::R<backend::RuntimeGenerateDiagnosticSession>(session),
+                    ls::owned_ptr<ls::R<backend::RuntimeGenerateSession>>(
+                        new ls::R<backend::RuntimeGenerateSession>(session),
                         [backend = &this->instance.get()](
-                                ls::R<backend::RuntimeGenerateDiagnosticSession>& value) {
-                            backend->closeRuntimeGenerateDiagnosticSession(value);
+                                ls::R<backend::RuntimeGenerateSession>& value) {
+                            backend->closeRuntimeGenerateSession(value);
                         });
             }
             const auto sourceImage = this->info.images.at(imageIdx);
@@ -619,7 +619,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 }
                 try {
                     this->generatedOutputReturnDiagnosticSession =
-                        std::make_unique<GeneratedOutputReturnDiagnosticSession>(
+                        std::make_unique<GeneratedOutputReturnSession>(
                             std::move(*generated), this->instance.get(),
                             this->runtimeGenerateDiagnosticSession.get(), this->devicePair,
                             this->instance.get().runtimeExchangeEndpoint(),

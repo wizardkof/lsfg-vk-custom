@@ -2,6 +2,7 @@ set(LAYER_SOURCES
     "src/d3b3_production_seams.cpp"
     "src/d3b3_normal_present_adapter.cpp"
     "src/d3b3_production_runtime.cpp"
+    "src/d3b3_production_core_owner.cpp"
     "src/d3b2_insertion_path.cpp"
     "src/d3b1_present_path.cpp"
     "src/entrypoint.cpp"

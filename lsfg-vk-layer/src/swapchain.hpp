@@ -206,9 +206,9 @@ selectGeneratedOutputTerminalConsumer(
         bool frameTransportReady{};
         uint32_t offloadQueueFamily{VK_QUEUE_FAMILY_IGNORED};
         ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;
-        ls::owned_ptr<ls::R<backend::RuntimeGenerateDiagnosticSession>>
+        ls::owned_ptr<ls::R<backend::RuntimeGenerateSession>>
             runtimeGenerateDiagnosticSession;
-        std::unique_ptr<GeneratedOutputReturnDiagnosticSession>
+        std::unique_ptr<GeneratedOutputReturnSession>
             generatedOutputReturnDiagnosticSession;
         std::optional<vk::Semaphore> returnedForGraphics;
         D3B1PresentationState d3b1State{D3B1PresentationState::IDLE};

@@ -712,26 +712,39 @@ public:
     }
 
     [[nodiscard]] layer::RuntimeGeneratedBReturnPending submitProductionBReturn(
-            layer::GeneratedOutputReturnDiagnosticSession& returnSession,
+            layer::GeneratedOutputReturnSession& returnSession,
             backend::RuntimeGenerateDiagnosticPending&& pending,
             backend::Instance& backendInstance,
-            backend::RuntimeGenerateDiagnosticSession& backendSession) {
+            backend::RuntimeGenerateSession& backendSession) {
         ++productionBReturnCalls;
         return returnSession.submitProductionBReturn(
             std::move(pending), backendInstance, backendSession);
     }
 
     [[nodiscard]] backend::ReturnedGeneratedOperation completeProductionAReturn(
-            layer::GeneratedOutputReturnDiagnosticSession& returnSession,
+            layer::GeneratedOutputReturnSession& returnSession,
             layer::RuntimeGeneratedBReturnPending&& pending,
             backend::Instance& backendInstance,
-            backend::RuntimeGenerateDiagnosticSession& backendSession) {
+            backend::RuntimeGenerateSession& backendSession) {
         ++aPhaseCalls;
         return returnSession.completeProductionGeneratedReturnOnA(
             std::move(pending), backendInstance, backendSession,
             vk::RuntimeForeignImageHandoffInfo{
                 terminalQueueFamily, returnedForGraphics});
     }
+
+    [[nodiscard]] vk::RuntimeForeignImageHandoffInfo productionHandoff() const noexcept {
+        return {terminalQueueFamily, returnedForGraphics};
+    }
+
+    [[nodiscard]] const vk::RuntimeExchangeChannel* exchangeChannelOwnerToken() const noexcept {
+        // The controlled-dispatch harness has no DMA-BUF channel object.  This
+        // non-dereferenced token proves only the owner's required lifetime edge;
+        // production construction supplies the real channel.
+        return reinterpret_cast<const vk::RuntimeExchangeChannel*>(uintptr_t{1});
+    }
+
+    void armProductionReturnForOwner() noexcept { returnResourcesArmed = true; }
 
     [[nodiscard]] size_t frontSubmitCount() const noexcept {
         return frontSubmits.size();

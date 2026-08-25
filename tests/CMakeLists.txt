@@ -406,6 +406,7 @@ add_test(NAME lsfg-vk-test-external-semaphore-sync
 add_executable(lsfg-vk-test-shadow-b-return-execution-harness
     shadow_b_return_execution_harness_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"

@@ -1,4 +1,5 @@
 #include "shadow_b_return_execution_harness.hpp"
+#include "d3b3_production_core_owner.hpp"
 #include "d3b3_production_seams.hpp"
 #include "d3b3_normal_present_adapter.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -434,7 +435,7 @@ void testRealB0B3PendingStaging() {
 
     auto backend = harness.createB0B3Instance();
     constexpr VkExtent2D productionExtent{64, 64};
-    auto& session = backend->openRuntimeGenerateDiagnosticSession(
+    auto& session = backend->openRuntimeGenerateSession(
         productionExtent, VK_FORMAT_B8G8R8A8_UNORM, 0, 1.0F, false,
         lsfgvk::backend::RuntimeGenerateMode::SerialReusable);
 
@@ -664,7 +665,7 @@ void testRealB0B3PendingStaging() {
 void testProductionWarmupNoSignalAndBCTransition() {
     ShadowBReturnExecutionHarness harness;
     auto backend = harness.createB0B3Instance();
-    auto& session = backend->openRuntimeGenerateDiagnosticSession(
+    auto& session = backend->openRuntimeGenerateSession(
         {64, 64}, VK_FORMAT_B8G8R8A8_UNORM, 0, 1.0F, false,
         lsfgvk::backend::RuntimeGenerateMode::SerialReusable);
     const auto hostWaitsBeforeWarmup = harness.frontFenceWaitCount();
@@ -714,7 +715,7 @@ void testProductionWarmupNoSignalAndBCTransition() {
 struct RealShadowPairFixture {
     ShadowBReturnExecutionHarness harness;
     std::unique_ptr<lsfgvk::backend::Instance> backend;
-    lsfgvk::backend::RuntimeGenerateDiagnosticSession* backendSession{};
+    lsfgvk::backend::RuntimeGenerateSession* backendSession{};
     lsfgvk::backend::RuntimeShadowGenerateSnapshot generated{};
     uint32_t hostWaitsBeforeGraph{};
     std::optional<std::pair<uint64_t, lsfgvk::backend::TemporalSourceSlot>> preparedIngest;
@@ -723,7 +724,7 @@ struct RealShadowPairFixture {
 
     explicit RealShadowPairFixture(bool prepareInitialPair = true) {
         backend = harness.createB0B3Instance();
-        backendSession = &backend->openRuntimeGenerateDiagnosticSession(
+        backendSession = &backend->openRuntimeGenerateSession(
             {64, 64}, VK_FORMAT_B8G8R8A8_UNORM, 0, 1.0F, false,
             lsfgvk::backend::RuntimeGenerateMode::SerialReusable);
         assert(harness.frontSubmitCount() == 1);
@@ -810,7 +811,7 @@ void testCompleteOnePairNonTerminalProductionGraph() {
     auto pending = fixture.take();
     assert(!harness.hasStagedPending() && pending.valid());
 
-    lsfgvk::layer::GeneratedOutputReturnDiagnosticSession returnSession(
+    lsfgvk::layer::GeneratedOutputReturnSession returnSession(
         lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
         harness.endpoint(), harness.renderEndpoint(), true);
 
@@ -1030,9 +1031,9 @@ void testCompleteOnePairNonTerminalProductionGraph() {
     assert(harness.deviceIdleCalls == 0);
 }
 
-std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>
+std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession>
 makeReturnSession(RealShadowPairFixture& fixture) {
-    return std::make_unique<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>(
+    return std::make_unique<lsfgvk::layer::GeneratedOutputReturnSession>(
         lsfgvk::layer::ProductionReturnExecution{}, fixture.harness.devicePair(),
         fixture.harness.endpoint(), fixture.harness.renderEndpoint(), true);
 }
@@ -1117,8 +1118,77 @@ void testProductionBReturnAndOutputRetirement() {
     assert(fixture.harness.aFenceWaitCalls == 0);
 }
 
+void testProductionCoreOwnerLifecycle() {
+    lsfgvk::test::ShadowBReturnExecutionHarness harness;
+    auto backend = harness.createB0B3Instance();
+    const auto pair = harness.devicePair();
+    const auto submitsBeforeConstruction = harness.frontSubmitCount();
+    lsfgvk::layer::D3B3ProductionCoreOwner owner({
+        .backend = backend.get(),
+        .devicePair = &pair,
+        .exchangeChannel = harness.exchangeChannelOwnerToken(),
+        .generationEndpoint = harness.endpoint(),
+        .renderEndpoint = harness.renderEndpoint(),
+        .extent = {64, 64},
+        .format = VK_FORMAT_B8G8R8A8_UNORM,
+        .modifier = 0,
+        .flow = 1.0F,
+        .performanceMode = false,
+        .sourceImage = [](lsfgvk::backend::TemporalSourceSlot) {
+            return reinterpret_cast<VkImage>(uintptr_t{0xC100});
+        }});
+    assert(owner.structurallyReady());
+    assert(harness.frontSubmitCount() == submitsBeforeConstruction);
+
+    const auto warmup = [&](uint64_t frame, auto slot) {
+        auto submitted = owner.submitWarmup(frame, slot, harness.exportTestPayload());
+        assert(submitted.submitAccepted && submitted.signalSemaphore == VK_NULL_HANDLE
+            && submitted.ingestReadyReusable);
+        assert(owner.tryRetireWarmup()
+            == lsfgvk::backend::RuntimeIngestRetirementStatus::RETIRED);
+    };
+    warmup('A', lsfgvk::backend::TemporalSourceSlot::Slot0);
+    warmup('B', lsfgvk::backend::TemporalSourceSlot::Slot1);
+
+    const auto c = owner.submitGenerateSource('C',
+        lsfgvk::backend::TemporalSourceSlot::Slot0, harness.exportTestPayload());
+    assert(c.submitAccepted && c.signalSemaphore != VK_NULL_HANDLE);
+    const auto generated = owner.submitGenerate({
+        .olderSlot = lsfgvk::backend::TemporalSourceSlot::Slot1,
+        .newerSlot = lsfgvk::backend::TemporalSourceSlot::Slot0,
+        .olderFrameId = 'B', .newerFrameId = 'C', .generationId = c.epoch});
+    assert(generated.submitAccepted && generated.generationReadySignalOutstanding);
+    harness.backendFenceStatusResult = VK_SUCCESS;
+    assert(owner.tryRetireGenerate()
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+
+    harness.armProductionReturnForOwner();
+    owner.submitBReturn();
+    const auto pendingB = owner.tryRetireBReturn();
+    assert(pendingB == lsfgvk::backend::RuntimeRetirementStatus::NOT_READY);
+    harness.retireFence();
+    assert(owner.tryRetireBReturn()
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    owner.submitAReturn(harness.productionHandoff());
+    assert(owner.releaseGeneratedOutput()
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(!owner.tryRetireAReturn());
+    harness.retireAFence();
+    assert(owner.tryRetireAReturn());
+    const auto final = owner.generateState();
+    assert(final.generationReadyWaitRetired && final.generationReadyReusable);
+}
+
+void testProductionCoreOwnerMissingDependencies() {
+    bool rejected{};
+    try {
+        static_cast<void>(lsfgvk::layer::D3B3ProductionCoreOwner({}));
+    } catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected);
+}
+
 void retireRecoveredBReturn(RealShadowPairFixture& fixture,
-        lsfgvk::layer::GeneratedOutputReturnDiagnosticSession& returnSession,
+        lsfgvk::layer::GeneratedOutputReturnSession& returnSession,
         lsfgvk::layer::RuntimeGeneratedBReturnPending& recovered) {
     fixture.retireSourceReads();
     fixture.harness.retireFence();
@@ -1336,7 +1406,7 @@ template<class T> T pairHandle(uintptr_t value) {
 
 lsfgvk::backend::ReturnedGeneratedOperation makeSubmittedB0COperation(
         RealShadowPairFixture& fixture,
-        lsfgvk::layer::GeneratedOutputReturnDiagnosticSession& returnSession) {
+        lsfgvk::layer::GeneratedOutputReturnSession& returnSession) {
     const auto aWaitCallsBefore = fixture.harness.aFenceWaitCalls;
     const auto aStatusCallsBefore = fixture.harness.aFenceStatusCalls;
     auto pending = fixture.take();
@@ -1495,7 +1565,7 @@ struct PairTerminalMock {
 
 lsfgvk::layer::D3B3PairOperation makePairOperation(
         RealShadowPairFixture& fixture, PairTerminalMock& terminalMock,
-        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession>& session,
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession>& session,
         const std::function<void(lsfgvk::backend::ReturnedGeneratedOperation&)>& mutate = {}) {
     session = makeReturnSession(fixture);
     auto returned = makeSubmittedB0COperation(fixture, *session);
@@ -1778,7 +1848,7 @@ void testD3B3PairOperationTerminalRetirementContract() {
 
     RealShadowPairFixture fixture;
     PairTerminalMock mock;
-    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
     auto pair = makePairOperation(fixture, mock, session);
     const auto identity = pair.identity();
     assert(identity.olderFrameId == static_cast<uint64_t>('B'));
@@ -1919,7 +1989,7 @@ void testD3B3PairConstructionRejectsInvalidSubmittedState() {
     for (const auto& mutate : invalidStates) {
         RealShadowPairFixture fixture;
         PairTerminalMock mock;
-        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
         bool rejected{};
         try { static_cast<void>(makePairOperation(fixture, mock, session, mutate)); }
         catch (const std::invalid_argument&) { rejected = true; }
@@ -1933,7 +2003,7 @@ void testD3B3PairConstructionRejectsInvalidSubmittedState() {
 void testD3B3AReturnObservedBeforeTerminalFence() {
     RealShadowPairFixture fixture;
     PairTerminalMock mock;
-    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
     auto pair = makePairOperation(fixture, mock, session);
     const auto aWaitsBeforeTerminal = fixture.harness.aFenceWaitCalls;
     bool aObservedBeforeTerminalFence{};
@@ -1965,7 +2035,7 @@ void testD3B3AReturnObservedBeforeTerminalFence() {
 void testD3B3LateAReturnFailureIsConservative() {
     RealShadowPairFixture fixture;
     PairTerminalMock mock;
-    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
     auto pair = makePairOperation(fixture, mock, session);
     pair.preflight();
     pair.submitTerminal();
@@ -1995,7 +2065,7 @@ void testD3B3PairOperationFailureBoundaries() {
     for (const auto failure : failures) {
         RealShadowPairFixture fixture;
         PairTerminalMock mock{.failure = failure};
-        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
         auto pair = makePairOperation(fixture, mock, session);
         bool failed{};
         try {
@@ -2034,7 +2104,7 @@ void testD3B3PairOperationFailureBoundaries() {
 
     RealShadowPairFixture fixture;
     PairTerminalMock mock;
-    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnDiagnosticSession> session;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
     auto pair = makePairOperation(fixture, mock, session);
     pair.preflight();
     pair.submitTerminal();
@@ -2153,6 +2223,8 @@ int main() {
     testProductionNonblockingGenerateRetirement();
     testProductionGenerateRetirementDeviceLost();
     testProductionBReturnAndOutputRetirement();
+    testProductionCoreOwnerLifecycle();
+    testProductionCoreOwnerMissingDependencies();
     testCompleteOnePairNonTerminalProductionGraph();
     testBReturnSubmitFailures();
     testBReturnExportFailureAfterAcceptedSubmit();
