@@ -8,7 +8,6 @@
 
 namespace lsfgvk::layer {
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 D3B3PairOperation::D3B3PairOperation(
         backend::ReturnedGeneratedOperation&& value,
         D3B3OriginalSourceAuthority&& source,
@@ -294,7 +293,6 @@ VkResult executeReusableTerminal(D3B2InsertionPath& path, bool reusableSlot) {
         throw std::invalid_argument("reusable D3B3 terminal requires present fences");
     return executeD3B2Insertion(path);
 }
-#endif
 
 D3B3RetirementStatus evaluateD3B3Retirement(
         const D3B3RetirementDomains& domains) noexcept {
@@ -311,9 +309,7 @@ D3B3ProductionState::D3B3ProductionState(Retirement callback) : retirement(std::
 
 PrePresentGateResult D3B3ProductionState::prePresentGate() {
     D3B3PendingProductionOperation snapshot;
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     bool finitePairActive{};
-#endif
     {
         std::scoped_lock lock(mutex);
         if (operation.state == D3B3PendingState::FAILED)
@@ -322,24 +318,16 @@ PrePresentGateResult D3B3ProductionState::prePresentGate() {
             return PrePresentGateResult::READY;
         snapshot = operation;
         operation.state = D3B3PendingState::RETIRING;
-#ifdef LSFGVK_D3B3_FINITE_TESTING
         finitePairActive = finitePair.has_value();
-#endif
     }
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     const auto status = finitePairActive
         ? retireFinitePair()
         : (retirement ? retirement(snapshot) : evaluateD3B3Retirement(snapshot.domains));
-#else
-    const auto status = retirement ? retirement(snapshot) : evaluateD3B3Retirement(snapshot.domains);
-#endif
     std::scoped_lock lock(mutex);
     if (status == D3B3RetirementStatus::RETIRED) {
         operation = {};
-#ifdef LSFGVK_D3B3_FINITE_TESTING
         if (!finiteStop && finiteTotals.applicationFrames >= 2)
             finiteCurrent = D3B3FiniteProductionState::READY_NEXT;
-#endif
         return PrePresentGateResult::READY;
     }
     operation.state = D3B3PendingState::PENDING_RETIREMENT;
@@ -382,22 +370,17 @@ bool D3B3ProductionState::markPending(D3B3PendingProductionOperation value) {
 void D3B3ProductionState::setFailure() noexcept {
     std::scoped_lock lock(mutex);
     operation.state = D3B3PendingState::FAILED;
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     finiteCurrent = D3B3FiniteProductionState::FAILED;
-#endif
 }
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 void D3B3ProductionState::setFiniteStopped(bool value) noexcept {
     std::scoped_lock lock(mutex);
     finiteStop = value;
     if (value) finiteCurrent = D3B3FiniteProductionState::FINITE_STOPPED;
 }
-#endif
 
 void D3B3ProductionState::setEligibleFrameCount(uint32_t value) noexcept { std::scoped_lock lock(mutex); eligibleFrames = value; }
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 void D3B3ProductionState::configureFinite(D3B3FiniteProductionOperations operations) {
     if (!operations.ingest || !operations.generate || !operations.presentWarmupOriginal
             || !operations.returnGenerated || !operations.makeOriginal
@@ -675,13 +658,10 @@ D3B3RetirementStatus D3B3ProductionState::retireFinitePair() {
         return D3B3RetirementStatus::FAILURE;
     }
 }
-#endif
-
 D3B3PendingProductionOperation D3B3ProductionState::pending() const { std::scoped_lock lock(mutex); return operation; }
 std::array<D3B3TemporalProductionSlot, 2> D3B3ProductionState::temporalSlots() const { std::scoped_lock lock(mutex); return slots; }
 uint32_t D3B3ProductionState::eligibleFrameCount() const noexcept { std::scoped_lock lock(mutex); return eligibleFrames; }
 uint32_t D3B3ProductionState::pairCount() const noexcept { std::scoped_lock lock(mutex); return pairs; }
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 bool D3B3ProductionState::finiteStopped() const noexcept { std::scoped_lock lock(mutex); return finiteStop; }
 D3B3FiniteProductionState D3B3ProductionState::finiteState() const noexcept { std::scoped_lock lock(mutex); return finiteCurrent; }
 D3B3FiniteProductionCounters D3B3ProductionState::finiteCounters() const noexcept { std::scoped_lock lock(mutex); return finiteTotals; }
@@ -692,7 +672,6 @@ bool D3B3ProductionState::acceptsPendingEpoch(uint64_t generationId) const noexc
         && operation.generationId == generationId && finitePair
         && finitePair->identity().generationId == generationId;
 }
-#endif
 void D3B3ProductionState::recordPair(uint64_t older, uint64_t newer) {
     std::scoped_lock lock(mutex);
     if (pairs < 3) ++pairs;

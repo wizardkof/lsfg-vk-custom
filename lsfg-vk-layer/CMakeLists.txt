@@ -1,5 +1,7 @@
 set(LAYER_SOURCES
     "src/d3b3_production_seams.cpp"
+    "src/d3b3_normal_present_adapter.cpp"
+    "src/d3b3_production_runtime.cpp"
     "src/d3b2_insertion_path.cpp"
     "src/d3b1_present_path.cpp"
     "src/entrypoint.cpp"
@@ -15,10 +17,6 @@ set(LAYER_SOURCES
     "src/virtual_swapchain_runtime.cpp")
 
 add_library(lsfg-vk-layer SHARED ${LAYER_SOURCES})
-
-if(LSFGVK_BUILD_TESTS)
-    target_compile_definitions(lsfg-vk-layer PRIVATE LSFGVK_D3B3_FINITE_TESTING)
-endif()
 
 target_link_libraries(lsfg-vk-layer
     PUBLIC lsfg-vk-common

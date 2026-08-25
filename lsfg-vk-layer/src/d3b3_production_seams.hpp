@@ -17,7 +17,6 @@ namespace lsfgvk::layer {
 
 enum class PrePresentGateResult : uint8_t { READY, TIMEOUT, FAILED, DEVICE_LOST };
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 struct CurrentOriginalFrame {
     VkImage image{};
     VkFormat format{VK_FORMAT_UNDEFINED};
@@ -139,7 +138,6 @@ struct D3B3ReturnDispatch {
     const D3B3ReturnDispatch&, GeneratedPairIdentity);
 
 [[nodiscard]] VkResult executeReusableTerminal(D3B2InsertionPath&, bool reusableSlot);
-#endif
 
 enum class D3B3RetirementStatus : uint8_t { RETIRED, TIMEOUT, DEVICE_LOST, FAILURE };
 
@@ -155,7 +153,6 @@ struct D3B3RetirementDomains {
     bool generatedAuthorityRetired{};
 };
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 enum class D3B3PairState : uint8_t {
     NON_TERMINAL_READY, TERMINAL_PREFLIGHTED, DESTINATIONS_ACQUIRED,
     TERMINAL_SUBMIT_PENDING, TERMINAL_SUBMITTED, GRAPHICS_RETIRED,
@@ -255,18 +252,15 @@ private:
     bool originalAcquisitionLeaseReleased{};
     bool hiddenAcquisitionLeasesReleasedValue{true};
 };
-#endif
 
 [[nodiscard]] D3B3RetirementStatus evaluateD3B3Retirement(
     const D3B3RetirementDomains&) noexcept;
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 enum class D3B3ShutdownPolicy : uint8_t { IMMEDIATE_ONE_SHOT, DEFER_UNTIL_FINITE_STOP };
 [[nodiscard]] constexpr bool shouldStopWorker(
         D3B3ShutdownPolicy policy, bool finiteStopped) noexcept {
     return policy == D3B3ShutdownPolicy::IMMEDIATE_ONE_SHOT || finiteStopped;
 }
-#endif
 
 enum class D3B3PendingState : uint8_t {
     EMPTY, ACTIVE, PENDING_RETIREMENT, RETIRING, RETIRED, FAILED
@@ -302,7 +296,6 @@ struct D3B3TerminalProductionSlot {
     bool hiddenAcquisitionLeasesReleased{true};
 };
 
-#ifdef LSFGVK_D3B3_FINITE_TESTING
 enum class D3B3FiniteProductionState : uint8_t {
     WARMUP_EMPTY, HISTORY_A_READY, HISTORY_AB_READY, WAITING_REUSE,
     READY_NEXT, FINITE_STOPPED, FAILED
@@ -341,7 +334,6 @@ struct D3B3FiniteProductionOperations {
     std::function<void(const std::string&)> record;
     std::function<void()> emitMarker;
 };
-#endif
 
 class D3B3ProductionState {
 public:
@@ -357,7 +349,6 @@ public:
     bool markPending(D3B3PendingProductionOperation operation);
     void setFailure() noexcept;
     void setEligibleFrameCount(uint32_t count) noexcept;
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     void setFiniteStopped(bool stopped) noexcept;
     void configureFinite(D3B3FiniteProductionOperations operations);
     bool presentFinite(uint64_t frameId);
@@ -366,7 +357,6 @@ public:
     [[nodiscard]] D3B3FiniteProductionState finiteState() const noexcept;
     [[nodiscard]] D3B3FiniteProductionCounters finiteCounters() const noexcept;
     [[nodiscard]] bool acceptsPendingEpoch(uint64_t generationId) const noexcept;
-#endif
     [[nodiscard]] D3B3PendingProductionOperation pending() const;
     [[nodiscard]] std::array<D3B3TemporalProductionSlot, 2> temporalSlots() const;
     [[nodiscard]] uint32_t eligibleFrameCount() const noexcept;
@@ -377,31 +367,23 @@ public:
     void recordPair(const backend::RuntimeTemporalPairIdentity& pair);
 
 private:
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     [[nodiscard]] D3B3RetirementStatus retireFinitePair();
     [[nodiscard]] bool finiteOperationsComplete() const noexcept;
-#endif
 
     mutable std::mutex mutex;
     Retirement retirement;
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     D3B3FiniteProductionOperations finiteOperations;
-#endif
     D3B3PendingProductionOperation operation{};
     std::array<D3B3TemporalProductionSlot, 2> slots{};
     uint32_t eligibleFrames{};
     uint32_t pairs{};
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     bool finiteStop{};
-#endif
     D3B3TerminalProductionSlot terminal{};
-#ifdef LSFGVK_D3B3_FINITE_TESTING
     D3B3FiniteProductionState finiteCurrent{D3B3FiniteProductionState::WARMUP_EMPTY};
     D3B3FiniteProductionCounters finiteTotals{};
     std::optional<D3B3PairOperation> finitePair;
     uint64_t lastFiniteFrame{};
     uint64_t finiteGeneration{};
-#endif
 };
 
 }

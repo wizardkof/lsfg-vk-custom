@@ -136,8 +136,21 @@ target_include_directories(lsfg-vk-test-d3b3-production-seams PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
 target_link_libraries(lsfg-vk-test-d3b3-production-seams PRIVATE
     lsfg-vk-common lsfg-vk-backend)
-target_compile_definitions(lsfg-vk-test-d3b3-production-seams PRIVATE
-    LSFGVK_D3B3_FINITE_TESTING)
+
+add_executable(lsfg-vk-test-d3b3-normal-present-adapter
+    d3b3_normal_present_adapter_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-d3b3-normal-present-adapter
+    COMMAND lsfg-vk-test-d3b3-normal-present-adapter)
 
 add_executable(lsfg-vk-test-graphics-final-queue graphics_final_queue_test.cpp)
 target_include_directories(lsfg-vk-test-graphics-final-queue PRIVATE
@@ -393,6 +406,8 @@ add_test(NAME lsfg-vk-test-external-semaphore-sync
 add_executable(lsfg-vk-test-shadow-b-return-execution-harness
     shadow_b_return_execution_harness_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
 target_include_directories(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
@@ -401,8 +416,6 @@ target_compile_options(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
     -UNDEBUG -Wno-unknown-warning-option)
 target_link_libraries(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
     lsfg-vk-common lsfg-vk-backend)
-target_compile_definitions(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
-    LSFGVK_D3B3_FINITE_TESTING)
 add_test(NAME lsfg-vk-test-shadow-b-return-execution-harness
     COMMAND lsfg-vk-test-shadow-b-return-execution-harness)
 

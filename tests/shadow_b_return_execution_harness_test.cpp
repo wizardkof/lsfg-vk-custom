@@ -1,5 +1,6 @@
 #include "shadow_b_return_execution_harness.hpp"
 #include "d3b3_production_seams.hpp"
+#include "d3b3_normal_present_adapter.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 
 #include <cassert>
@@ -1541,6 +1542,46 @@ void testD3B3FiniteABCDEFProductionState() {
     assert(std::ranges::count(run.terminal.events, "BLIT_ORIGINAL_C_TO_HIDDEN") == 3);
 }
 
+void testD3B3FiniteABCDEFThroughProductionAdapter() {
+    FiniteRealD3B3Run run;
+    constexpr uint64_t swapchainGeneration = 11;
+    auto runtime = std::make_unique<lsfgvk::layer::D3B3ProductionRuntimeSession>(
+        swapchainGeneration, run.operations());
+    lsfgvk::layer::D3B3NormalPresentAdapter adapter({
+        .swapchain = pairHandle<VkSwapchainKHR>(0xA601),
+        .sourceImage = pairHandle<VkImage>(0xA602),
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {8, 8},
+        .presentQueue = pairHandle<VkQueue>(0xA603),
+        .presentQueueFamily = ShadowBReturnExecutionHarness::terminalQueueFamily,
+        .originalReady = pairHandle<VkSemaphore>(0xA604),
+        .swapchainGeneration = swapchainGeneration,
+        .runtimeDevicePairReady = true,
+        .exchangeChannelReady = true,
+        .terminalReady = true},
+        std::move(runtime));
+
+    assert(adapter.structurallyReady() && adapter.constructOperations());
+    for (const auto frame : {'A', 'B', 'C', 'D', 'E'})
+        assert(adapter.processFrame(static_cast<uint64_t>(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::READY);
+
+    const auto* controller = adapter.controller();
+    assert(controller && controller->finiteStopped());
+    const auto counters = controller->finiteCounters();
+    assert(counters.applicationFrames == 5 && counters.generate == 3);
+    assert(counters.bReturns == 3 && counters.aReturns == 3);
+    assert(counters.pairOperations == 3 && counters.terminalSubmits == 3);
+    assert(counters.internalPresents == 6 && controller->pairCount() == 3);
+    assert(adapter.ownership() == lsfgvk::layer::D3B3PresentOwnership::D3B3_ROUTE);
+    assert(adapter.frameSerial() == 6);
+    assert(run.fixture.harness.productionBReturnCalls == 3);
+    assert(run.fixture.harness.aPhaseCalls == 3);
+    assert(run.fixture.harness.aFenceWaitCalls == 0);
+    assert(run.terminal.terminalSubmitCalls == 3);
+    assert(run.terminal.acquireCalls == 6);
+}
+
 void testD3B3PairOperationTerminalRetirementContract() {
     static_assert(!std::is_copy_constructible_v<lsfgvk::layer::D3B3PairOperation>);
     static_assert(std::is_move_constructible_v<lsfgvk::layer::D3B3PairOperation>);
@@ -1926,6 +1967,7 @@ int main() {
     testAReturnFailureMatrix();
     testAReturnFenceRetirementFailure();
     testD3B3FiniteABCDEFProductionState();
+    testD3B3FiniteABCDEFThroughProductionAdapter();
     testD3B3SubmittedAReturnTerminalReadinessFirewall();
     testD3B3PairConstructionRejectsInvalidSubmittedState();
     testD3B3PairOperationTerminalRetirementContract();
