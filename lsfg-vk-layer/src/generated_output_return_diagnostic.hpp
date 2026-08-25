@@ -196,6 +196,12 @@ namespace lsfgvk::layer {
                 RuntimeGeneratedBReturnPending&&, backend::Instance&,
                 backend::RuntimeGenerateDiagnosticSession&,
                 vk::RuntimeForeignImageHandoffInfo);
+        [[nodiscard]] backend::RuntimeRetirementStatus
+            tryRetireProductionBReturn(backend::ReturnedGeneratedOperation&,
+                backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
+        [[nodiscard]] backend::RuntimeRetirementStatus
+            releaseProductionGeneratedOutput(backend::ReturnedGeneratedOperation&,
+                backend::Instance&, backend::RuntimeGenerateDiagnosticSession&);
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeGeneratedBReturnPending submitShadowBReturnForTesting(
             backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,

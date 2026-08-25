@@ -371,6 +371,7 @@ namespace lsfgvk::backend {
         RuntimeIngestRetirementStatus tryRetireShadowIngest();
         [[nodiscard]] RuntimeShadowIngestSnapshot shadowIngestSnapshot() const noexcept;
         RuntimeShadowGenerateSnapshot submitShadowGenerate(RuntimeTemporalPairIdentity);
+        RuntimeRetirementStatus tryRetireShadowGenerate();
         RuntimeShadowGenerateSnapshot retireShadowGenerate();
         [[nodiscard]] RuntimeShadowGenerateSnapshot shadowGenerateSnapshot() const noexcept;
         std::optional<RuntimeGenerateDiagnosticPending> takeShadowGeneratePending();
@@ -411,6 +412,7 @@ namespace lsfgvk::backend {
             RuntimeGenerationId lastRetiredGeneration{};
             bool lastExecutionRetired{};
             bool lastGeneratedOutputRetired{};
+            bool lastGenerationReadyWaitRetired{};
             bool lastGenerationReadyReusable{};
         };
         struct Pass {
@@ -830,6 +832,11 @@ RuntimeShadowIngestSnapshot Instance::inspectRuntimeIngest(
 RuntimeShadowGenerateSnapshot Instance::submitRuntimePrepassGenerate(
         RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair) {
     return session.submitShadowGenerate(pair);
+}
+
+RuntimeRetirementStatus Instance::tryRetireRuntimePrepassGenerate(
+        RuntimeGenerateDiagnosticSession& session) {
+    return session.tryRetireShadowGenerate();
 }
 
 RuntimeShadowGenerateSnapshot Instance::retireRuntimePrepassGenerate(
@@ -1662,6 +1669,8 @@ RuntimeGenerateDiagnosticSessionImpl::shadowGenerateSnapshot() const noexcept {
         result.olderSlot = shadow.lastRetiredPair.olderSlot;
         result.newerSlot = shadow.lastRetiredPair.newerSlot;
         result.executionRetired = shadow.lastExecutionRetired;
+        result.generationReadyWaitRetired =
+            shadow.lastGenerationReadyWaitRetired;
         result.generationReadyReusable = shadow.lastGenerationReadyReusable;
         result.generatedOutputRetired = shadow.lastGeneratedOutputRetired;
     }
@@ -1761,15 +1770,29 @@ RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::submitShadow
     }
 }
 
-RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowGenerate() {
+RuntimeRetirementStatus RuntimeGenerateDiagnosticSessionImpl::tryRetireShadowGenerate() {
     if (!shadowSplit || !shadowSplit->generateState)
         throw std::logic_error("no accepted shadow Generate to retire");
     auto& shadow = *shadowSplit;
+    if (shadow.generateExecutionRetired)
+        return RuntimeRetirementStatus::RETIRED;
+    if (!shadow.pending)
+        throw std::logic_error("Generate retirement lost its ingest authority");
     const auto epoch = shadow.pending->epoch();
-    if (!shadow.generateState->fence->wait(instance.getVulkan())) {
+    const auto& vk = instance.getVulkan();
+    const auto result = vk.df().GetFenceStatus(
+        vk.dev(), shadow.generateState->fence->handle());
+    if (result == VK_NOT_READY)
+        return RuntimeRetirementStatus::NOT_READY;
+    if (result != VK_SUCCESS) {
         shadow.ingestReadyEpoch.consumerFailed(epoch);
+        shadow.generateState->generationReadyEpoch.consumerFailed(
+            shadow.generateState->generation);
+        serialState.fail();
+        shadow.deviceLost = result == VK_ERROR_DEVICE_LOST;
         shadow.failed = true;
-        throw backend::error("shadow Generate fence wait failed");
+        return shadow.deviceLost ? RuntimeRetirementStatus::DEVICE_LOST
+                                 : RuntimeRetirementStatus::FAILED;
     }
     shadow.ingestReadyEpoch.waitRetired(epoch);
     shadow.ingestReadyEpoch.makeAvailable(epoch);
@@ -1782,6 +1805,20 @@ RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadow
     if (serialState.currentPhase() == RuntimeGenerateSerialPhase::IN_FLIGHT)
         serialState.sourceReadsRetired(shadow.generateState->generation);
     shadow.generateExecutionRetired = true;
+    return RuntimeRetirementStatus::RETIRED;
+}
+
+RuntimeShadowGenerateSnapshot RuntimeGenerateDiagnosticSessionImpl::retireShadowGenerate() {
+    if (!shadowSplit || !shadowSplit->generateState)
+        throw std::logic_error("no accepted shadow Generate to retire");
+    if (!shadowSplit->generateExecutionRetired
+            && !shadowSplit->generateState->fence->wait(instance.getVulkan())) {
+        shadowSplit->failed = true;
+        throw backend::error("shadow Generate fence wait failed");
+    }
+    const auto retirement = tryRetireShadowGenerate();
+    if (retirement != RuntimeRetirementStatus::RETIRED)
+        throw backend::error("shadow Generate retirement failed");
     return shadowGenerateSnapshot();
 }
 
@@ -1849,6 +1886,7 @@ void RuntimeGenerateDiagnosticSessionImpl::releaseShadowGenerationReady(
     shadowSplit->lastRetiredGeneration = generation;
     shadowSplit->lastExecutionRetired = shadowSplit->generateExecutionRetired;
     shadowSplit->lastGeneratedOutputRetired = shadowSplit->generateState->operationRetired;
+    shadowSplit->lastGenerationReadyWaitRetired = true;
     shadowSplit->lastGenerationReadyReusable = true;
     shadowSplit->generateState.reset();
     shadowSplit->generatePending.reset();

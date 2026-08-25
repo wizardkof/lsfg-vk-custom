@@ -566,6 +566,63 @@ GeneratedOutputReturnDiagnosticSession::completeProductionGeneratedReturnOnA(
     return result;
 }
 
+lsfgvk::backend::RuntimeRetirementStatus
+GeneratedOutputReturnDiagnosticSession::tryRetireProductionBReturn(
+        backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    const auto generation = operation.identity().generationId;
+    auto& authority = operation.bReturnAuthority();
+    if (authority.state() == backend::RuntimeAuthorityState::RETIRED)
+        return backend::RuntimeRetirementStatus::RETIRED;
+    if (!operation.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
+            || authority.epoch() != generation || !generationEndpoint.GetFenceStatus)
+        throw std::logic_error("invalid production B-return retirement request");
+    const auto result = generationEndpoint.GetFenceStatus(
+        generationEndpoint.bufferDevice.device, authority.fenceHandle());
+    if (result == VK_NOT_READY)
+        return backend::RuntimeRetirementStatus::NOT_READY;
+    if (result != VK_SUCCESS) {
+        authority.fail();
+        backend.failRuntimeBReturnRetirement(
+            backendSession, generation, result == VK_ERROR_DEVICE_LOST);
+        return result == VK_ERROR_DEVICE_LOST
+            ? backend::RuntimeRetirementStatus::DEVICE_LOST
+            : backend::RuntimeRetirementStatus::FAILED;
+    }
+    backend.retireRuntimeBReturnWait(backendSession, generation);
+    authority.retire(generation);
+    return backend::RuntimeRetirementStatus::RETIRED;
+}
+
+lsfgvk::backend::RuntimeRetirementStatus
+GeneratedOutputReturnDiagnosticSession::releaseProductionGeneratedOutput(
+        backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
+        backend::RuntimeGenerateDiagnosticSession& backendSession) {
+    if (operation.generatedOutputRetired())
+        return backend::RuntimeRetirementStatus::RETIRED;
+    if (!operation.valid())
+        throw std::logic_error("invalid production generated-output release request");
+    if (operation.bReturnAuthority().state() != backend::RuntimeAuthorityState::RETIRED)
+        return backend::RuntimeRetirementStatus::NOT_READY;
+    try {
+        operation.rejectGeneratedOutputRetirement();
+        if (!operation.generatedOutput.valid() || !operation.generatedRetirement.valid()
+                || operation.generatedRetirement.generationId()
+                    != operation.identity().generationId)
+            throw std::logic_error("generated-output retirement authority is missing");
+        static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
+            backendSession, std::move(operation.generatedOutput)));
+        backend.retireRuntimeGenerateOperation(
+            backendSession, std::move(operation.generatedRetirement));
+        backend.releaseRuntimeGenerationReady(
+            backendSession, operation.identity().generationId);
+        operation.markGeneratedOutputRetired();
+        return backend::RuntimeRetirementStatus::RETIRED;
+    } catch (...) {
+        return backend::RuntimeRetirementStatus::FAILED;
+    }
+}
+
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 lsfgvk::backend::ReturnedGeneratedOperation
 GeneratedOutputReturnDiagnosticSession::completeShadowGeneratedReturnOnAForTesting(
@@ -580,39 +637,32 @@ void GeneratedOutputReturnDiagnosticSession::retireShadowBReturnForTesting(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
         backend::RuntimeGenerateDiagnosticSession& backendSession) {
     const auto generation = operation.identity().generationId;
-    auto& authority = operation.bReturn;
+    auto& authority = operation.bReturnAuthority();
     if (!operation.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
             || authority.epoch() != generation || !generationEndpoint.WaitForFences)
         throw std::logic_error("invalid shadow B-return fence retirement request");
     const VkFence fence = authority.fenceHandle();
-    const auto result = generationEndpoint.WaitForFences(
+    const auto waitResult = generationEndpoint.WaitForFences(
         generationEndpoint.bufferDevice.device, 1, &fence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) {
-        if (result != VK_TIMEOUT) {
+    if (waitResult != VK_SUCCESS) {
+        if (waitResult != VK_TIMEOUT) {
             authority.fail();
             backend.failShadowBReturnRetirement(
-                backendSession, generation, result == VK_ERROR_DEVICE_LOST);
+                backendSession, generation, waitResult == VK_ERROR_DEVICE_LOST);
         }
-        throw ls::vulkan_error(result, "shadow B-return fence retirement failed");
+        throw ls::vulkan_error(waitResult, "shadow B-return fence retirement failed");
     }
-    backend.retireShadowBReturnWait(backendSession, generation);
-    authority.retire(generation);
+    const auto result = tryRetireProductionBReturn(operation, backend, backendSession);
+    if (result != backend::RuntimeRetirementStatus::RETIRED)
+        throw backend::error("shadow B-return retirement did not complete");
 }
 
 void GeneratedOutputReturnDiagnosticSession::releaseShadowGeneratedOutputForTesting(
         backend::ReturnedGeneratedOperation& operation, backend::Instance& backend,
         backend::RuntimeGenerateDiagnosticSession& backendSession) {
-    const auto generation = operation.identity().generationId;
-    operation.rejectGeneratedOutputRetirement();
-    if (!operation.generatedOutput.valid() || !operation.generatedRetirement.valid()
-            || operation.generatedRetirement.generationId() != generation)
-        throw std::logic_error("generated-output retirement authority is missing");
-    static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
-        backendSession, std::move(operation.generatedOutput)));
-    backend.retireRuntimeGenerateOperation(
-        backendSession, std::move(operation.generatedRetirement));
-    backend.releaseShadowGenerationReady(backendSession, generation);
-    operation.markGeneratedOutputRetired();
+    const auto result = releaseProductionGeneratedOutput(operation, backend, backendSession);
+    if (result != backend::RuntimeRetirementStatus::RETIRED)
+        throw backend::error("shadow generated-output release did not complete");
 }
 
 void GeneratedOutputReturnDiagnosticSession::retireShadowAReturnForTesting(

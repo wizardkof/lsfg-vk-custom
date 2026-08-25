@@ -462,6 +462,7 @@ public:
     VkResult aFenceWaitResult{VK_TIMEOUT};
     VkResult aFenceStatusResult{VK_NOT_READY};
     VkResult backendFenceStatusResult{VK_SUCCESS};
+    VkResult bReturnFenceStatusResult{VK_NOT_READY};
     VkResult aImportResult{VK_SUCCESS};
     ShadowHarnessFailurePoint failurePoint{ShadowHarnessFailurePoint::NONE};
     ShadowAHarnessFailurePoint aFailurePoint{ShadowAHarnessFailurePoint::NONE};
@@ -745,7 +746,11 @@ public:
         return backendImportedFdCalls;
     }
 
-    void retireFence() noexcept { fenceRetired = true; fenceWaitResult = VK_SUCCESS; }
+    void retireFence() noexcept {
+        fenceRetired = true;
+        fenceWaitResult = VK_SUCCESS;
+        bReturnFenceStatusResult = VK_SUCCESS;
+    }
     void retireSourceFence() noexcept {
         sourceFenceRetired = true;
         sourceFenceWaitResult = VK_SUCCESS;
@@ -1733,7 +1738,9 @@ private:
             ++active->aFenceStatusCalls;
             return active->aFenceStatusResult;
         }
-        if (active->fullBackendMode && !active->returnResourcesArmed)
+        if (fence == active->returnFence)
+            return active->bReturnFenceStatusResult;
+        if (active->fullBackendMode)
             return active->backendFenceStatusResult;
         return VK_NOT_READY;
     }

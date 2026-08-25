@@ -797,8 +797,9 @@ struct RealShadowPairFixture {
 
     void retireSourceReads() {
         harness.retireSourceFence();
-        const auto retired = backend->retireShadowPrepassGenerate(*backendSession);
-        assert(retired.executionRetired);
+        assert(backend->tryRetireRuntimePrepassGenerate(*backendSession)
+            == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+        assert(backend->inspectRuntimePrepassGenerate(*backendSession).executionRetired);
     }
 };
 
@@ -1036,6 +1037,86 @@ makeReturnSession(RealShadowPairFixture& fixture) {
         fixture.harness.endpoint(), fixture.harness.renderEndpoint(), true);
 }
 
+void testProductionNonblockingGenerateRetirement() {
+    RealShadowPairFixture fixture;
+    fixture.harness.backendFenceStatusResult = VK_NOT_READY;
+    assert(fixture.backend->tryRetireRuntimePrepassGenerate(*fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::NOT_READY);
+    auto pendingSnapshot = fixture.backend->inspectRuntimePrepassGenerate(
+        *fixture.backendSession);
+    assert(!pendingSnapshot.executionRetired && !pendingSnapshot.ingestReadyReusable);
+    assert(pendingSnapshot.generationReadySignalOutstanding);
+
+    fixture.harness.backendFenceStatusResult = VK_SUCCESS;
+    assert(fixture.backend->tryRetireRuntimePrepassGenerate(*fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(fixture.backend->tryRetireRuntimePrepassGenerate(*fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    const auto retired = fixture.backend->inspectRuntimePrepassGenerate(
+        *fixture.backendSession);
+    assert(retired.executionRetired && retired.ingestReadyReusable);
+    assert(retired.generationReadySignalOutstanding && !retired.generationReadyReusable);
+    assert(fixture.harness.frontFenceWaitCount() == fixture.hostWaitsBeforeGraph);
+}
+
+void testProductionGenerateRetirementDeviceLost() {
+    RealShadowPairFixture fixture;
+    fixture.harness.backendFenceStatusResult = VK_ERROR_DEVICE_LOST;
+    assert(fixture.backend->tryRetireRuntimePrepassGenerate(*fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::DEVICE_LOST);
+    const auto failed = fixture.backend->inspectRuntimePrepassGenerate(
+        *fixture.backendSession);
+    assert(failed.failed && failed.deviceLost && !failed.executionRetired);
+}
+
+void testProductionBReturnAndOutputRetirement() {
+    RealShadowPairFixture fixture;
+    fixture.harness.backendFenceStatusResult = VK_SUCCESS;
+    assert(fixture.backend->tryRetireRuntimePrepassGenerate(*fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    auto pending = fixture.take();
+    auto returnSession = makeReturnSession(fixture);
+    auto bPending = fixture.harness.submitProductionBReturn(
+        *returnSession, std::move(pending), *fixture.backend, *fixture.backendSession);
+    auto operation = fixture.harness.completeProductionAReturn(
+        *returnSession, std::move(bPending), *fixture.backend, *fixture.backendSession);
+
+    assert(returnSession->releaseProductionGeneratedOutput(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::NOT_READY);
+    assert(returnSession->tryRetireProductionBReturn(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::NOT_READY);
+    assert(operation.bReturnAuthority().state()
+        == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
+    assert(operation.generatedOutputLive());
+
+    fixture.harness.retireFence();
+    assert(returnSession->tryRetireProductionBReturn(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(returnSession->tryRetireProductionBReturn(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(operation.bReturnAuthority().state()
+        == lsfgvk::backend::RuntimeAuthorityState::RETIRED);
+    assert(operation.generatedOutputLive());
+    assert(!operation.aReturnRetired());
+
+    assert(returnSession->releaseProductionGeneratedOutput(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(returnSession->releaseProductionGeneratedOutput(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(operation.generatedOutputRetired());
+    const auto released = fixture.backend->inspectRuntimePrepassGenerate(
+        *fixture.backendSession);
+    assert(released.generationReadyWaitRetired && released.generationReadyReusable);
+    assert(!operation.aReturnRetired());
+    assert(fixture.harness.aFenceWaitCalls == 0);
+}
+
 void retireRecoveredBReturn(RealShadowPairFixture& fixture,
         lsfgvk::layer::GeneratedOutputReturnDiagnosticSession& returnSession,
         lsfgvk::layer::RuntimeGeneratedBReturnPending& recovered) {
@@ -1266,10 +1347,12 @@ lsfgvk::backend::ReturnedGeneratedOperation makeSubmittedB0COperation(
 
     fixture.retireSourceReads();
     fixture.harness.retireFence();
-    returnSession.retireShadowBReturnForTesting(
-        operation, *fixture.backend, *fixture.backendSession);
-    returnSession.releaseShadowGeneratedOutputForTesting(
-        operation, *fixture.backend, *fixture.backendSession);
+    assert(returnSession.tryRetireProductionBReturn(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(returnSession.releaseProductionGeneratedOutput(
+        operation, *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
     assert(operation.valid() && operation.terminalReady());
     assert(operation.returnedForGraphicsOutstanding());
     assert(operation.aReturnAuthority().state()
@@ -2067,6 +2150,9 @@ int main() {
     testIndependentFenceRetirement();
     testRealB0B3PendingStaging();
     testProductionWarmupNoSignalAndBCTransition();
+    testProductionNonblockingGenerateRetirement();
+    testProductionGenerateRetirementDeviceLost();
+    testProductionBReturnAndOutputRetirement();
     testCompleteOnePairNonTerminalProductionGraph();
     testBReturnSubmitFailures();
     testBReturnExportFailureAfterAcceptedSubmit();

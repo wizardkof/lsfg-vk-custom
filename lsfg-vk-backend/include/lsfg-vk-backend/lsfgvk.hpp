@@ -97,6 +97,9 @@ namespace lsfgvk::backend {
     enum class RuntimeGenerateMode : uint8_t { OneShot, SerialReusable };
     enum class RuntimeIngestIntent : uint8_t { WARMUP_TEMPORAL, GENERATE_SOURCE };
     enum class RuntimeIngestRetirementStatus : uint8_t { NOT_READY, RETIRED };
+    enum class RuntimeRetirementStatus : uint8_t {
+        NOT_READY, RETIRED, DEVICE_LOST, FAILED
+    };
 
     enum class TemporalSourceSlot : uint8_t { Slot0 = 0, Slot1 = 1 };
 
@@ -340,6 +343,8 @@ namespace lsfgvk::backend {
             const RuntimeGenerateDiagnosticSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowGenerateSnapshot submitRuntimePrepassGenerate(
             RuntimeGenerateDiagnosticSession& session, RuntimeTemporalPairIdentity pair);
+        [[nodiscard]] RuntimeRetirementStatus tryRetireRuntimePrepassGenerate(
+            RuntimeGenerateDiagnosticSession& session);
         [[nodiscard]] RuntimeShadowGenerateSnapshot retireRuntimePrepassGenerate(
             RuntimeGenerateDiagnosticSession& session);
         [[nodiscard]] RuntimeShadowGenerateSnapshot inspectRuntimePrepassGenerate(
