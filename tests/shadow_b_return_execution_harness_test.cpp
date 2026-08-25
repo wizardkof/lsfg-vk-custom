@@ -1221,7 +1221,7 @@ lsfgvk::backend::ReturnedGeneratedOperation makeSubmittedB0COperation(
 enum class PairTerminalFailure {
     NONE, PREFLIGHT, ACQUIRE_GENERATED, ACQUIRE_ORIGINAL, RECORD, SUBMIT,
     DEVICE_LOST, GENERATED_PRESENT, ORIGINAL_PRESENT, GRAPHICS_FENCE,
-    GENERATED_PRESENT_FENCE, HIDDEN_REACQUIRE
+    GENERATED_PRESENT_FENCE
 };
 
 struct PairTerminalMock {
@@ -1234,7 +1234,6 @@ struct PairTerminalMock {
     uint32_t terminalSubmitCalls{};
     VkSemaphore terminalWaitSemaphore{};
     VkImage terminalGeneratedSource{};
-    bool hiddenReusable{true};
     std::function<void()> beforeGraphicsFenceRetirement;
 
     lsfgvk::layer::D3B2InsertionPath build(
@@ -1376,11 +1375,6 @@ lsfgvk::layer::D3B3PairOperation makePairOperation(
         },
         .retireOriginalPresentFence = [&] {
             terminalMock.events.emplace_back("PRESENT_FENCE_ORIGINAL_RETIRED");
-        },
-        .confirmHiddenDestinationsReusable = [&] {
-            terminalMock.events.emplace_back("HIDDEN_DESTINATIONS_REACQUIRE_CHECK");
-            return terminalMock.hiddenReusable
-                && terminalMock.failure != PairTerminalFailure::HIDDEN_REACQUIRE;
         }};
     auto pair = lsfgvk::layer::D3B3PairOperation(
         std::move(returned), std::move(original), std::move(dispatch));
@@ -1411,10 +1405,6 @@ lsfgvk::layer::D3B3PairTerminalDispatch makeFiniteTerminalDispatch(
         },
         .retireOriginalPresentFence = [&terminalMock, label] {
             terminalMock.events.emplace_back("PRESENT_FENCE_ORIGINAL_" + label);
-        },
-        .confirmHiddenDestinationsReusable = [&terminalMock, label] {
-            terminalMock.events.emplace_back("HIDDEN_REACQUIRE_" + label);
-            return terminalMock.hiddenReusable;
         }};
 }
 
@@ -1551,38 +1541,6 @@ void testD3B3FiniteABCDEFProductionState() {
     assert(std::ranges::count(run.terminal.events, "BLIT_ORIGINAL_C_TO_HIDDEN") == 3);
 }
 
-void testD3B3FinitePrePresentTimeoutAndEpochFirewall() {
-    FiniteRealD3B3Run run;
-    run.terminal.hiddenReusable = false;
-    lsfgvk::layer::D3B3ProductionState state;
-    state.configureFinite(run.operations());
-    for (const auto frame : {static_cast<uint64_t>('A'), static_cast<uint64_t>('B'),
-            static_cast<uint64_t>('C')})
-        assert(state.presentFinite(frame));
-
-    const auto beforeD = state.finiteCounters();
-    assert(!state.presentFinite(static_cast<uint64_t>('D')));
-    assert(state.finiteState() == lsfgvk::layer::D3B3FiniteProductionState::WAITING_REUSE);
-    const auto afterTimeout = state.finiteCounters();
-    assert(afterTimeout.applicationFrames == beforeD.applicationFrames);
-    assert(afterTimeout.generate == beforeD.generate);
-    assert(run.fixture.harness.productionBReturnCalls == 1);
-    assert(state.acceptsPendingEpoch(1));
-    assert(!state.acceptsPendingEpoch(0));
-    assert(!state.acceptsPendingEpoch(2));
-
-    run.terminal.hiddenReusable = true;
-    assert(state.presentFinite(static_cast<uint64_t>('D')));
-    assert(state.finiteCounters().generate == 2);
-    assert(state.acceptsPendingEpoch(2));
-    assert(!state.acceptsPendingEpoch(1));
-    assert(state.prePresentGate() == lsfgvk::layer::PrePresentGateResult::READY);
-    assert(state.pending().state == lsfgvk::layer::D3B3PendingState::EMPTY);
-    assert(!state.acceptsPendingEpoch(2));
-    assert(state.finishFinite() == false);
-    assert(!state.finiteStopped());
-}
-
 void testD3B3PairOperationTerminalRetirementContract() {
     static_assert(!std::is_copy_constructible_v<lsfgvk::layer::D3B3PairOperation>);
     static_assert(std::is_move_constructible_v<lsfgvk::layer::D3B3PairOperation>);
@@ -1642,7 +1600,7 @@ void testD3B3PairOperationTerminalRetirementContract() {
     pair.retirePresentWaits();
     assert(pair.state() == lsfgvk::layer::D3B3PairState::PRESENTS_RETIRED);
     assert(pair.generatedPresentRetired() && pair.originalPresentRetired());
-    assert(pair.hiddenLedgerEmpty());
+    assert(pair.hiddenAcquisitionLeasesReleased());
     bool pendingAReturnBlockedPairRetirement{};
     try { pair.retirePair(); }
     catch (const std::logic_error&) { pendingAReturnBlockedPairRetirement = true; }
@@ -1667,8 +1625,7 @@ void testD3B3PairOperationTerminalRetirementContract() {
         "BLIT_GENERATED_G_TO_HIDDEN", "BLIT_ORIGINAL_C_TO_HIDDEN",
         "TERMINAL_RECORD_END", "TERMINAL_SUBMIT_WAIT_RETURNED_FOR_GRAPHICS",
         "PRESENT_GENERATED", "PRESENT_ORIGINAL", "TERMINAL_GRAPHICS_FENCE_WAIT",
-        "PRESENT_FENCE_GENERATED_RETIRED", "PRESENT_FENCE_ORIGINAL_RETIRED",
-        "HIDDEN_DESTINATIONS_REACQUIRE_CHECK"}));
+        "PRESENT_FENCE_GENERATED_RETIRED", "PRESENT_FENCE_ORIGINAL_RETIRED"}));
 }
 
 void testD3B3SubmittedAReturnTerminalReadinessFirewall() {
@@ -1855,18 +1812,95 @@ void testD3B3PairOperationFailureBoundaries() {
     try { pair.submitTerminal(); }
     catch (const std::logic_error&) { doubleSubmitRejected = true; }
     assert(doubleSubmitRejected);
-    mock.hiddenReusable = false;
     pair.retirePresentWaits();
-    assert(!pair.hiddenLedgerEmpty());
-    bool earlyPairRetirementRejected{};
-    try { pair.retirePair(); }
-    catch (const std::logic_error&) { earlyPairRetirementRejected = true; }
-    assert(earlyPairRetirementRejected);
-    mock.hiddenReusable = true;
-    pair.retirePresentWaits();
+    assert(pair.hiddenAcquisitionLeasesReleased());
     fixture.harness.retireAFence();
     assert(pair.tryRetireAReturn());
     pair.retirePair();
+}
+
+struct HiddenWsiLeaseModel {
+    explicit HiddenWsiLeaseModel(uint32_t count) : acquired(count), presentPending(count) {}
+
+    bool acquire(uint32_t index) {
+        if (index >= acquired.size() || acquired[index])
+            return false;
+        acquired[index] = true;
+        return true;
+    }
+
+    bool present(uint32_t index, VkResult result = VK_SUCCESS) {
+        if (index >= acquired.size() || !acquired[index] || result != VK_SUCCESS)
+            return false;
+        acquired[index] = false;
+        presentPending[index] = true;
+        return true;
+    }
+
+    bool release(uint32_t index) {
+        if (index >= acquired.size() || !acquired[index])
+            return false;
+        acquired[index] = false;
+        return true;
+    }
+
+    void retirePresentFence(uint32_t index) {
+        assert(index < presentPending.size() && presentPending[index]);
+        presentPending[index] = false;
+    }
+
+    bool acquisitionLeasesReleased() const {
+        return std::ranges::none_of(acquired, [](bool value) { return value; });
+    }
+
+    bool presentPendingFor(uint32_t index) const { return presentPending[index]; }
+
+    std::vector<bool> acquired;
+    std::vector<bool> presentPending;
+};
+
+void testD3B3HiddenWsiLeaseRetirementModel() {
+    // Exact R3 shape: two presented images, while future acquire returns image 2 forever.
+    HiddenWsiLeaseModel r3(3);
+    assert(r3.acquire(0) && r3.acquire(1));
+    assert(r3.present(0) && r3.present(1));
+    assert(r3.acquisitionLeasesReleased());
+    assert(r3.presentPendingFor(0) && r3.presentPendingFor(1));
+    assert(r3.acquire(2) && r3.release(2));
+    r3.retirePresentFence(0);
+    r3.retirePresentFence(1);
+    assert(r3.acquisitionLeasesReleased());
+
+    // Pair 2 owns a fresh, independently acquired pair; its legal indices need not match Pair 1.
+    HiddenWsiLeaseModel pair2(3);
+    assert(pair2.acquire(2) && pair2.acquire(1));
+    assert(pair2.present(2) && pair2.present(1));
+    assert(pair2.acquisitionLeasesReleased());
+
+    for (const uint32_t count : {2u, 3u, 4u}) {
+        HiddenWsiLeaseModel model(count);
+        assert(model.acquire(0) && model.acquire(1));
+        assert(model.present(0) && model.present(1));
+        assert(model.acquisitionLeasesReleased());
+    }
+
+    // Present-resource retirement is independent from acquisition-lease retirement.
+    HiddenWsiLeaseModel fenceIndependent(3);
+    assert(fenceIndependent.acquire(0) && fenceIndependent.acquire(1));
+    assert(fenceIndependent.present(0) && fenceIndependent.present(1));
+    assert(fenceIndependent.acquisitionLeasesReleased());
+    assert(fenceIndependent.presentPendingFor(0));
+    fenceIndependent.retirePresentFence(0);
+    fenceIndependent.retirePresentFence(1);
+
+    // Failed present leaves that image application-owned until explicit release cleanup.
+    HiddenWsiLeaseModel failure(3);
+    assert(failure.acquire(0) && failure.acquire(1));
+    assert(failure.present(0));
+    assert(!failure.present(1, VK_ERROR_OUT_OF_DATE_KHR));
+    assert(!failure.acquisitionLeasesReleased());
+    assert(failure.release(1));
+    assert(failure.acquisitionLeasesReleased());
 }
 
 }
@@ -1892,12 +1926,12 @@ int main() {
     testAReturnFailureMatrix();
     testAReturnFenceRetirementFailure();
     testD3B3FiniteABCDEFProductionState();
-    testD3B3FinitePrePresentTimeoutAndEpochFirewall();
     testD3B3SubmittedAReturnTerminalReadinessFirewall();
     testD3B3PairConstructionRejectsInvalidSubmittedState();
     testD3B3PairOperationTerminalRetirementContract();
     testD3B3AReturnObservedBeforeTerminalFence();
     testD3B3LateAReturnFailureIsConservative();
     testD3B3PairOperationFailureBoundaries();
+    testD3B3HiddenWsiLeaseRetirementModel();
     return 0;
 }

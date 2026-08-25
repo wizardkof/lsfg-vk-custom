@@ -17,8 +17,7 @@ D3B3PairOperation::D3B3PairOperation(
     dispatch(std::move(terminal)) {
     if (!returned.valid() || !original.valid() || !dispatch.build
             || !dispatch.retireGeneratedPresentFence
-            || !dispatch.retireOriginalPresentFence
-            || !dispatch.confirmHiddenDestinationsReusable)
+            || !dispatch.retireOriginalPresentFence)
         throw std::invalid_argument("invalid D3B3 Pair1 terminal authorities");
 
     const auto pair = returned.identity();
@@ -39,7 +38,9 @@ D3B3PairOperation::D3B3PairOperation(D3B3PairOperation&& other) noexcept :
     originalPresentSubmitted(other.originalPresentSubmitted),
     generatedPresentRetiredValue(other.generatedPresentRetiredValue),
     originalPresentRetiredValue(other.originalPresentRetiredValue),
-    hiddenEmpty(other.hiddenEmpty) {
+    generatedAcquisitionLeaseReleased(other.generatedAcquisitionLeaseReleased),
+    originalAcquisitionLeaseReleased(other.originalAcquisitionLeaseReleased),
+    hiddenAcquisitionLeasesReleasedValue(other.hiddenAcquisitionLeasesReleasedValue) {
     bindCallbacks();
     other.current = D3B3PairState::FAILED;
     other.terminalPath.reset();
@@ -58,7 +59,9 @@ D3B3PairOperation& D3B3PairOperation::operator=(D3B3PairOperation&& other) noexc
     originalPresentSubmitted = other.originalPresentSubmitted;
     generatedPresentRetiredValue = other.generatedPresentRetiredValue;
     originalPresentRetiredValue = other.originalPresentRetiredValue;
-    hiddenEmpty = other.hiddenEmpty;
+    generatedAcquisitionLeaseReleased = other.generatedAcquisitionLeaseReleased;
+    originalAcquisitionLeaseReleased = other.originalAcquisitionLeaseReleased;
+    hiddenAcquisitionLeasesReleasedValue = other.hiddenAcquisitionLeasesReleasedValue;
     bindCallbacks();
     other.current = D3B3PairState::FAILED;
     other.terminalPath.reset();
@@ -158,16 +161,12 @@ void D3B3PairOperation::retirePresentWaits() {
         throw std::logic_error("D3B3 Pair1 presents are not pending retirement");
     }
 
-    if (!hiddenEmpty) {
-        if (dispatch.confirmHiddenDestinationsReusable())
-            hiddenEmpty = true;
-    }
 }
 
 void D3B3PairOperation::retirePair() {
     if (current != D3B3PairState::PRESENTS_RETIRED
             || !generatedPresentRetiredValue || !originalPresentRetiredValue
-            || !hiddenEmpty || !returnedForGraphicsReusable()
+            || !hiddenAcquisitionLeasesReleasedValue || !returnedForGraphicsReusable()
             || !returned.aReturnRetired()
             || original.state() != D3B3OriginalSourceState::TERMINAL_RETIRED)
         throw std::logic_error("D3B3 Pair1 retirement domains are incomplete");
@@ -202,7 +201,9 @@ void D3B3PairOperation::bindCallbacks() {
     path.onDestinationsAcquired = [this] {
         if (current != D3B3PairState::TERMINAL_SUBMIT_PENDING)
             throw std::logic_error("D3B3 Pair1 destinations acquired out of order");
-        hiddenEmpty = false;
+        generatedAcquisitionLeaseReleased = false;
+        originalAcquisitionLeaseReleased = false;
+        hiddenAcquisitionLeasesReleasedValue = false;
         current = D3B3PairState::DESTINATIONS_ACQUIRED;
     };
     path.onRecordBegin = [this] {
@@ -225,12 +226,18 @@ void D3B3PairOperation::bindCallbacks() {
         if (current != D3B3PairState::TERMINAL_SUBMITTED)
             throw std::logic_error("D3B3 generated present submitted out of order");
         generatedPresentSubmitted = true;
+        generatedAcquisitionLeaseReleased = true;
+        hiddenAcquisitionLeasesReleasedValue =
+            generatedAcquisitionLeaseReleased && originalAcquisitionLeaseReleased;
     };
     path.onOriginalPresentAccepted = [this] {
         if (!generatedPresentSubmitted
                 || current != D3B3PairState::TERMINAL_SUBMITTED)
             throw std::logic_error("D3B3 original present submitted out of order");
         originalPresentSubmitted = true;
+        originalAcquisitionLeaseReleased = true;
+        hiddenAcquisitionLeasesReleasedValue =
+            generatedAcquisitionLeaseReleased && originalAcquisitionLeaseReleased;
         current = D3B3PairState::PRESENTS_SUBMITTED;
     };
     path.onGraphicsFenceRetired = [this] {
@@ -294,7 +301,8 @@ D3B3RetirementStatus evaluateD3B3Retirement(
     if (domains.inputFence && domains.bReturnFence && domains.aReturnComplete
             && domains.graphicsFence && domains.generatedPresentFence
             && domains.originalPresentFence && domains.temporaryPayloadRetired
-            && domains.hiddenLedgerEmpty && domains.generatedAuthorityRetired)
+            && domains.hiddenAcquisitionLeasesReleased
+            && domains.generatedAuthorityRetired)
         return D3B3RetirementStatus::RETIRED;
     return D3B3RetirementStatus::TIMEOUT;
 }
@@ -582,7 +590,7 @@ bool D3B3ProductionState::presentFinite(uint64_t frameId) {
                 finitePair->originalPresentRetired(),
                 finitePair->aReturnPayloadState()
                     == backend::RuntimeTemporaryPayloadState::WAIT_RETIRED,
-                finitePair->hiddenLedgerEmpty(), true};
+                finitePair->hiddenAcquisitionLeasesReleased(), true};
             operation.state = D3B3PendingState::PENDING_RETIREMENT;
             finiteCurrent = D3B3FiniteProductionState::READY_NEXT;
         }
@@ -640,7 +648,7 @@ D3B3RetirementStatus D3B3ProductionState::retireFinitePair() {
         if (!finitePair)
             return D3B3RetirementStatus::RETIRED;
         finitePair->retirePresentWaits();
-        if (!finitePair->hiddenLedgerEmpty())
+        if (!finitePair->hiddenAcquisitionLeasesReleased())
             return D3B3RetirementStatus::TIMEOUT;
         if (!finitePair->tryRetireAReturn())
             return D3B3RetirementStatus::TIMEOUT;

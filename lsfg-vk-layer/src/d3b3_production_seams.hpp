@@ -151,7 +151,7 @@ struct D3B3RetirementDomains {
     bool generatedPresentFence{};
     bool originalPresentFence{};
     bool temporaryPayloadRetired{};
-    bool hiddenLedgerEmpty{};
+    bool hiddenAcquisitionLeasesReleased{};
     bool generatedAuthorityRetired{};
 };
 
@@ -168,9 +168,6 @@ struct D3B3PairTerminalDispatch {
         D3B2Source generated, D3B2Source original, VkSemaphore returnedForGraphics)> build;
     std::function<void()> retireGeneratedPresentFence;
     std::function<void()> retireOriginalPresentFence;
-    // This is intentionally separate from present-fence retirement.  A WSI
-    // image becomes reusable only when this authority says so.
-    std::function<bool()> confirmHiddenDestinationsReusable;
 };
 
 class D3B3PairOperation {
@@ -221,7 +218,11 @@ public:
             || current == D3B3PairState::PRESENTS_RETIRED
             || current == D3B3PairState::PAIR_RETIRED;
     }
-    [[nodiscard]] bool hiddenLedgerEmpty() const noexcept { return hiddenEmpty; }
+    // True means neither hidden image remains an application-owned
+    // acquisition lease. It does not claim that either index is reacquirable.
+    [[nodiscard]] bool hiddenAcquisitionLeasesReleased() const noexcept {
+        return hiddenAcquisitionLeasesReleasedValue;
+    }
     [[nodiscard]] bool generatedPresentRetired() const noexcept { return generatedPresentRetiredValue; }
     [[nodiscard]] bool originalPresentRetired() const noexcept { return originalPresentRetiredValue; }
     [[nodiscard]] bool pairRetired() const noexcept {
@@ -250,7 +251,9 @@ private:
     bool originalPresentSubmitted{};
     bool generatedPresentRetiredValue{};
     bool originalPresentRetiredValue{};
-    bool hiddenEmpty{true};
+    bool generatedAcquisitionLeaseReleased{};
+    bool originalAcquisitionLeaseReleased{};
+    bool hiddenAcquisitionLeasesReleasedValue{true};
 };
 #endif
 
@@ -296,7 +299,7 @@ struct D3B3TerminalProductionSlot {
     VkSemaphore originalReady{};
     VkFence generatedPresentFence{};
     VkFence originalPresentFence{};
-    bool hiddenLedgerEmpty{true};
+    bool hiddenAcquisitionLeasesReleased{true};
 };
 
 #ifdef LSFGVK_D3B3_FINITE_TESTING
