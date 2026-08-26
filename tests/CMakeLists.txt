@@ -152,6 +152,24 @@ target_link_libraries(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
 add_test(NAME lsfg-vk-test-d3b3-normal-present-adapter
     COMMAND lsfg-vk-test-d3b3-normal-present-adapter)
 
+add_executable(lsfg-vk-test-d3b3-per-swapchain-runtime
+    d3b3_per_swapchain_runtime_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_per_swapchain_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp")
+target_include_directories(lsfg-vk-test-d3b3-per-swapchain-runtime PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-d3b3-per-swapchain-runtime PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-d3b3-per-swapchain-runtime PRIVATE
+    lsfg-vk-common lsfg-vk-backend Threads::Threads)
+add_test(NAME lsfg-vk-test-d3b3-per-swapchain-runtime
+    COMMAND lsfg-vk-test-d3b3-per-swapchain-runtime)
+
 add_executable(lsfg-vk-test-graphics-final-queue graphics_final_queue_test.cpp)
 target_include_directories(lsfg-vk-test-graphics-final-queue PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")

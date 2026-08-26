@@ -1,4 +1,5 @@
 set(LAYER_SOURCES
+    "src/d3b3_per_swapchain_runtime.cpp"
     "src/d3b3_production_seams.cpp"
     "src/d3b3_normal_present_adapter.cpp"
     "src/d3b3_production_runtime.cpp"
