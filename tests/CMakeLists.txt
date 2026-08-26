@@ -428,6 +428,23 @@ target_link_libraries(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
 add_test(NAME lsfg-vk-test-shadow-b-return-execution-harness
     COMMAND lsfg-vk-test-shadow-b-return-execution-harness)
 
+add_executable(lsfg-vk-test-d3b3-production-core-runner
+    d3b3_production_core_runner_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-d3b3-production-core-runner PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-d3b3-production-core-runner PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-d3b3-production-core-runner PRIVATE
+    lsfg-vk-common lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-d3b3-production-core-runner
+    COMMAND lsfg-vk-test-d3b3-production-core-runner)
+
 add_executable(lsfg-vk-test-interop-sync-fd-probe
     interop_sync_fd_probe_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/interop_sync_fd_probe.cpp")
