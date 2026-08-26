@@ -2,6 +2,7 @@
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/runtime_device_extension_contract.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 
@@ -261,12 +262,8 @@ namespace {
         if (std::ranges::binary_search(advertisedExtensions,
                 std::string(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)))
             requestedExtensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
-        if (std::ranges::binary_search(advertisedExtensions,
-                std::string(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)))
-            requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-        if (std::ranges::binary_search(advertisedExtensions,
-                std::string(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)))
-            requestedExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+        appendAdvertisedRuntimeCrossDeviceExtensions(
+            requestedExtensions, advertisedExtensions);
         std::cerr << "[DG2X-P4B-A4H1] Backend extension contract\n"
                   << "  API version: 1.2\n";
         for (const auto* extension : requestedExtensions)

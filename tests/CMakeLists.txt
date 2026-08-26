@@ -212,6 +212,15 @@ add_test(
     NAME lsfg-vk-test-physical-device-diagnostics
     COMMAND lsfg-vk-test-physical-device-diagnostics)
 
+add_executable(lsfg-vk-test-runtime-device-extension-contract
+    runtime_device_extension_contract_test.cpp)
+target_compile_options(lsfg-vk-test-runtime-device-extension-contract PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-runtime-device-extension-contract PRIVATE
+    lsfg-vk-common)
+add_test(NAME lsfg-vk-test-runtime-device-extension-contract
+    COMMAND lsfg-vk-test-runtime-device-extension-contract)
+
 add_executable(lsfg-vk-test-runtime-device-pair
     runtime_device_pair_test.cpp)
 

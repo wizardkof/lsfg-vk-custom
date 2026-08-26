@@ -8,6 +8,7 @@
 #include "lsfg-vk-common/configuration/detection.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/runtime_device_extension_contract.hpp"
 #include "lsfg-vk-common/vulkan/runtime_device_pair.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -216,11 +217,12 @@ namespace {
             [&pair](const vk::PhysicalDeviceSnapshot& snapshot) {
                 return snapshot.identity.samePhysicalDevice(pair.generation.identity);
             });
-        if (generationSnapshot == backend.visibleDevices().end()
-                || !extensionAdvertised(*generationSnapshot,
-                    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME))
-            throw ls::error(
-                "generation GPU does not advertise VK_EXT_external_memory_dma_buf");
+        if (generationSnapshot == backend.visibleDevices().end())
+            throw ls::error("generation GPU is absent from the backend device inventory");
+        for (const auto* extension : vk::RUNTIME_CROSS_DEVICE_DEVICE_EXTENSIONS) {
+            if (!extensionAdvertised(*generationSnapshot, extension))
+                throw ls::error(std::string("generation GPU does not advertise ") + extension);
+        }
 
         std::filesystem::path allocatorNode;
         VkDeviceSize backingSize{};
@@ -489,7 +491,7 @@ void Root::modifyDeviceCreateInfo(const ConfigSnapshot& snapshot,
     // Cross-device transport is only reachable through an explicit generation-GPU
     // selector. Keep the Default/same-GPU device contract unchanged.
     if (snapshot.activeProfile().gpu.has_value())
-        requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        vk::appendRuntimeCrossDeviceExtensions(requestedExtensions);
 
     auto extensions = add_extensions(
         createInfo.ppEnabledExtensionNames,

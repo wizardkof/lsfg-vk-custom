@@ -5,6 +5,7 @@
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
+#include "lsfg-vk-common/vulkan/runtime_device_extension_contract.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "swapchain.hpp"
 #include "virtual_swapchain_image_spec.hpp"
@@ -1049,6 +1050,16 @@ namespace {
                 newInfo.enabledExtensionCount =
                     static_cast<uint32_t>(compatibilityDeviceExtensions.size());
                 newInfo.ppEnabledExtensionNames = compatibilityDeviceExtensions.data();
+            }
+            if (configSnapshot.active()
+                    && configSnapshot.activeProfile().gpu.has_value()) {
+                for (const auto* extension : vk::RUNTIME_CROSS_DEVICE_DEVICE_EXTENSIONS) {
+                    if (!hasDeviceExtension(physdev, instance_info->funcs, extension)) {
+                        std::cerr << "lsfg-vk: cross-device runtime compatibility unavailable: "
+                            << extension << " not available\n";
+                        return VK_ERROR_EXTENSION_NOT_PRESENT;
+                    }
+                }
             }
             if (configSnapshot.active()) {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
