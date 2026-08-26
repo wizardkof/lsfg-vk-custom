@@ -445,6 +445,24 @@ target_link_libraries(lsfg-vk-test-d3b3-production-core-runner PRIVATE
 add_test(NAME lsfg-vk-test-d3b3-production-core-runner
     COMMAND lsfg-vk-test-d3b3-production-core-runner)
 
+# A6A5H is an explicitly invoked real-device executable.  It is built with
+# the normal test/tool graph but is intentionally not a default CTest test:
+# it requires live AMD->NVIDIA hardware and LSFGVK_DLL_PATH.
+add_executable(lsfg-vk-d3b3-production-core-hardware-runner
+    d3b3_production_core_hardware_runner.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/runtime_dma_buf_backing.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-d3b3-production-core-hardware-runner PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-d3b3-production-core-hardware-runner PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-d3b3-production-core-hardware-runner PRIVATE
+    lsfg-vk-common lsfg-vk-backend PkgConfig::TEST_GBM)
+
 add_executable(lsfg-vk-test-interop-sync-fd-probe
     interop_sync_fd_probe_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-cli/src/tools/interop_sync_fd_probe.cpp")
