@@ -445,6 +445,15 @@ target_link_libraries(lsfg-vk-test-d3b3-production-core-runner PRIVATE
 add_test(NAME lsfg-vk-test-d3b3-production-core-runner
     COMMAND lsfg-vk-test-d3b3-production-core-runner)
 
+add_executable(lsfg-vk-test-d3b3-hardware-runner-device-selector
+    d3b3_hardware_runner_device_selector_test.cpp)
+target_compile_options(lsfg-vk-test-d3b3-hardware-runner-device-selector PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-d3b3-hardware-runner-device-selector PRIVATE
+    lsfg-vk-common)
+add_test(NAME lsfg-vk-test-d3b3-hardware-runner-device-selector
+    COMMAND lsfg-vk-test-d3b3-hardware-runner-device-selector)
+
 # A6A5H is an explicitly invoked real-device executable.  It is built with
 # the normal test/tool graph but is intentionally not a default CTest test:
 # it requires live AMD->NVIDIA hardware and LSFGVK_DLL_PATH.

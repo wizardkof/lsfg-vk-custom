@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "d3b3_production_core_owner.hpp"
+#include "d3b3_hardware_runner_device_selector.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/fnv1a.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -24,6 +25,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -190,8 +192,13 @@ vk::RuntimeFrameTransportSubmission submitTransport(
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool devicePreflight = argc == 2
+            && std::string_view(argv[1]) == "--device-preflight";
+        if (argc != 1 && !devicePreflight)
+            throw std::invalid_argument("usage: hardware runner [--device-preflight]");
+
         const auto selectA = [](const vk::VulkanInstanceFuncs& funcs,
                 const std::vector<VkPhysicalDevice>& devices) {
             return selectVendor(funcs, devices, 0x1002U, "GPU A (AMD)");
@@ -205,12 +212,19 @@ int main() {
             return identity.vendorId == 0x10deU;
         };
         backend::Instance backend(selectB, shaderPath(), false);
+        const auto generationSelector =
+            lsfgvk::tests::makeHardwareRunnerDeviceSelector(backend.deviceIdentity());
         const auto pair = vk::bindRuntimeDevicePair(
-            renderIdentity, backend.deviceIdentity(), std::optional<std::string>{"generation"});
+            renderIdentity, backend.deviceIdentity(), generationSelector);
         if (!pair || !pair->crossDevice())
             throw std::runtime_error("A6A5H did not bind a cross-device AMD->NVIDIA pair");
         std::cerr << "A6A5H DEVICES A=" << pair->render.identity.name
-            << " B=" << pair->generation.identity.name << " PASS\n";
+            << " B=" << pair->generation.identity.name
+            << " selector=" << generationSelector << " PASS\n";
+        if (devicePreflight) {
+            std::cerr << "A6A5R3 DEVICE PAIR PREFLIGHT PASS\n";
+            return 0;
+        }
 
         auto renderEndpoint = vk::makeRuntimeExchangeEndpoint(renderVk);
         auto generationEndpoint = backend.runtimeExchangeEndpoint();
