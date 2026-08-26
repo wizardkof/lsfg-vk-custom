@@ -62,6 +62,7 @@ public:
     [[nodiscard]] vk::RuntimeImageObservationDescriptor
         generatedObservationSource() const noexcept;
     [[nodiscard]] const backend::ReturnedGeneratedOperation* returnedOperation() const noexcept;
+    [[nodiscard]] backend::ReturnedGeneratedOperation takeReturnedOperation();
 
 private:
     backend::RuntimeGenerateSession& ensureGenerateSession();

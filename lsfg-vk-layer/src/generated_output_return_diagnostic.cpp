@@ -55,6 +55,12 @@ void GpuChainedReturnStateMachine::advance(
     current = next;
 }
 
+void GpuChainedReturnStateMachine::resetAfterProductionHandoff() {
+    if (current != GpuChainedReturnState::A_SUBMITTED)
+        throw std::logic_error("D3A2 production handoff is not resettable");
+    current = GpuChainedReturnState::EMPTY;
+}
+
 GeneratedOutputReturnSession::GeneratedOutputReturnSession(
         backend::RuntimeGenerateDiagnosticResult&& result, const vk::RuntimeDevicePair& pair,
         vk::RuntimeExchangeEndpoint generation, vk::RuntimeExchangeEndpoint render,
@@ -649,6 +655,14 @@ GeneratedOutputReturnSession::releaseProductionGeneratedOutput(
     } catch (...) {
         return backend::RuntimeRetirementStatus::FAILED;
     }
+}
+
+void GeneratedOutputReturnSession::resetAfterProductionHandoff() {
+    if (aReadbackPending.valid() || delayedGeneration.valid()
+            || delayedBackend || delayedBackendSession)
+        throw std::logic_error("D3A2 production authority remains in the return session");
+    chainedStates.resetAfterProductionHandoff();
+    operationLifetime = std::make_shared<const uint8_t>(0);
 }
 
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <array>
 #include <vector>
 
 #include <vulkan/vulkan_core.h>
@@ -77,6 +78,10 @@ struct D3B2InsertionPath {
     std::function<VkResult(const D3B2HiddenImage&, VkSemaphore)> present;
     std::function<VkResult(const D3B2HiddenImage&, VkSemaphore, VkFence)> presentWithFence;
     std::function<bool()> waitGraphicsFence;
+    // Production nonblocking retirement probe.  The legacy synchronous D3B2
+    // diagnostic keeps waitGraphicsFence; asynchronous D3B3 composition must
+    // bind this callback instead.
+    std::function<VkResult()> tryRetireGraphicsFence;
     std::function<bool()> generatedIntegrity;
     std::function<bool()> originalIdentity;
     std::function<void()> retire;
@@ -109,5 +114,27 @@ struct D3B2InsertionPath {
 
 void validateD3B2InsertionPreflight(const D3B2InsertionPath&);
 VkResult executeD3B2Insertion(D3B2InsertionPath&);
+
+struct D3B2PendingInsertion {
+    std::array<D3B2HiddenImage, 2> images{};
+    std::array<D3B2ImageState, 2> imageStates{
+        D3B2ImageState::NOT_ACQUIRED, D3B2ImageState::NOT_ACQUIRED};
+    VkResult presentResult{VK_SUCCESS};
+    bool submitAccepted{};
+    bool completed{};
+};
+
+/// Submit the existing D3B2 terminal algorithm through both QueuePresent
+/// calls, but do not wait for its graphics fence.
+VkResult submitD3B2InsertionNonblocking(
+    D3B2InsertionPath&, D3B2PendingInsertion&);
+
+enum class D3B2RetirementResult : uint8_t {
+    RETIRED, NOT_READY, DEVICE_LOST, FAILED
+};
+
+/// Observe graphics retirement without a host wait and finish validation.
+[[nodiscard]] D3B2RetirementResult tryRetireD3B2Insertion(
+    D3B2InsertionPath&, D3B2PendingInsertion&);
 
 }

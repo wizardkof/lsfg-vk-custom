@@ -164,3 +164,13 @@ const backend::ReturnedGeneratedOperation*
 D3B3ProductionCoreOwner::returnedOperation() const noexcept {
     return returned ? &*returned : nullptr;
 }
+
+backend::ReturnedGeneratedOperation
+D3B3ProductionCoreOwner::takeReturnedOperation() {
+    if (!returned || !returned->terminalReady())
+        throw std::logic_error("D3B3 returned operation is not terminal-ready");
+    auto value = std::move(*returned);
+    returned.reset();
+    returnSession->resetAfterProductionHandoff();
+    return value;
+}

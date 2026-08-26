@@ -5,8 +5,117 @@
 #include <utility>
 
 #include <stdexcept>
+#include <ranges>
 
 namespace lsfgvk::layer {
+
+ApplicationPresentWaitAuthority::ApplicationPresentWaitAuthority(
+        std::vector<VkSemaphore> waits, uint64_t epoch, uintptr_t scope) :
+    values(std::move(waits)), epochValue(epoch), scopeValue(scope) {
+    if (!valid())
+        throw std::invalid_argument("invalid application present-wait authority");
+}
+
+ApplicationPresentWaitAuthority::ApplicationPresentWaitAuthority(
+        ApplicationPresentWaitAuthority&& other) noexcept :
+    values(std::move(other.values)), epochValue(std::exchange(other.epochValue, 0)),
+    scopeValue(std::exchange(other.scopeValue, 0)), current(other.current) {
+    other.current = ApplicationPresentWaitState::FAILED;
+}
+
+ApplicationPresentWaitAuthority& ApplicationPresentWaitAuthority::operator=(
+        ApplicationPresentWaitAuthority&& other) noexcept {
+    if (this == &other) return *this;
+    values = std::move(other.values);
+    epochValue = std::exchange(other.epochValue, 0);
+    scopeValue = std::exchange(other.scopeValue, 0);
+    current = other.current;
+    other.current = ApplicationPresentWaitState::FAILED;
+    return *this;
+}
+
+bool ApplicationPresentWaitAuthority::valid() const noexcept {
+    if (current != ApplicationPresentWaitState::AVAILABLE
+            || epochValue == 0 || scopeValue == 0)
+        return false;
+    for (const auto wait : values)
+        if (wait == VK_NULL_HANDLE)
+            return false;
+    return true;
+}
+
+void ApplicationPresentWaitAuthority::bridgeAccepted() {
+    if (!valid())
+        throw std::logic_error("application present waits were already consumed");
+    current = ApplicationPresentWaitState::BRIDGED;
+}
+
+D3B3OriginalReadyAuthority::D3B3OriginalReadyAuthority(
+        VkSemaphore semaphore, uint64_t epoch, uintptr_t scope) :
+    semaphoreValue(semaphore), epochValue(epoch), scopeValue(scope) {
+    if (semaphore == VK_NULL_HANDLE || epoch == 0 || scope == 0)
+        throw std::invalid_argument("invalid bridged original-ready authority");
+    readiness.signalSubmitted(epoch);
+}
+
+D3B3OriginalReadyAuthority::D3B3OriginalReadyAuthority(
+        D3B3OriginalReadyAuthority&& other) noexcept :
+    semaphoreValue(std::exchange(other.semaphoreValue, VK_NULL_HANDLE)),
+    epochValue(std::exchange(other.epochValue, 0)),
+    scopeValue(std::exchange(other.scopeValue, 0)),
+    readiness(std::move(other.readiness)) {}
+
+D3B3OriginalReadyAuthority& D3B3OriginalReadyAuthority::operator=(
+        D3B3OriginalReadyAuthority&& other) noexcept {
+    if (this == &other) return *this;
+    semaphoreValue = std::exchange(other.semaphoreValue, VK_NULL_HANDLE);
+    epochValue = std::exchange(other.epochValue, 0);
+    scopeValue = std::exchange(other.scopeValue, 0);
+    readiness = std::move(other.readiness);
+    return *this;
+}
+
+bool D3B3OriginalReadyAuthority::valid() const noexcept {
+    return semaphoreValue != VK_NULL_HANDLE && epochValue != 0 && scopeValue != 0
+        && readiness.state() == backend::RuntimeBinarySemaphoreState::SIGNAL_SUBMITTED;
+}
+
+void D3B3OriginalReadyAuthority::waitSubmitted() {
+    readiness.waitSubmitted(epochValue);
+}
+
+void D3B3OriginalReadyAuthority::waitRetired() {
+    readiness.waitRetired(epochValue);
+}
+
+ApplicationPresentWaitBridgeResult bridgeApplicationPresentWaits(
+        ApplicationPresentWaitAuthority& input, VkQueue queue,
+        const std::vector<VkSemaphore>& signals, VkSemaphore originalReadyTarget,
+        const std::function<VkResult(VkQueue, const VkSubmitInfo&)>& queueSubmit) {
+    if (!input.valid() || queue == VK_NULL_HANDLE || signals.empty() || !queueSubmit
+            || (originalReadyTarget != VK_NULL_HANDLE
+                && std::ranges::find(signals, originalReadyTarget) == signals.end()))
+        return {.result = VK_ERROR_INITIALIZATION_FAILED};
+    std::vector<VkPipelineStageFlags> stages(
+        input.waits().size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    const VkSubmitInfo submit{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .waitSemaphoreCount = static_cast<uint32_t>(input.waits().size()),
+        .pWaitSemaphores = input.waits().empty() ? nullptr : input.waits().data(),
+        .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
+        .commandBufferCount = 0, .pCommandBuffers = nullptr,
+        .signalSemaphoreCount = static_cast<uint32_t>(signals.size()),
+        .pSignalSemaphores = signals.data()};
+    const auto result = queueSubmit(queue, submit);
+    if (result != VK_SUCCESS)
+        return {.result = result};
+    input.bridgeAccepted();
+    ApplicationPresentWaitBridgeResult bridged;
+    bridged.result = VK_SUCCESS;
+    if (originalReadyTarget != VK_NULL_HANDLE)
+        bridged.originalReady = D3B3OriginalReadyAuthority(
+            originalReadyTarget, input.epoch(), input.scope());
+    return bridged;
+}
 
 D3B3PairOperation::D3B3PairOperation(
         backend::ReturnedGeneratedOperation&& value,
@@ -14,25 +123,37 @@ D3B3PairOperation::D3B3PairOperation(
         D3B3PairTerminalDispatch terminal) :
     returned(std::move(value)), original(std::move(source)),
     dispatch(std::move(terminal)) {
+    const bool blockingPresentRetirement = dispatch.retireGeneratedPresentFence
+        && dispatch.retireOriginalPresentFence;
+    const bool nonblockingPresentRetirement = dispatch.tryRetireGeneratedPresentFence
+        && dispatch.tryRetireOriginalPresentFence;
     if (!returned.valid() || !original.valid() || !dispatch.build
-            || !dispatch.retireGeneratedPresentFence
-            || !dispatch.retireOriginalPresentFence)
+            || !dispatch.originalReadyAuthority
+            || !dispatch.originalReadyAuthority->valid()
+            || (!blockingPresentRetirement && !nonblockingPresentRetirement))
         throw std::invalid_argument("invalid D3B3 Pair1 terminal authorities");
 
     const auto pair = returned.identity();
     if (!backend::validTemporalPair(pair)
             || pair.newerFrameId != original.source().frameId
+            || dispatch.originalReadyAuthority->epoch() != pair.generationId
+            || dispatch.originalReadyAuthority->scope()
+                != original.source().authorityScope
             || !returned.terminalReady())
         throw std::invalid_argument("D3B3 Pair1 requires terminal-ready B0C authorities");
 
     returnedForGraphics.signalSubmitted(pair.generationId);
+    originalReady = std::move(*dispatch.originalReadyAuthority);
+    dispatch.originalReadyAuthority.reset();
 }
 
 D3B3PairOperation::D3B3PairOperation(D3B3PairOperation&& other) noexcept :
     returned(std::move(other.returned)), original(std::move(other.original)),
     dispatch(std::move(other.dispatch)),
     returnedForGraphics(std::move(other.returnedForGraphics)),
-    terminalPath(std::move(other.terminalPath)), terminalState(other.terminalState),
+    originalReady(std::move(other.originalReady)),
+    terminalPath(std::move(other.terminalPath)),
+    terminalPending(std::move(other.terminalPending)), terminalState(other.terminalState),
     current(other.current), generatedPresentSubmitted(other.generatedPresentSubmitted),
     originalPresentSubmitted(other.originalPresentSubmitted),
     generatedPresentRetiredValue(other.generatedPresentRetiredValue),
@@ -51,7 +172,9 @@ D3B3PairOperation& D3B3PairOperation::operator=(D3B3PairOperation&& other) noexc
     original = std::move(other.original);
     dispatch = std::move(other.dispatch);
     returnedForGraphics = std::move(other.returnedForGraphics);
+    originalReady = std::move(other.originalReady);
     terminalPath = std::move(other.terminalPath);
+    terminalPending = std::move(other.terminalPending);
     terminalState = other.terminalState;
     current = other.current;
     generatedPresentSubmitted = other.generatedPresentSubmitted;
@@ -82,7 +205,7 @@ void D3B3PairOperation::preflight() {
                 || view.sourceQueueFamily() == VK_QUEUE_FAMILY_IGNORED
                 || view.destinationQueueFamily() == VK_QUEUE_FAMILY_IGNORED
                 || original.source().queueFamily == VK_QUEUE_FAMILY_IGNORED
-                || dispatch.originalReady == VK_NULL_HANDLE)
+                || !originalReady.valid())
             throw std::runtime_error("D3B3 Pair1 source preflight failed");
 
         const D3B2Source generated{
@@ -102,7 +225,7 @@ void D3B3PairOperation::preflight() {
         auto& path = *terminalPath;
         path.generated = generated;
         path.original = originalSource;
-        path.originalReady = dispatch.originalReady;
+        path.originalReady = originalReady.semaphore();
         path.returnedForGraphics = returned.returnedReady();
         path.state = &terminalState;
         if (!path.presentFences.enabled() || !path.presentWithFence
@@ -124,13 +247,36 @@ void D3B3PairOperation::submitTerminal() {
         throw std::logic_error("D3B3 Pair1 terminal submit is not preflighted");
     current = D3B3PairState::TERMINAL_SUBMIT_PENDING;
     try {
-        static_cast<void>(executeD3B2Insertion(*terminalPath));
-        if (current != D3B3PairState::GRAPHICS_RETIRED)
-            throw std::logic_error("D3B3 Pair1 terminal did not retire its graphics waiter");
+        if (terminalPath->tryRetireGraphicsFence) {
+            terminalPending.emplace();
+            static_cast<void>(submitD3B2InsertionNonblocking(
+                *terminalPath, *terminalPending));
+            if (current != D3B3PairState::PRESENTS_SUBMITTED)
+                throw std::logic_error("D3B3 Pair1 terminal submit did not publish presents");
+        } else {
+            static_cast<void>(executeD3B2Insertion(*terminalPath));
+            if (current != D3B3PairState::GRAPHICS_RETIRED)
+                throw std::logic_error("D3B3 Pair1 terminal did not retire its graphics waiter");
+        }
     } catch (...) {
         fail();
         throw;
     }
+}
+
+D3B2RetirementResult D3B3PairOperation::tryRetireTerminal() {
+    if (current == D3B3PairState::GRAPHICS_RETIRED
+            || current == D3B3PairState::PRESENTS_RETIRED
+            || current == D3B3PairState::PAIR_RETIRED)
+        return D3B2RetirementResult::RETIRED;
+    if (current != D3B3PairState::PRESENTS_SUBMITTED
+            || !terminalPath || !terminalPending)
+        return D3B2RetirementResult::FAILED;
+    const auto result = tryRetireD3B2Insertion(*terminalPath, *terminalPending);
+    if (result == D3B2RetirementResult::FAILED
+            || result == D3B2RetirementResult::DEVICE_LOST)
+        fail();
+    return result;
 }
 
 bool D3B3PairOperation::tryRetireAReturn() {
@@ -162,6 +308,40 @@ void D3B3PairOperation::retirePresentWaits() {
 
 }
 
+D3B2RetirementResult D3B3PairOperation::tryRetirePresentWaits() {
+    if (current == D3B3PairState::PRESENTS_RETIRED)
+        return D3B2RetirementResult::RETIRED;
+    if (current != D3B3PairState::GRAPHICS_RETIRED
+            || !dispatch.tryRetireGeneratedPresentFence
+            || !dispatch.tryRetireOriginalPresentFence)
+        return D3B2RetirementResult::FAILED;
+    try {
+        if (!generatedPresentRetiredValue) {
+            const auto result = dispatch.tryRetireGeneratedPresentFence();
+            if (result == D3B2RetirementResult::FAILED
+                    || result == D3B2RetirementResult::DEVICE_LOST)
+                fail();
+            if (result != D3B2RetirementResult::RETIRED)
+                return result;
+            generatedPresentRetiredValue = true;
+        }
+        if (!originalPresentRetiredValue) {
+            const auto result = dispatch.tryRetireOriginalPresentFence();
+            if (result == D3B2RetirementResult::FAILED
+                    || result == D3B2RetirementResult::DEVICE_LOST)
+                fail();
+            if (result != D3B2RetirementResult::RETIRED)
+                return result;
+            originalPresentRetiredValue = true;
+        }
+        current = D3B3PairState::PRESENTS_RETIRED;
+        return D3B2RetirementResult::RETIRED;
+    } catch (...) {
+        fail();
+        throw;
+    }
+}
+
 void D3B3PairOperation::retirePair() {
     if (current != D3B3PairState::PRESENTS_RETIRED
             || !generatedPresentRetiredValue || !originalPresentRetiredValue
@@ -174,6 +354,7 @@ void D3B3PairOperation::retirePair() {
         // operation until this point, even though both reads were already
         // proven complete at the graphics fence.
         original.release();
+        terminalPending.reset();
         terminalPath.reset();
         returned = {};
         current = D3B3PairState::PAIR_RETIRED;
@@ -218,6 +399,7 @@ void D3B3PairOperation::bindCallbacks() {
             throw std::logic_error("D3B3 Pair1 submit accepted out of order");
         returned.consumeReturnedForGraphics();
         returnedForGraphics.waitSubmitted(identity().generationId);
+        originalReady.waitSubmitted();
         original.terminalSubmitted();
         current = D3B3PairState::TERMINAL_SUBMITTED;
     };
@@ -244,6 +426,7 @@ void D3B3PairOperation::bindCallbacks() {
                 || current != D3B3PairState::PRESENTS_SUBMITTED)
             throw std::logic_error("D3B3 graphics retirement occurred out of order");
         returnedForGraphics.waitRetired(identity().generationId);
+        originalReady.waitRetired();
         original.terminalRetired();
         current = D3B3PairState::GRAPHICS_RETIRED;
     };

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "virtual_swapchain_runtime.hpp"
+#include "d3b3_production_seams.hpp"
 #include "d3b1_present_path.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 
@@ -150,37 +151,37 @@ void VirtualSwapchainRuntime::setPrePresentGate(PrePresentGate gate) {
 }
 
 VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
-        uint32_t imageIndex,
+        uint32_t imageIndex, uint64_t epoch,
         const std::vector<VkSemaphore>& waitSemaphores) const noexcept {
     if (sourceQueue == VK_NULL_HANDLE || imageIndex >= this->readySemaphores.size())
         return VK_ERROR_OUT_OF_DATE_KHR;
 
-    std::vector<VkPipelineStageFlags> stages(
-        waitSemaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     const auto ready = this->readySemaphores.at(imageIndex).handle();
     const auto originalReady = this->originalReadySemaphores.at(imageIndex).handle();
     const bool d3b2 = [] {
         const char* value = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
         return value && std::strcmp(value, "1") == 0;
     }();
-    const std::array<VkSemaphore, 2> signals{ready, originalReady};
-    const VkSubmitInfo submitInfo{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size()),
-        .pWaitSemaphores = waitSemaphores.empty() ? nullptr : waitSemaphores.data(),
-        .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
-        .commandBufferCount = 0,
-        .pCommandBuffers = nullptr,
-        .signalSemaphoreCount = d3b2 ? 2U : 1U,
-        .pSignalSemaphores = signals.data()
-    };
+    const std::vector<VkSemaphore> signals = d3b2
+        ? std::vector<VkSemaphore>{ready, originalReady}
+        : std::vector<VkSemaphore>{ready};
 
     // vkQueuePresentKHR requires host access to its queue to be externally
     // synchronized by the caller. The layer is executing inside that call, so
     // this bridge submit can safely consume the same present waits on the
     // application's source queue before returning control to the application.
-    return this->vk.get().df().QueueSubmit(
-        sourceQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    try {
+        ApplicationPresentWaitAuthority input(waitSemaphores, epoch,
+            reinterpret_cast<uintptr_t>(this));
+        return bridgeApplicationPresentWaits(input, sourceQueue, signals,
+            d3b2 ? originalReady : VK_NULL_HANDLE,
+            [this](VkQueue queue, const VkSubmitInfo& submit) {
+                return this->vk.get().df().QueueSubmit(
+                    queue, 1, &submit, VK_NULL_HANDLE);
+            }).result;
+    } catch (...) {
+        return VK_ERROR_UNKNOWN;
+    }
 }
 
 VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
@@ -254,7 +255,7 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
     // preserves vkQueuePresentKHR semaphore-consumption semantics while still
     // allowing the CPU call to return before WSI presentation is performed.
     const auto bridge = this->bridgePresentWaits(
-        sourceQueue, imageIndex, waitSemaphores);
+        sourceQueue, imageIndex, serial, waitSemaphores);
     if (bridge != VK_SUCCESS) {
         {
             const std::scoped_lock lock(this->jobsMutex);

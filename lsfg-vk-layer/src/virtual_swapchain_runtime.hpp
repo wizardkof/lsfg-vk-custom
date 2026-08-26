@@ -114,7 +114,7 @@ namespace lsfgvk::layer {
 
         [[nodiscard]] VkResult signalAcquire(VkSemaphore semaphore, VkFence fence) const noexcept;
         [[nodiscard]] VkResult bridgePresentWaits(VkQueue sourceQueue,
-            uint32_t imageIndex,
+            uint32_t imageIndex, uint64_t epoch,
             const std::vector<VkSemaphore>& waitSemaphores) const noexcept;
         void workerLoop(std::stop_token stopToken) noexcept;
         void finishCompletion(const std::shared_ptr<Completion>& completion,

@@ -134,4 +134,114 @@ VkResult executeD3B2Insertion(D3B2InsertionPath& path) {
     }
 }
 
+VkResult submitD3B2InsertionNonblocking(
+        D3B2InsertionPath& path, D3B2PendingInsertion& pending) {
+    if (!path.state || pending.submitAccepted || pending.completed
+            || *path.state == D3B2InsertionState::PASS
+            || *path.state == D3B2InsertionState::FAILED)
+        throw std::logic_error("D3B2 nonblocking insertion is not submit-ready");
+    try {
+        *path.state = D3B2InsertionState::PREFLIGHT;
+        validateD3B2InsertionPreflight(path);
+        if (!path.tryRetireGraphicsFence)
+            throw std::runtime_error("D3B2 nonblocking retirement probe is missing");
+        *path.state = D3B2InsertionState::GENERATED_READY;
+        pending.images[0] = path.acquire(path.acquireGenerated);
+        pending.imageStates[0] = D3B2ImageState::ACQUIRED_IDLE;
+        pending.images[1] = path.acquire(path.acquireOriginal);
+        pending.imageStates[1] = D3B2ImageState::ACQUIRED_IDLE;
+        if (!pending.images[0].image || !pending.images[1].image
+                || pending.images[0].index == pending.images[1].index)
+            throw std::runtime_error("D3B2 hidden acquire invariant failed");
+        path.distinctHiddenImages = true;
+        if (path.onDestinationsAcquired) path.onDestinationsAcquired();
+        *path.state = D3B2InsertionState::TWO_ACQUIRES_READY;
+        if (path.onRecordBegin) path.onRecordBegin();
+        path.record(pending.images[0], pending.images[1]);
+        if (path.onRecordEnd) path.onRecordEnd();
+        const auto submitResult = path.submitWithWaitStage
+            ? path.submitWithWaitStage(path.returnedForGraphicsWaitStage)
+            : path.submit();
+        if (submitResult != VK_SUCCESS)
+            throw ls::vulkan_error(submitResult, "D3B2 graphics submit failed");
+        pending.submitAccepted = true;
+        pending.imageStates.fill(D3B2ImageState::SUBMITTED_FOR_GRAPHICS);
+        *path.state = D3B2InsertionState::INSERT_SUBMITTED;
+        if (path.onTerminalSubmitAccepted) path.onTerminalSubmitAccepted();
+
+        pending.imageStates[0] = D3B2ImageState::PRESENT_CALL_ISSUED;
+        const auto generatedResult = path.presentFences.enabled() && path.presentWithFence
+            ? path.presentWithFence(pending.images[0], path.generatedPresentReady,
+                path.presentFences.generated)
+            : path.present(pending.images[0], path.generatedPresentReady);
+        if (generatedResult != VK_SUCCESS)
+            throw ls::vulkan_error(generatedResult, "D3B2 generated present failed");
+        pending.imageStates[0] = D3B2ImageState::PRESENT_ACQUISITION_RELEASED;
+        *path.state = D3B2InsertionState::GENERATED_PRESENTED;
+        if (path.onGeneratedPresentAccepted) path.onGeneratedPresentAccepted();
+
+        pending.imageStates[1] = D3B2ImageState::PRESENT_CALL_ISSUED;
+        pending.presentResult = path.presentFences.enabled() && path.presentWithFence
+            ? path.presentWithFence(pending.images[1], path.originalPresentReady,
+                path.presentFences.original)
+            : path.present(pending.images[1], path.originalPresentReady);
+        if (pending.presentResult != VK_SUCCESS)
+            throw ls::vulkan_error(pending.presentResult, "D3B2 original present failed");
+        pending.imageStates[1] = D3B2ImageState::PRESENT_ACQUISITION_RELEASED;
+        *path.state = D3B2InsertionState::ORIGINAL_PRESENTED;
+        if (path.onOriginalPresentAccepted) path.onOriginalPresentAccepted();
+        return pending.presentResult;
+    } catch (...) {
+        // Before QueueSubmit acceptance maintenance1 can safely release any
+        // acquired image.  After acceptance, keep every authority live and
+        // sticky-failed; no host wait is introduced to manufacture cleanup.
+        if (!pending.submitAccepted) {
+            std::vector<uint32_t> outstanding;
+            for (size_t i = 0; i < pending.imageStates.size(); ++i)
+                if (pending.imageStates[i] == D3B2ImageState::ACQUIRED_IDLE)
+                    outstanding.push_back(pending.images[i].index);
+            if (!outstanding.empty())
+                static_cast<void>(path.releaseAcquiredImages(outstanding));
+            if (path.retire) path.retire();
+        }
+        *path.state = D3B2InsertionState::FAILED;
+        throw;
+    }
+}
+
+D3B2RetirementResult tryRetireD3B2Insertion(
+        D3B2InsertionPath& path, D3B2PendingInsertion& pending) {
+    if (!path.state || !pending.submitAccepted || pending.completed
+            || *path.state != D3B2InsertionState::ORIGINAL_PRESENTED
+            || !path.tryRetireGraphicsFence)
+        return D3B2RetirementResult::FAILED;
+    VkResult status{};
+    try { status = path.tryRetireGraphicsFence(); }
+    catch (...) { *path.state = D3B2InsertionState::FAILED; return D3B2RetirementResult::FAILED; }
+    if (status == VK_NOT_READY || status == VK_TIMEOUT)
+        return D3B2RetirementResult::NOT_READY;
+    if (status == VK_ERROR_DEVICE_LOST) {
+        *path.state = D3B2InsertionState::FAILED;
+        return D3B2RetirementResult::DEVICE_LOST;
+    }
+    if (status != VK_SUCCESS) {
+        *path.state = D3B2InsertionState::FAILED;
+        return D3B2RetirementResult::FAILED;
+    }
+    try {
+        if (path.onGraphicsFenceRetired) path.onGraphicsFenceRetired();
+        *path.state = D3B2InsertionState::VALIDATING;
+        if (!path.generatedIntegrity() || !path.originalIdentity())
+            throw std::runtime_error("D3B2 terminal validation failed");
+        if (path.retire) path.retire();
+        pending.completed = true;
+        *path.state = D3B2InsertionState::PASS;
+        if (path.emitMarker) path.emitMarker();
+        return D3B2RetirementResult::RETIRED;
+    } catch (...) {
+        *path.state = D3B2InsertionState::FAILED;
+        return D3B2RetirementResult::FAILED;
+    }
+}
+
 }

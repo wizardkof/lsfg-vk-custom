@@ -36,6 +36,39 @@ D3B3FiniteProductionOperations inertOperations() {
     return operations;
 }
 
+D3B3AsyncFiniteOperations inertAsyncOperations() {
+    D3B3AsyncFiniteOperations operations;
+    operations.submitIngest = [](uint64_t, lsfgvk::backend::TemporalSourceSlot, bool) {
+        return 1;
+    };
+    operations.tryRetireIngest = [] { return D3B3RetirementStatus::RETIRED; };
+    operations.presentWarmupOriginal = [](uint64_t) { return true; };
+    operations.submitGenerate = [](lsfgvk::backend::RuntimeTemporalPairIdentity) {
+        return true;
+    };
+    operations.tryRetireGenerate = [] {
+        return lsfgvk::backend::RuntimeRetirementStatus::RETIRED;
+    };
+    operations.submitBReturn = [] {};
+    operations.tryRetireBReturn = [] {
+        return lsfgvk::backend::RuntimeRetirementStatus::RETIRED;
+    };
+    operations.submitAReturn = [](lsfgvk::backend::RuntimeTemporalPairIdentity) {};
+    operations.releaseGeneratedOutput = [] {
+        return lsfgvk::backend::RuntimeRetirementStatus::RETIRED;
+    };
+    operations.takeReturnedOperation = [] {
+        return lsfgvk::backend::ReturnedGeneratedOperation{};
+    };
+    operations.makeOriginal = [](const lsfgvk::backend::RuntimeTemporalPairIdentity&) {
+        return D3B3OriginalSourceAuthority{};
+    };
+    operations.makeTerminal = [](const lsfgvk::backend::RuntimeTemporalPairIdentity&) {
+        return D3B3PairTerminalDispatch{};
+    };
+    return operations;
+}
+
 struct Fixture {
     vk::RuntimeDevicePair pair{};
     vk::RuntimeExchangeEndpoint generation{};
@@ -98,6 +131,10 @@ int main() {
         },
         .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
             return [] { return true; };
+        },
+        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
+                const D3B3PerSwapchainRuntimeDescriptor&) {
+            return inertAsyncOperations();
         }};
 
     auto first = factory.create(fixture.descriptor(0x100, 1), assembly);
@@ -123,6 +160,10 @@ int main() {
         },
         .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
             return [] { return true; };
+        },
+        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
+                const D3B3PerSwapchainRuntimeDescriptor&) {
+            return inertAsyncOperations();
         }};
     try {
         (void)factory.recreate(fixture.descriptor(0x200, 3), failing);
@@ -148,6 +189,10 @@ int main() {
                 const D3B3PerSwapchainRuntimeDescriptor&) { return inertOperations(); },
         .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
             return [] { return false; };
+        },
+        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
+                const D3B3PerSwapchainRuntimeDescriptor&) {
+            return inertAsyncOperations();
         }};
     auto pending = activeFactory.create(fixture.descriptor(0x300, 1), active);
     assert(!activeFactory.destroy(handle(0x300)));
@@ -156,4 +201,85 @@ int main() {
         assert(false);
     } catch (const std::logic_error&) {}
     assert(activeFactory.find(handle(0x300)) == pending);
+
+    // Two owners independently reach the fully GPU-chained pre-Pair point.
+    // Polling or invalid input for one owner cannot advance the other, and an
+    // active owner cannot be destroyed or recreated.
+    D3B3PerSwapchainRuntimeFactory concurrentFactory;
+    auto left = concurrentFactory.create(fixture.descriptor(0x400, 1), assembly);
+    auto right = concurrentFactory.create(fixture.descriptor(0x500, 1), assembly);
+    for (const uint64_t frame : {uint64_t{'A'}, uint64_t{'B'}}) {
+        assert(left->asyncComposition().processFrame(frame) == D3B3AsyncProgress::PENDING);
+        assert(right->asyncComposition().processFrame(frame) == D3B3AsyncProgress::PENDING);
+        assert(left->asyncComposition().processFrame(frame) == D3B3AsyncProgress::ACCEPTED);
+        assert(right->asyncComposition().processFrame(frame) == D3B3AsyncProgress::ACCEPTED);
+    }
+    assert(left->asyncComposition().processFrame(uint64_t{'C'})
+        == D3B3AsyncProgress::PENDING);
+    assert(left->asyncComposition().phase() == D3B3PrePairPhase::A_RETURN_SUBMITTED);
+    assert(right->asyncComposition().phase() == D3B3PrePairPhase::IDLE);
+    assert(right->asyncComposition().processFrame(uint64_t{'C'})
+        == D3B3AsyncProgress::PENDING);
+    assert(right->asyncComposition().phase() == D3B3PrePairPhase::A_RETURN_SUBMITTED);
+    const auto leftCounts = left->asyncComposition().counters();
+    const auto rightCounts = right->asyncComposition().counters();
+    assert(leftCounts.generateSubmits == 1 && leftCounts.bReturnSubmits == 1
+        && leftCounts.aReturnSubmits == 1);
+    assert(rightCounts.generateSubmits == 1 && rightCounts.bReturnSubmits == 1
+        && rightCounts.aReturnSubmits == 1);
+    assert(!concurrentFactory.destroy(handle(0x400)));
+    try {
+        (void)concurrentFactory.recreate(fixture.descriptor(0x400, 2), assembly);
+        assert(false);
+    } catch (const std::logic_error&) {}
+    assert(concurrentFactory.find(handle(0x400)) == left);
+    assert(concurrentFactory.find(handle(0x500)) == right);
+
+    enum class SubmitFailure { Generate, BReturn, AReturn };
+    for (const auto failure : {SubmitFailure::Generate, SubmitFailure::BReturn,
+            SubmitFailure::AReturn}) {
+        auto operations = inertAsyncOperations();
+        operations.submitGenerate = [failure](auto) {
+            return failure != SubmitFailure::Generate;
+        };
+        operations.submitBReturn = [failure] {
+            if (failure == SubmitFailure::BReturn)
+                throw std::runtime_error("B-return rejected");
+        };
+        operations.submitAReturn = [failure](auto) {
+            if (failure == SubmitFailure::AReturn)
+                throw std::runtime_error("A-return rejected");
+        };
+        D3B3AsyncFiniteComposition composition(std::move(operations));
+        for (const uint64_t frame : {uint64_t{'A'}, uint64_t{'B'}}) {
+            assert(composition.processFrame(frame) == D3B3AsyncProgress::PENDING);
+            assert(composition.processFrame(frame) == D3B3AsyncProgress::ACCEPTED);
+        }
+        assert(composition.processFrame(uint64_t{'C'}) == D3B3AsyncProgress::FAILED);
+        assert(composition.phase() == D3B3PrePairPhase::FAILED);
+        const auto counts = composition.counters();
+        assert(counts.generateSubmits
+            == (failure == SubmitFailure::Generate ? 0u : 1u));
+        assert(counts.bReturnSubmits
+            == (failure == SubmitFailure::AReturn ? 1u : 0u));
+        assert(counts.aReturnSubmits == 0);
+        assert(composition.processFrame(uint64_t{'C'}) == D3B3AsyncProgress::FAILED);
+    }
+
+    auto deviceLostOperations = inertAsyncOperations();
+    deviceLostOperations.tryRetireGenerate = [] {
+        return lsfgvk::backend::RuntimeRetirementStatus::DEVICE_LOST;
+    };
+    deviceLostOperations.tryRetireBReturn = [] {
+        return lsfgvk::backend::RuntimeRetirementStatus::NOT_READY;
+    };
+    D3B3AsyncFiniteComposition lost(std::move(deviceLostOperations));
+    for (const uint64_t frame : {uint64_t{'A'}, uint64_t{'B'}}) {
+        assert(lost.processFrame(frame) == D3B3AsyncProgress::PENDING);
+        assert(lost.processFrame(frame) == D3B3AsyncProgress::ACCEPTED);
+    }
+    assert(lost.processFrame(uint64_t{'C'}) == D3B3AsyncProgress::PENDING);
+    assert(lost.processFrame(uint64_t{'C'}) == D3B3AsyncProgress::DEVICE_LOST);
+    assert(lost.phase() == D3B3PrePairPhase::FAILED);
+    assert(lost.processFrame(uint64_t{'C'}) == D3B3AsyncProgress::FAILED);
 }

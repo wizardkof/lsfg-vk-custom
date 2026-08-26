@@ -132,6 +132,7 @@ namespace lsfgvk::layer {
     class GpuChainedReturnStateMachine {
     public:
         void advance(GpuChainedReturnState expected, GpuChainedReturnState next);
+        void resetAfterProductionHandoff();
         void fail() noexcept { current = GpuChainedReturnState::FAILED; }
         [[nodiscard]] GpuChainedReturnState state() const noexcept { return current; }
         [[nodiscard]] bool markerReady() const noexcept {
@@ -205,6 +206,7 @@ namespace lsfgvk::layer {
         [[nodiscard]] backend::RuntimeRetirementStatus
             releaseProductionGeneratedOutput(backend::ReturnedGeneratedOperation&,
                 backend::Instance&, backend::RuntimeGenerateSession&);
+        void resetAfterProductionHandoff();
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeGeneratedBReturnPending submitShadowBReturnForTesting(
             backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,

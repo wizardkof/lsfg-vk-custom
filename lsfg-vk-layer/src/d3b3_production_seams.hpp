@@ -25,7 +25,77 @@ struct CurrentOriginalFrame {
     uint32_t queueFamily{VK_QUEUE_FAMILY_IGNORED};
     uint32_t virtualImageIndex{};
     uint64_t frameId{};
+    uintptr_t authorityScope{};
 };
+
+enum class ApplicationPresentWaitState : uint8_t { AVAILABLE, BRIDGED, FAILED };
+
+struct ApplicationPresentWaitBridgeResult;
+
+class ApplicationPresentWaitAuthority {
+public:
+    ApplicationPresentWaitAuthority(std::vector<VkSemaphore> waits,
+        uint64_t epoch, uintptr_t scope);
+    ApplicationPresentWaitAuthority(const ApplicationPresentWaitAuthority&) = delete;
+    ApplicationPresentWaitAuthority& operator=(const ApplicationPresentWaitAuthority&) = delete;
+    ApplicationPresentWaitAuthority(ApplicationPresentWaitAuthority&&) noexcept;
+    ApplicationPresentWaitAuthority& operator=(ApplicationPresentWaitAuthority&&) noexcept;
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] const std::vector<VkSemaphore>& waits() const noexcept { return values; }
+    [[nodiscard]] uint64_t epoch() const noexcept { return epochValue; }
+    [[nodiscard]] uintptr_t scope() const noexcept { return scopeValue; }
+    [[nodiscard]] ApplicationPresentWaitState state() const noexcept { return current; }
+private:
+    friend class D3B3OriginalReadyAuthority;
+    friend struct ApplicationPresentWaitBridgeResult;
+    friend ApplicationPresentWaitBridgeResult bridgeApplicationPresentWaits(
+        ApplicationPresentWaitAuthority&, VkQueue, const std::vector<VkSemaphore>&,
+        VkSemaphore, const std::function<VkResult(VkQueue, const VkSubmitInfo&)>&);
+    void bridgeAccepted();
+    std::vector<VkSemaphore> values;
+    uint64_t epochValue{};
+    uintptr_t scopeValue{};
+    ApplicationPresentWaitState current{ApplicationPresentWaitState::AVAILABLE};
+};
+
+class D3B3OriginalReadyAuthority {
+public:
+    D3B3OriginalReadyAuthority() noexcept = default;
+    D3B3OriginalReadyAuthority(const D3B3OriginalReadyAuthority&) = delete;
+    D3B3OriginalReadyAuthority& operator=(const D3B3OriginalReadyAuthority&) = delete;
+    D3B3OriginalReadyAuthority(D3B3OriginalReadyAuthority&&) noexcept;
+    D3B3OriginalReadyAuthority& operator=(D3B3OriginalReadyAuthority&&) noexcept;
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] VkSemaphore semaphore() const noexcept { return semaphoreValue; }
+    [[nodiscard]] uint64_t epoch() const noexcept { return epochValue; }
+    [[nodiscard]] uintptr_t scope() const noexcept { return scopeValue; }
+    void waitSubmitted();
+    void waitRetired();
+    [[nodiscard]] backend::RuntimeBinarySemaphoreState state() const noexcept {
+        return readiness.state();
+    }
+private:
+    friend struct ApplicationPresentWaitBridgeResult;
+    friend ApplicationPresentWaitBridgeResult bridgeApplicationPresentWaits(
+        ApplicationPresentWaitAuthority&, VkQueue, const std::vector<VkSemaphore>&,
+        VkSemaphore, const std::function<VkResult(VkQueue, const VkSubmitInfo&)>&);
+    D3B3OriginalReadyAuthority(VkSemaphore, uint64_t, uintptr_t);
+    VkSemaphore semaphoreValue{};
+    uint64_t epochValue{};
+    uintptr_t scopeValue{};
+    backend::RuntimeBinarySemaphoreEpoch readiness;
+};
+
+struct ApplicationPresentWaitBridgeResult {
+    VkResult result{VK_ERROR_UNKNOWN};
+    std::optional<D3B3OriginalReadyAuthority> originalReady;
+};
+
+[[nodiscard]] ApplicationPresentWaitBridgeResult bridgeApplicationPresentWaits(
+    ApplicationPresentWaitAuthority&, VkQueue,
+    const std::vector<VkSemaphore>& signalSemaphores,
+    VkSemaphore originalReadyTarget,
+    const std::function<VkResult(VkQueue, const VkSubmitInfo&)>& queueSubmit);
 
 enum class D3B3OriginalSourceState : uint8_t {
     AVAILABLE, TERMINAL_SUBMITTED, TERMINAL_RETIRED, RELEASED, FAILED
@@ -160,11 +230,13 @@ enum class D3B3PairState : uint8_t {
 };
 
 struct D3B3PairTerminalDispatch {
-    VkSemaphore originalReady{};
+    std::optional<D3B3OriginalReadyAuthority> originalReadyAuthority;
     std::function<D3B2InsertionPath(
         D3B2Source generated, D3B2Source original, VkSemaphore returnedForGraphics)> build;
     std::function<void()> retireGeneratedPresentFence;
     std::function<void()> retireOriginalPresentFence;
+    std::function<D3B2RetirementResult()> tryRetireGeneratedPresentFence;
+    std::function<D3B2RetirementResult()> tryRetireOriginalPresentFence;
 };
 
 class D3B3PairOperation {
@@ -192,6 +264,12 @@ public:
     }
     [[nodiscard]] backend::RuntimeBinarySemaphoreState returnedForGraphicsState() const noexcept {
         return returnedForGraphics.state();
+    }
+    [[nodiscard]] backend::RuntimeBinarySemaphoreState originalReadyState() const noexcept {
+        return originalReady.state();
+    }
+    [[nodiscard]] VkSemaphore originalReadySemaphore() const noexcept {
+        return originalReady.semaphore();
     }
     [[nodiscard]] bool returnedForGraphicsReusable() const noexcept {
         return returnedForGraphics.state()
@@ -228,8 +306,10 @@ public:
 
     void preflight();
     void submitTerminal();
+    [[nodiscard]] D3B2RetirementResult tryRetireTerminal();
     [[nodiscard]] bool tryRetireAReturn();
     void retirePresentWaits();
+    [[nodiscard]] D3B2RetirementResult tryRetirePresentWaits();
     void retirePair();
     void rejectReturnedForGraphicsReuse() const;
 
@@ -241,7 +321,9 @@ private:
     D3B3OriginalSourceAuthority original;
     D3B3PairTerminalDispatch dispatch;
     backend::RuntimeBinarySemaphoreEpoch returnedForGraphics;
+    D3B3OriginalReadyAuthority originalReady;
     std::optional<D3B2InsertionPath> terminalPath;
+    std::optional<D3B2PendingInsertion> terminalPending;
     D3B2InsertionState terminalState{D3B2InsertionState::INACTIVE};
     D3B3PairState current{D3B3PairState::NON_TERMINAL_READY};
     bool generatedPresentSubmitted{};

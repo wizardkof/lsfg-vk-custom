@@ -116,5 +116,58 @@ int main() {
         else
             assert(releaseCalls == 1 && releaseImages == 2);
     }
+
+    // Production path: submit/presents are one-shot, while retirement is
+    // observed by repeated nonblocking fence-status polls.
+    state = D3B2InsertionState::INACTIVE;
+    acquires = submits = presents = markers = 0;
+    int polls = 0;
+    VkResult fenceStatus = VK_NOT_READY;
+    path.acquire = [&](VkSemaphore) {
+        ++acquires;
+        return D3B2HiddenImage{h<VkImage>(40 + acquires),
+            static_cast<uint32_t>(acquires), {500, 500}};
+    };
+    path.record = [](const auto&, const auto&) {};
+    path.submit = [&] { ++submits; return VK_SUCCESS; };
+    path.present = [&](const auto&, VkSemaphore) { ++presents; return VK_SUCCESS; };
+    path.tryRetireGraphicsFence = [&] { ++polls; return fenceStatus; };
+    path.generatedIntegrity = [] { return true; };
+    path.originalIdentity = [] { return true; };
+    path.retire = [] {};
+    path.emitMarker = [&] { ++markers; };
+    D3B2PendingInsertion pending;
+    assert(submitD3B2InsertionNonblocking(path, pending) == VK_SUCCESS);
+    assert(pending.submitAccepted && submits == 1 && presents == 2);
+    for (int retry = 0; retry < 3; ++retry)
+        assert(tryRetireD3B2Insertion(path, pending)
+            == D3B2RetirementResult::NOT_READY);
+    assert(submits == 1 && presents == 2 && polls == 3 && markers == 0);
+    fenceStatus = VK_SUCCESS;
+    assert(tryRetireD3B2Insertion(path, pending) == D3B2RetirementResult::RETIRED);
+    assert(state == D3B2InsertionState::PASS && markers == 1);
+    assert(tryRetireD3B2Insertion(path, pending) == D3B2RetirementResult::FAILED);
+
+    // An accepted submit followed by present failure remains sticky and is
+    // never converted into maintenance-release cleanup or a blocking wait.
+    state = D3B2InsertionState::INACTIVE;
+    int stickyReleases = 0;
+    submits = presents = 0;
+    path.present = [&](const auto&, VkSemaphore semaphore) {
+        ++presents;
+        return semaphore == path.originalPresentReady
+            ? VK_ERROR_OUT_OF_DATE_KHR : VK_SUCCESS;
+    };
+    path.releaseAcquiredImages = [&](const std::vector<uint32_t>&) {
+        ++stickyReleases;
+        return VK_SUCCESS;
+    };
+    D3B2PendingInsertion acceptedFailure;
+    bool postSubmitFailed{};
+    try { static_cast<void>(submitD3B2InsertionNonblocking(path, acceptedFailure)); }
+    catch (const std::exception&) { postSubmitFailed = true; }
+    assert(postSubmitFailed && acceptedFailure.submitAccepted);
+    assert(state == D3B2InsertionState::FAILED);
+    assert(submits == 1 && presents == 2 && stickyReleases == 0);
     return 0;
 }
