@@ -5,6 +5,7 @@
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
+#include "lsfg-vk-common/vulkan/runtime_image_observation.hpp"
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -308,7 +309,7 @@ namespace lsfgvk::backend {
             VkFormat transportFormat, uint64_t transportModifier,
             float flow, bool perf);
         void processRuntimePrepass(RuntimePrepassSession& session,
-            VkImage transportImage, vk::SyncFdPayload payload);
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport);
         void closeRuntimePrepassSession(const RuntimePrepassSession& session);
         RuntimeGenerateSession& openRuntimeGenerateSession(
             VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
@@ -316,13 +317,14 @@ namespace lsfgvk::backend {
             RuntimeGenerateMode mode = RuntimeGenerateMode::OneShot);
         std::optional<RuntimeGenerateDiagnosticResult> processRuntimeGenerateDiagnostic(
             RuntimeGenerateSession& session,
-            VkImage transportImage, vk::SyncFdPayload payload);
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport);
         std::optional<RuntimeGenerateDiagnosticPending> submitRuntimeGenerateDiagnostic(
             RuntimeGenerateSession& session,
-            VkImage transportImage, vk::SyncFdPayload payload);
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport);
         std::optional<RuntimeGenerateDiagnosticPending> submitRuntimeGenerateExplicit(
             RuntimeGenerateSession& session, VkImage transportImage,
-            vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+            vk::RuntimeFrameTransportSubmission transport,
+            TemporalSourceSlot destinationSlot,
             uint64_t frameId, std::optional<RuntimeTemporalPairIdentity> pair = std::nullopt);
         RuntimeGenerateDiagnosticResult completeRuntimeGenerateDiagnostic(
             RuntimeGenerateSession& session,
@@ -335,12 +337,25 @@ namespace lsfgvk::backend {
             const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowIngestSnapshot submitRuntimeIngest(
             RuntimeGenerateSession& session, VkImage transportImage,
+            vk::RuntimeFrameTransportSubmission transport,
+            TemporalSourceSlot destinationSlot,
+            uint64_t frameId, RuntimeIngestIntent intent);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        [[nodiscard]] RuntimeShadowIngestSnapshot submitRuntimeIngest(
+            RuntimeGenerateSession& session, VkImage transportImage,
             vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
             uint64_t frameId, RuntimeIngestIntent intent);
+#endif
         [[nodiscard]] RuntimeIngestRetirementStatus tryRetireRuntimeIngest(
             RuntimeGenerateSession& session);
         [[nodiscard]] RuntimeShadowIngestSnapshot inspectRuntimeIngest(
             const RuntimeGenerateSession& session) const noexcept;
+        [[nodiscard]] vk::RuntimeImageObservationDescriptor
+            inspectRuntimeTemporalSource(const RuntimeGenerateSession& session,
+                TemporalSourceSlot slot) const noexcept;
+        [[nodiscard]] vk::RuntimeImageObservationDescriptor
+            inspectRuntimeGeneratedOutput(
+                const RuntimeGenerateSession& session) const noexcept;
         [[nodiscard]] RuntimeShadowGenerateSnapshot submitRuntimePrepassGenerate(
             RuntimeGenerateSession& session, RuntimeTemporalPairIdentity pair);
         [[nodiscard]] RuntimeRetirementStatus tryRetireRuntimePrepassGenerate(

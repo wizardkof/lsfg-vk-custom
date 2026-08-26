@@ -42,9 +42,10 @@ backend::RuntimeGenerateSession& D3B3ProductionCoreOwner::ensureGenerateSession(
 }
 
 backend::RuntimeShadowIngestSnapshot D3B3ProductionCoreOwner::submitWarmup(
-        uint64_t frameId, backend::TemporalSourceSlot slot, vk::SyncFdPayload payload) {
+        uint64_t frameId, backend::TemporalSourceSlot slot,
+        vk::RuntimeFrameTransportSubmission transport) {
     return dependencies.backend->submitRuntimeIngest(ensureGenerateSession(),
-        dependencies.sourceImage(slot), std::move(payload), slot, frameId,
+        dependencies.sourceImage(slot), std::move(transport), slot, frameId,
         backend::RuntimeIngestIntent::WARMUP_TEMPORAL);
 }
 
@@ -53,11 +54,30 @@ backend::RuntimeIngestRetirementStatus D3B3ProductionCoreOwner::tryRetireWarmup(
 }
 
 backend::RuntimeShadowIngestSnapshot D3B3ProductionCoreOwner::submitGenerateSource(
-        uint64_t frameId, backend::TemporalSourceSlot slot, vk::SyncFdPayload payload) {
+        uint64_t frameId, backend::TemporalSourceSlot slot,
+        vk::RuntimeFrameTransportSubmission transport) {
+    return dependencies.backend->submitRuntimeIngest(ensureGenerateSession(),
+        dependencies.sourceImage(slot), std::move(transport), slot, frameId,
+        backend::RuntimeIngestIntent::GENERATE_SOURCE);
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+backend::RuntimeShadowIngestSnapshot D3B3ProductionCoreOwner::submitWarmup(
+        uint64_t frameId, backend::TemporalSourceSlot slot,
+        vk::SyncFdPayload payload) {
+    return dependencies.backend->submitRuntimeIngest(ensureGenerateSession(),
+        dependencies.sourceImage(slot), std::move(payload), slot, frameId,
+        backend::RuntimeIngestIntent::WARMUP_TEMPORAL);
+}
+
+backend::RuntimeShadowIngestSnapshot D3B3ProductionCoreOwner::submitGenerateSource(
+        uint64_t frameId, backend::TemporalSourceSlot slot,
+        vk::SyncFdPayload payload) {
     return dependencies.backend->submitRuntimeIngest(ensureGenerateSession(),
         dependencies.sourceImage(slot), std::move(payload), slot, frameId,
         backend::RuntimeIngestIntent::GENERATE_SOURCE);
 }
+#endif
 
 backend::RuntimeShadowGenerateSnapshot D3B3ProductionCoreOwner::submitGenerate(
         backend::RuntimeTemporalPairIdentity pair) {
@@ -116,6 +136,21 @@ D3B3ProductionCoreOwner::ingestState() const noexcept {
     return generateSession
         ? dependencies.backend->inspectRuntimeIngest(*generateSession)
         : backend::RuntimeShadowIngestSnapshot{};
+}
+
+vk::RuntimeImageObservationDescriptor
+D3B3ProductionCoreOwner::temporalObservationSource(
+        backend::TemporalSourceSlot slot) const noexcept {
+    return generateSession
+        ? dependencies.backend->inspectRuntimeTemporalSource(*generateSession, slot)
+        : vk::RuntimeImageObservationDescriptor{};
+}
+
+vk::RuntimeImageObservationDescriptor
+D3B3ProductionCoreOwner::generatedObservationSource() const noexcept {
+    return generateSession
+        ? dependencies.backend->inspectRuntimeGeneratedOutput(*generateSession)
+        : vk::RuntimeImageObservationDescriptor{};
 }
 
 backend::RuntimeShadowGenerateSnapshot

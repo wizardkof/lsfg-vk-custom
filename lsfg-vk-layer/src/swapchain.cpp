@@ -530,8 +530,11 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             if (!this->frameTransportReady)
                 throw ls::error("P4C-C frame transport resources unavailable");
             vk::RuntimeImageEndpoint::executeRealFrameTransport(
-                this->frameTransportA, this->frameTransportB, sourceImage,
-                this->info.extent, semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
+                this->frameTransportA, this->frameTransportB,
+                vk::RuntimeFrameTransportSource{sourceImage,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, this->info.format,
+                    this->info.extent, 1, this->frameSourceLifetime},
+                semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
             this->instance.get().validateRuntimePrepass(
                 this->frameTransportB.image(), this->info.extent,
                 VK_FORMAT_B8G8R8A8_UNORM, this->frameTransportBacking.modifier(),
@@ -555,12 +558,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                     });
             }
             const auto sourceImage = this->info.images.at(imageIdx);
-            auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
-                this->frameTransportA, sourceImage, this->info.extent,
+            auto transport = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
+                this->frameTransportA,
+                vk::RuntimeFrameTransportSource{sourceImage,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, this->info.format,
+                    this->info.extent, this->captureOnlyPhase + 1,
+                    this->frameSourceLifetime},
                 semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
             this->instance.get().processRuntimePrepass(
                 this->runtimePrepassSession.get(), this->frameTransportB.image(),
-                std::move(payload));
+                std::move(transport));
             this->captureOnlyPhase++;
             return VK_SUCCESS;
         }
@@ -579,12 +586,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                         });
             }
             const auto sourceImage = this->info.images.at(imageIdx);
-            auto payload = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
-                this->frameTransportA, sourceImage, this->info.extent,
+            auto transport = vk::RuntimeImageEndpoint::submitRealFrameTransportA(
+                this->frameTransportA,
+                vk::RuntimeFrameTransportSource{sourceImage,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, this->info.format,
+                    this->info.extent, this->captureOnlyPhase + 1,
+                    this->frameSourceLifetime},
                 semaphores.empty() ? VK_NULL_HANDLE : semaphores.front());
             auto generated = this->instance.get().submitRuntimeGenerateDiagnostic(
                 this->runtimeGenerateDiagnosticSession.get(), this->frameTransportB.image(),
-                std::move(payload));
+                std::move(transport));
             if (generated) {
                 const bool d3bResourcesReady = queue != VK_NULL_HANDLE && queueMutex
                     && graphicsFinalQueue

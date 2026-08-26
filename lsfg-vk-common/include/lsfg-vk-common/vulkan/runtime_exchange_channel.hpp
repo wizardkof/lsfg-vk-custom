@@ -19,6 +19,75 @@ namespace vk {
 
     class Vulkan;
     class RuntimeImageEndpoint;
+    class RuntimeFrameTransportStateStorage;
+
+    /// Content-bearing application image consumed by the A-side transport.
+    /// Ownership is intentionally not transferred by this descriptor: the
+    /// caller must make the image available to the endpoint queue and keep the
+    /// declared layout valid until the returned transport authority retires.
+    struct RuntimeFrameTransportSource {
+        VkImage image{};
+        VkImageLayout currentLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+        VkFormat format{VK_FORMAT_UNDEFINED};
+        VkExtent2D extent{};
+        uint64_t generation{};
+        std::weak_ptr<const uint8_t> lifetime;
+    };
+
+    enum class RuntimeFrameTransportState : uint8_t {
+        FIRST_USE,
+        A_SUBMITTED,
+        B_WAIT_SUBMITTED,
+        REUSABLE,
+        FAILED
+    };
+
+    enum class RuntimeFrameTransportSubmitStatus : uint8_t {
+        SUBMITTED,
+        TEMPORARILY_BLOCKED
+    };
+
+    /// Move-only authority coupling an exported A-side SYNC_FD payload to the
+    /// B-side queue submission which consumes it.  A transport image becomes
+    /// reusable only after consumerRetired(), never from A completion alone.
+    class RuntimeFrameTransportSubmission {
+    public:
+        RuntimeFrameTransportSubmission() noexcept = default;
+        RuntimeFrameTransportSubmission(const RuntimeFrameTransportSubmission&) = delete;
+        RuntimeFrameTransportSubmission& operator=(const RuntimeFrameTransportSubmission&) = delete;
+        RuntimeFrameTransportSubmission(RuntimeFrameTransportSubmission&&) noexcept;
+        RuntimeFrameTransportSubmission& operator=(RuntimeFrameTransportSubmission&&) noexcept;
+        ~RuntimeFrameTransportSubmission();
+
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] uint64_t generation() const noexcept { return generationValue; }
+        [[nodiscard]] uint64_t epoch() const noexcept { return epochValue; }
+        [[nodiscard]] RuntimeFrameTransportState state() const noexcept;
+        [[nodiscard]] SyncFdPayload releasePayload();
+        void consumerSubmitted();
+        void consumerRetired();
+        void consumerFailed() noexcept;
+    private:
+        friend class RuntimeImageEndpoint;
+        friend struct RuntimeFrameTransportSubmissionTestAccess;
+        RuntimeFrameTransportSubmission(
+            std::shared_ptr<RuntimeFrameTransportStateStorage>, SyncFdPayload&&,
+            uint64_t, uint64_t) noexcept;
+        void abandon() noexcept;
+
+        std::shared_ptr<RuntimeFrameTransportStateStorage> authority;
+        SyncFdPayload payload;
+        uint64_t generationValue{};
+        uint64_t epochValue{};
+        bool payloadReleased{};
+        bool terminal{};
+    };
+
+    struct RuntimeFrameTransportSubmitResult {
+        RuntimeFrameTransportSubmitStatus status{
+            RuntimeFrameTransportSubmitStatus::TEMPORARILY_BLOCKED};
+        RuntimeFrameTransportSubmission submission;
+    };
 
     struct RuntimeForeignImageHandoffInfo {
         uint32_t destinationQueueFamilyIndex{VK_QUEUE_FAMILY_IGNORED};
@@ -152,6 +221,9 @@ namespace vk {
         PFN_vkDestroyBuffer DestroyBuffer{};
         PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements{};
         PFN_vkBindBufferMemory BindBufferMemory{};
+        // Kept at the end to preserve source compatibility for existing
+        // aggregate initializers.  Required by reusable observation commands.
+        PFN_vkResetCommandBuffer ResetCommandBuffer{};
     };
 
     struct RuntimeExchangeChannelInfo {
@@ -194,11 +266,16 @@ namespace vk {
         static void executeCompleteRoundTrip(RuntimeImageEndpoint& imageA,
             RuntimeImageEndpoint& imageB);
         static void executeRealFrameTransport(RuntimeImageEndpoint& imageA,
-            RuntimeImageEndpoint& imageB, VkImage sourceImage,
-            VkExtent2D sourceExtent, VkSemaphore bridgeWait);
-        [[nodiscard]] static SyncFdPayload submitRealFrameTransportA(
-            RuntimeImageEndpoint& imageA, VkImage sourceImage,
-            VkExtent2D sourceExtent, VkSemaphore bridgeWait);
+            RuntimeImageEndpoint& imageB, const RuntimeFrameTransportSource& source,
+            VkSemaphore bridgeWait);
+        [[nodiscard]] static RuntimeFrameTransportSubmitResult trySubmitFrameTransportA(
+            RuntimeImageEndpoint& imageA, const RuntimeFrameTransportSource& source,
+            VkSemaphore bridgeWait = VK_NULL_HANDLE);
+        /// WSI-facing throwing wrapper over the generic nonblocking core.
+        [[nodiscard]] static RuntimeFrameTransportSubmission submitRealFrameTransportA(
+            RuntimeImageEndpoint& imageA, const RuntimeFrameTransportSource& source,
+            VkSemaphore bridgeWait = VK_NULL_HANDLE);
+        [[nodiscard]] RuntimeFrameTransportState frameTransportStateValue() const noexcept;
         [[nodiscard]] static std::vector<uint8_t> readForeignImage(
             RuntimeImageEndpoint& imageA, SyncFdPayload payload);
         [[nodiscard]] static RuntimeForeignImageReadbackPending submitForeignImageReadback(
@@ -211,6 +288,7 @@ namespace vk {
             RuntimeForeignImageReadbackPending& pending);
     private:
         friend struct RuntimeImageEndpointTestAccess;
+        friend struct RuntimeFrameTransportSubmissionTestAccess;
         friend class RuntimeForeignImageReadbackPending;
         friend RuntimeImageEndpoint createRuntimeImageEndpoint(
             const RuntimeExchangeEndpoint&, ls::OwnedFd, const RuntimeImageBackingInfo&);
@@ -231,6 +309,7 @@ namespace vk {
         VkFormat format{VK_FORMAT_UNDEFINED};
         uint64_t modifier{};
         std::shared_ptr<const uint8_t> lifetime{std::make_shared<const uint8_t>(0)};
+        std::shared_ptr<RuntimeFrameTransportStateStorage> frameTransportState;
     };
 
     [[nodiscard]] RuntimeImageEndpoint createRuntimeImageEndpoint(

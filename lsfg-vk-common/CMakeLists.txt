@@ -18,6 +18,7 @@ set(COMMON_SOURCES
     "src/vulkan/runtime_device_pair.cpp"
     "src/vulkan/runtime_exchange_channel.cpp"
     "src/vulkan/runtime_exchange_endpoint.cpp"
+    "src/vulkan/runtime_image_observation.cpp"
     "src/vulkan/vulkan_native_external_image_backing.cpp"
     "src/vulkan/sampler.cpp"
     "src/vulkan/semaphore.cpp"

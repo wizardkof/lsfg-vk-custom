@@ -34,10 +34,18 @@ public:
 
     [[nodiscard]] bool structurallyReady() const noexcept;
     [[nodiscard]] backend::RuntimeShadowIngestSnapshot submitWarmup(
-        uint64_t frameId, backend::TemporalSourceSlot, vk::SyncFdPayload);
+        uint64_t frameId, backend::TemporalSourceSlot,
+        vk::RuntimeFrameTransportSubmission);
     [[nodiscard]] backend::RuntimeIngestRetirementStatus tryRetireWarmup();
     [[nodiscard]] backend::RuntimeShadowIngestSnapshot submitGenerateSource(
+        uint64_t frameId, backend::TemporalSourceSlot,
+        vk::RuntimeFrameTransportSubmission);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    [[nodiscard]] backend::RuntimeShadowIngestSnapshot submitWarmup(
         uint64_t frameId, backend::TemporalSourceSlot, vk::SyncFdPayload);
+    [[nodiscard]] backend::RuntimeShadowIngestSnapshot submitGenerateSource(
+        uint64_t frameId, backend::TemporalSourceSlot, vk::SyncFdPayload);
+#endif
     [[nodiscard]] backend::RuntimeShadowGenerateSnapshot submitGenerate(
         backend::RuntimeTemporalPairIdentity);
     [[nodiscard]] backend::RuntimeRetirementStatus tryRetireGenerate();
@@ -49,6 +57,10 @@ public:
 
     [[nodiscard]] backend::RuntimeShadowIngestSnapshot ingestState() const noexcept;
     [[nodiscard]] backend::RuntimeShadowGenerateSnapshot generateState() const noexcept;
+    [[nodiscard]] vk::RuntimeImageObservationDescriptor temporalObservationSource(
+        backend::TemporalSourceSlot) const noexcept;
+    [[nodiscard]] vk::RuntimeImageObservationDescriptor
+        generatedObservationSource() const noexcept;
     [[nodiscard]] const backend::ReturnedGeneratedOperation* returnedOperation() const noexcept;
 
 private:

@@ -203,6 +203,8 @@ selectGeneratedOutputTerminalConsumer(
         RuntimeDmaBufBacking frameTransportBacking;
         vk::RuntimeImageEndpoint frameTransportA;
         vk::RuntimeImageEndpoint frameTransportB;
+        std::shared_ptr<const uint8_t> frameSourceLifetime{
+            std::make_shared<const uint8_t>(0)};
         bool frameTransportReady{};
         uint32_t offloadQueueFamily{VK_QUEUE_FAMILY_IGNORED};
         ls::owned_ptr<ls::R<backend::RuntimePrepassSession>> runtimePrepassSession;

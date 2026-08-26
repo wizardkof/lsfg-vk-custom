@@ -35,6 +35,25 @@ struct RuntimeOperationAuthorityTestAccess {
 };
 }
 
+namespace vk {
+struct RuntimeImageEndpointTestAccess {
+    static RuntimeImageEndpoint make(RuntimeExchangeEndpoint endpoint,
+            VkImage image, VkExtent2D extent, VkFormat format) {
+        RuntimeImageEndpoint result;
+        endpoint.FreeCommandBuffers = nullptr;
+        endpoint.DestroyCommandPool = nullptr;
+        endpoint.DestroyImage = nullptr;
+        result.endpoint = std::move(endpoint);
+        result.imageHandle = image;
+        result.extent = extent;
+        result.format = format;
+        result.commandBuffers = {
+            reinterpret_cast<VkCommandBuffer>(uintptr_t{0xA6A500})};
+        return result;
+    }
+};
+}
+
 namespace {
 
 void assertFdClosed(int fd) {
@@ -1140,19 +1159,49 @@ void testProductionCoreOwnerLifecycle() {
     assert(owner.structurallyReady());
     assert(harness.frontSubmitCount() == submitsBeforeConstruction);
 
+    auto frameTransportA = vk::RuntimeImageEndpointTestAccess::make(
+        harness.frameTransportAEndpoint(),
+        reinterpret_cast<VkImage>(uintptr_t{0xA6A501}), {64, 64},
+        VK_FORMAT_R8G8B8A8_UNORM);
+    const auto makeTransport = [&](uint64_t generation) {
+        const auto lifetime = std::make_shared<const uint8_t>(0);
+        const vk::RuntimeFrameTransportSource source{
+            .image = reinterpret_cast<VkImage>(uintptr_t{0xC100}),
+            .currentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .extent = {64, 64},
+            .generation = generation,
+            .lifetime = lifetime};
+        auto submitted = vk::RuntimeImageEndpoint::trySubmitFrameTransportA(
+            frameTransportA, source);
+        assert(submitted.status
+            == vk::RuntimeFrameTransportSubmitStatus::SUBMITTED);
+        assert(submitted.submission.valid());
+        return std::move(submitted.submission);
+    };
+
     const auto warmup = [&](uint64_t frame, auto slot) {
-        auto submitted = owner.submitWarmup(frame, slot, harness.exportTestPayload());
+        auto submitted = owner.submitWarmup(frame, slot, makeTransport(frame));
         assert(submitted.submitAccepted && submitted.signalSemaphore == VK_NULL_HANDLE
             && submitted.ingestReadyReusable);
         assert(owner.tryRetireWarmup()
             == lsfgvk::backend::RuntimeIngestRetirementStatus::RETIRED);
+        const auto observed = owner.temporalObservationSource(slot);
+        assert(observed.image != VK_NULL_HANDLE
+            && observed.layout == VK_IMAGE_LAYOUT_GENERAL
+            && observed.format == VK_FORMAT_R8G8B8A8_UNORM
+            && observed.extent.width == 64 && observed.extent.height == 64
+            && observed.queueFamilyIndex == 3
+            && !observed.lifetime.expired());
     };
     warmup('A', lsfgvk::backend::TemporalSourceSlot::Slot0);
     warmup('B', lsfgvk::backend::TemporalSourceSlot::Slot1);
 
     const auto c = owner.submitGenerateSource('C',
-        lsfgvk::backend::TemporalSourceSlot::Slot0, harness.exportTestPayload());
+        lsfgvk::backend::TemporalSourceSlot::Slot0, makeTransport('C'));
     assert(c.submitAccepted && c.signalSemaphore != VK_NULL_HANDLE);
+    assert(!owner.temporalObservationSource(
+        lsfgvk::backend::TemporalSourceSlot::Slot0).image);
     const auto generated = owner.submitGenerate({
         .olderSlot = lsfgvk::backend::TemporalSourceSlot::Slot1,
         .newerSlot = lsfgvk::backend::TemporalSourceSlot::Slot0,
@@ -1161,6 +1210,24 @@ void testProductionCoreOwnerLifecycle() {
     harness.backendFenceStatusResult = VK_SUCCESS;
     assert(owner.tryRetireGenerate()
         == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(frameTransportA.frameTransportStateValue()
+        == vk::RuntimeFrameTransportState::REUSABLE);
+    const auto observedC = owner.temporalObservationSource(
+        lsfgvk::backend::TemporalSourceSlot::Slot0);
+    assert(observedC.image != VK_NULL_HANDLE
+        && observedC.layout == VK_IMAGE_LAYOUT_GENERAL
+        && observedC.format == VK_FORMAT_R8G8B8A8_UNORM
+        && observedC.extent.width == 64 && observedC.extent.height == 64
+        && observedC.queueFamilyIndex == 3
+        && !observedC.lifetime.expired());
+    const auto observedGenerated = owner.generatedObservationSource();
+    assert(observedGenerated.image != VK_NULL_HANDLE
+        && observedGenerated.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        && observedGenerated.format == VK_FORMAT_R8G8B8A8_UNORM
+        && observedGenerated.extent.width == 64
+        && observedGenerated.extent.height == 64
+        && observedGenerated.queueFamilyIndex == 3
+        && !observedGenerated.lifetime.expired());
 
     harness.armProductionReturnForOwner();
     owner.submitBReturn();

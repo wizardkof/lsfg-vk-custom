@@ -325,6 +325,16 @@ public:
         return result;
     }
 
+    [[nodiscard]] vk::RuntimeExchangeEndpoint frameTransportAEndpoint() const {
+        auto result = renderEndpoint();
+        // The owner harness uses this A-side endpoint only to exercise the
+        // generic production transport token.  Its image and command handles
+        // are supplied by the test access shim below.
+        result.CmdBlitImage = cmdBlitImage;
+        result.semaphoreDevice.funcs.GetSemaphoreFdKHR = getSemaphoreFd;
+        return result;
+    }
+
     [[nodiscard]] bool productionResourcePfnInventoryComplete() const {
         const auto generation = generationEndpoint();
         const auto render = renderEndpoint();

@@ -90,6 +90,7 @@ public:
     bool operationRetired{};
     RuntimeTemporalPairIdentity temporalPair{};
     RuntimeBinarySemaphoreEpoch generationReadyEpoch;
+    std::optional<vk::RuntimeFrameTransportSubmission> frameTransport;
 };
 
 RuntimeGenerateDiagnosticPending::RuntimeGenerateDiagnosticPending(
@@ -325,7 +326,8 @@ namespace lsfgvk::backend {
     public:
         RuntimePrepassSessionImpl(const InstanceImpl& instance, VkExtent2D extent,
             VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf);
-        void process(VkImage transportImage, vk::SyncFdPayload payload);
+        void process(VkImage transportImage,
+            vk::RuntimeFrameTransportSubmission transport);
     private:
         const InstanceImpl& instance;
         VkExtent2D extent{};
@@ -349,11 +351,11 @@ namespace lsfgvk::backend {
             VkFormat transportFormat, uint64_t transportModifier, float flow, bool perf,
             RuntimeGenerateMode mode);
         std::optional<RuntimeGenerateDiagnosticResult> process(
-            VkImage transportImage, vk::SyncFdPayload payload);
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport);
         std::optional<RuntimeGenerateDiagnosticPending> submit(
-            VkImage transportImage, vk::SyncFdPayload payload);
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport);
         std::optional<RuntimeGenerateDiagnosticPending> submitExplicit(
-            VkImage transportImage, vk::SyncFdPayload payload,
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport,
             TemporalSourceSlot destinationSlot, uint64_t frameId,
             std::optional<RuntimeTemporalPairIdentity> pair);
         RuntimeGenerateDiagnosticResult complete(RuntimeGenerateDiagnosticPending&& pending);
@@ -366,10 +368,19 @@ namespace lsfgvk::backend {
                 instance.getVulkan().queueFamilyIndex(),
                 shadowSplit->ingestReadyEpoch.canSignalAgain()};
         }
+        RuntimeShadowIngestSnapshot submitShadowIngest(
+            VkImage, vk::RuntimeFrameTransportSubmission,
+            TemporalSourceSlot, uint64_t, RuntimeIngestIntent);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
         RuntimeShadowIngestSnapshot submitShadowIngest(VkImage, vk::SyncFdPayload,
             TemporalSourceSlot, uint64_t, RuntimeIngestIntent);
+#endif
         RuntimeIngestRetirementStatus tryRetireShadowIngest();
         [[nodiscard]] RuntimeShadowIngestSnapshot shadowIngestSnapshot() const noexcept;
+        [[nodiscard]] vk::RuntimeImageObservationDescriptor
+            temporalObservationDescriptor(TemporalSourceSlot) const noexcept;
+        [[nodiscard]] vk::RuntimeImageObservationDescriptor
+            generatedObservationDescriptor() const noexcept;
         RuntimeShadowGenerateSnapshot submitShadowGenerate(RuntimeTemporalPairIdentity);
         RuntimeRetirementStatus tryRetireShadowGenerate();
         RuntimeShadowGenerateSnapshot retireShadowGenerate();
@@ -392,6 +403,7 @@ namespace lsfgvk::backend {
             RuntimeBinarySemaphoreEpoch ingestReadyEpoch;
             std::unique_ptr<vk::Semaphore> importedWait;
             std::optional<RuntimeIngestPending> pending;
+            std::optional<vk::RuntimeFrameTransportSubmission> frameTransport;
             std::optional<RuntimeGenerateDiagnosticPending> generatePending;
             std::shared_ptr<RuntimeGenerateDiagnosticPendingState> generateState;
             uint64_t nextEpoch{1};
@@ -443,17 +455,23 @@ namespace lsfgvk::backend {
         RuntimeGenerateSerialState serialState;
         RuntimeGenerateMode mode{RuntimeGenerateMode::OneShot};
         std::array<uint64_t, 2> temporalFrameIds{};
+        std::array<bool, 2> temporalInitialized{};
         std::unique_ptr<ShadowSplitResources> shadowSplit;
         RuntimeGenerationId generation{};
         std::shared_ptr<const uint8_t> sessionLifetime{std::make_shared<const uint8_t>(0)};
         std::shared_ptr<RuntimeGenerateDiagnosticPendingState> pendingGeneration;
+        RuntimeShadowIngestSnapshot submitShadowIngestInternal(VkImage,
+            std::optional<vk::RuntimeFrameTransportSubmission>, vk::SyncFdPayload,
+            TemporalSourceSlot, uint64_t, RuntimeIngestIntent);
         std::optional<RuntimeGenerateDiagnosticPending> processSubmission(
-            VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion,
+            VkImage transportImage, vk::RuntimeFrameTransportSubmission transport,
+            bool deferGenerateCompletion,
             std::optional<TemporalSourceSlot> destinationSlot = std::nullopt,
             uint64_t frameId = 0,
             std::optional<RuntimeTemporalPairIdentity> pair = std::nullopt);
         void recordTemporalIngestCommands(const vk::Vulkan&, const vk::CommandBuffer&,
-            VkImage transportImage, size_t frameIndex, bool seed, uint32_t family);
+            VkImage transportImage, size_t frameIndex, bool seed,
+            bool destinationFirstUse, uint32_t family);
         void recordPrepassGenerateCommands(const vk::Vulkan&, const vk::CommandBuffer&,
             size_t frameIndex, bool runGammaDelta, bool runGenerate);
         RuntimeGenerateDiagnosticResult validateCompletedGeneration(
@@ -746,8 +764,8 @@ RuntimePrepassSession& Instance::openRuntimePrepassSession(VkExtent2D extent,
 }
 
 void Instance::processRuntimePrepass(RuntimePrepassSession& session,
-        VkImage transportImage, vk::SyncFdPayload payload) {
-    session.process(transportImage, std::move(payload));
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
+    session.process(transportImage, std::move(transport));
 }
 
 void Instance::closeRuntimePrepassSession(const RuntimePrepassSession& session) {
@@ -767,21 +785,22 @@ RuntimeGenerateSession& Instance::openRuntimeGenerateSession(
 
 std::optional<RuntimeGenerateDiagnosticResult> Instance::processRuntimeGenerateDiagnostic(
         RuntimeGenerateSession& session,
-        VkImage transportImage, vk::SyncFdPayload payload) {
-    return session.process(transportImage, std::move(payload));
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
+    return session.process(transportImage, std::move(transport));
 }
 
 std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateDiagnostic(
         RuntimeGenerateSession& session,
-        VkImage transportImage, vk::SyncFdPayload payload) {
-    return session.submit(transportImage, std::move(payload));
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
+    return session.submit(transportImage, std::move(transport));
 }
 
 std::optional<RuntimeGenerateDiagnosticPending> Instance::submitRuntimeGenerateExplicit(
         RuntimeGenerateSession& session, VkImage transportImage,
-        vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
+        vk::RuntimeFrameTransportSubmission transport,
+        TemporalSourceSlot destinationSlot,
         uint64_t frameId, std::optional<RuntimeTemporalPairIdentity> pair) {
-    return session.submitExplicit(transportImage, std::move(payload),
+    return session.submitExplicit(transportImage, std::move(transport),
         destinationSlot, frameId, pair);
 }
 
@@ -813,11 +832,22 @@ RuntimeShadowSplitResourceSnapshot Instance::inspectRuntimeSplitResources(
 
 RuntimeShadowIngestSnapshot Instance::submitRuntimeIngest(
         RuntimeGenerateSession& session, VkImage transportImage,
+        vk::RuntimeFrameTransportSubmission transport,
+        TemporalSourceSlot destinationSlot,
+        uint64_t frameId, RuntimeIngestIntent intent) {
+    return session.submitShadowIngest(transportImage, std::move(transport),
+        destinationSlot, frameId, intent);
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+RuntimeShadowIngestSnapshot Instance::submitRuntimeIngest(
+        RuntimeGenerateSession& session, VkImage transportImage,
         vk::SyncFdPayload payload, TemporalSourceSlot destinationSlot,
         uint64_t frameId, RuntimeIngestIntent intent) {
     return session.submitShadowIngest(transportImage, std::move(payload),
         destinationSlot, frameId, intent);
 }
+#endif
 
 RuntimeIngestRetirementStatus Instance::tryRetireRuntimeIngest(
         RuntimeGenerateSession& session) {
@@ -827,6 +857,16 @@ RuntimeIngestRetirementStatus Instance::tryRetireRuntimeIngest(
 RuntimeShadowIngestSnapshot Instance::inspectRuntimeIngest(
         const RuntimeGenerateSession& session) const noexcept {
     return session.shadowIngestSnapshot();
+}
+
+vk::RuntimeImageObservationDescriptor Instance::inspectRuntimeTemporalSource(
+        const RuntimeGenerateSession& session, TemporalSourceSlot slot) const noexcept {
+    return session.temporalObservationDescriptor(slot);
+}
+
+vk::RuntimeImageObservationDescriptor Instance::inspectRuntimeGeneratedOutput(
+        const RuntimeGenerateSession& session) const noexcept {
+    return session.generatedObservationDescriptor();
 }
 
 RuntimeShadowGenerateSnapshot Instance::submitRuntimePrepassGenerate(
@@ -1168,9 +1208,11 @@ RuntimePrepassSessionImpl::RuntimePrepassSessionImpl(const InstanceImpl& instanc
     instance(instance), extent(extent), transportFormat(transportFormat),
     transportModifier(transportModifier),
     sources(vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT),
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT),
             vk::Image(instance.getVulkan(), extent, VK_FORMAT_R8G8B8A8_UNORM,
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)),
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT)),
     ctx(createCtx(instance, extent, false, flow, perf, 0)), mipmaps(ctx, sources),
     alpha0{Alpha0(ctx, mipmaps.getImages().at(0)), Alpha0(ctx, mipmaps.getImages().at(1)),
         Alpha0(ctx, mipmaps.getImages().at(2)), Alpha0(ctx, mipmaps.getImages().at(3)),
@@ -1198,7 +1240,12 @@ RuntimePrepassSessionImpl::RuntimePrepassSessionImpl(const InstanceImpl& instanc
     command.end(vk); command.submit(vk);
 }
 
-void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayload payload) {
+void RuntimePrepassSessionImpl::process(
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
+    if (!transport.valid())
+        throw std::invalid_argument("P4C-D1 frame transport authority is invalid");
+    auto payload = transport.releasePayload();
+    try {
     const auto& vk = instance.getVulkan();
     const uint32_t family = vk.queueFamilyIndex();
     const size_t frameIndex = directFrames % 2;
@@ -1268,7 +1315,9 @@ void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayloa
     vk::Fence fence(vk);
     command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
         fence.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+    transport.consumerSubmitted();
     if (!fence.wait(vk)) throw backend::error("P4C-D1 backend fence wait failed");
+    transport.consumerRetired();
     directFrames++;
     if (first) seeded = true; else rotations++;
     if (first) {
@@ -1303,6 +1352,10 @@ void RuntimePrepassSessionImpl::process(VkImage transportImage, vk::SyncFdPayloa
             << "  Generated frame: NONE\n  Presentation from B: NONE\n"
             << "  Frame transport connected: INPUT_ONLY\n"
             << "DG2X_P4C_D1_DIRECT_PREPASS_CHAIN_PASS\n";
+    }
+    } catch (...) {
+        transport.consumerFailed();
+        throw;
     }
 }
 
@@ -1432,7 +1485,8 @@ RuntimeGenerateSessionImpl::RuntimeGenerateSessionImpl(
 
 void RuntimeGenerateSessionImpl::recordTemporalIngestCommands(
         const vk::Vulkan& vk, const vk::CommandBuffer& command,
-        VkImage transportImage, size_t frameIndex, bool seed, uint32_t family) {
+        VkImage transportImage, size_t frameIndex, bool seed,
+        bool destinationFirstUse, uint32_t family) {
     const auto range = VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     std::vector<vk::Barrier> acquire{{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, 0,
         VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1447,8 +1501,10 @@ void RuntimeGenerateSessionImpl::recordTemporalIngestCommands(
     } else {
         const auto image = frameIndex == 0 ? sources.first.handle() : sources.second.handle();
         acquire.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            destinationFirstUse ? 0U : VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            destinationFirstUse ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image, range});
     }
     command.insertBarriers(vk, acquire, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -1517,21 +1573,82 @@ RuntimeGenerateSessionImpl::shadowIngestSnapshot() const noexcept {
     return result;
 }
 
+vk::RuntimeImageObservationDescriptor
+RuntimeGenerateSessionImpl::temporalObservationDescriptor(
+        TemporalSourceSlot slot) const noexcept {
+    const auto index = temporalSourceSlotIndex(slot);
+    if (index >= temporalInitialized.size() || !temporalInitialized[index]
+            || (shadowSplit && shadowSplit->pending))
+        return {};
+    return {
+        .image = index == 0 ? sources.first.handle() : sources.second.handle(),
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = extent,
+        .queueFamilyIndex = instance.getVulkan().queueFamilyIndex(),
+        .lifetime = sessionLifetime
+    };
+}
+
+vk::RuntimeImageObservationDescriptor
+RuntimeGenerateSessionImpl::generatedObservationDescriptor() const noexcept {
+    if (!shadowSplit || !shadowSplit->generateState
+            || !shadowSplit->generateExecutionRetired)
+        return {};
+    return {
+        .image = destination.handle(),
+        .layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = extent,
+        .queueFamilyIndex = instance.getVulkan().queueFamilyIndex(),
+        .lifetime = sessionLifetime
+    };
+}
+
+RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport,
+        TemporalSourceSlot destinationSlot, uint64_t frameId,
+        RuntimeIngestIntent intent) {
+    std::optional<vk::RuntimeFrameTransportSubmission> authority;
+    authority.emplace(std::move(transport));
+    return submitShadowIngestInternal(transportImage, std::move(authority), {},
+        destinationSlot, frameId, intent);
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
 RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
         VkImage transportImage, vk::SyncFdPayload payload,
         TemporalSourceSlot destinationSlot, uint64_t frameId,
         RuntimeIngestIntent intent) {
+    return submitShadowIngestInternal(transportImage, {}, std::move(payload),
+        destinationSlot, frameId, intent);
+}
+#endif
+
+RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngestInternal(
+        VkImage transportImage,
+        std::optional<vk::RuntimeFrameTransportSubmission> transport,
+        vk::SyncFdPayload testingPayload, TemporalSourceSlot destinationSlot,
+        uint64_t frameId, RuntimeIngestIntent intent) {
     if (!shadowSplit) throw std::logic_error("shadow split resources unavailable");
     auto& shadow = *shadowSplit;
     if (transportImage == VK_NULL_HANDLE || frameId == 0
             || temporalSourceSlotIndex(destinationSlot) >= 2)
         throw std::invalid_argument("invalid shadow ingest identity");
-    if (shadow.pending || shadow.failed || !shadow.ingestReadyEpoch.canSignalAgain())
+    if (shadow.pending || shadow.frameTransport || shadow.failed
+            || !shadow.ingestReadyEpoch.canSignalAgain())
         throw std::logic_error("shadow ingest resources are not reusable");
+    if (transport && !transport->valid())
+        throw std::invalid_argument("shadow ingest frame transport authority is invalid");
+    if (!transport && !testingPayload.valid())
+        throw std::invalid_argument("shadow ingest SYNC_FD payload is invalid");
 
     const auto& vk = instance.getVulkan();
+    auto payload = transport ? transport->releasePayload() : std::move(testingPayload);
     const uint64_t epoch = intent == RuntimeIngestIntent::GENERATE_SOURCE
         ? shadow.nextEpoch++ : shadow.nextWarmupEpoch++;
+    const auto destinationIndex = temporalSourceSlotIndex(destinationSlot);
+    const bool destinationFirstUse = !temporalInitialized[destinationIndex];
     bool epochReserved{};
     bool submitAccepted{};
     try {
@@ -1548,7 +1665,7 @@ RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
 
         shadow.ingestCommand.begin(vk);
         recordTemporalIngestCommands(vk, shadow.ingestCommand, transportImage,
-            temporalSourceSlotIndex(destinationSlot), false, vk.queueFamilyIndex());
+            destinationIndex, false, destinationFirstUse, vk.queueFamilyIndex());
         shadow.ingestCommand.end(vk);
 
         shadow.ingestIntent = intent;
@@ -1578,6 +1695,11 @@ RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
             throw ls::vulkan_error(submitResult, "shadow ingest vkQueueSubmit() failed");
         }
         submitAccepted = true;
+        if (transport) {
+            transport->consumerSubmitted();
+            shadow.frameTransport.emplace(std::move(*transport));
+        }
+        temporalInitialized[destinationIndex] = true;
 
         if (intent == RuntimeIngestIntent::GENERATE_SOURCE)
             shadow.ingestReadyEpoch.producerSubmitted(epoch);
@@ -1588,6 +1710,8 @@ RuntimeShadowIngestSnapshot RuntimeGenerateSessionImpl::submitShadowIngest(
         ++shadow.ingestSubmitCount;
         return shadowIngestSnapshot();
     } catch (...) {
+        if (transport) transport->consumerFailed();
+        if (shadow.frameTransport) shadow.frameTransport->consumerFailed();
         if (epochReserved) shadow.ingestReadyEpoch.producerFailed();
         shadow.failed = true;
         if (!submitAccepted && !shadow.deviceLost) {
@@ -1609,6 +1733,7 @@ RuntimeGenerateSessionImpl::tryRetireShadowIngest() {
     if (result == VK_NOT_READY)
         return RuntimeIngestRetirementStatus::NOT_READY;
     if (result != VK_SUCCESS) {
+        if (shadow.frameTransport) shadow.frameTransport->consumerFailed();
         shadow.pending->submissionAuthority().fail();
         shadow.pending->payloadAuthority().fail();
         if (shadow.ingestIntent == RuntimeIngestIntent::GENERATE_SOURCE)
@@ -1619,6 +1744,10 @@ RuntimeGenerateSessionImpl::tryRetireShadowIngest() {
     }
     shadow.pending->submissionAuthority().retire(epoch);
     shadow.pending->payloadAuthority().waitRetired(epoch);
+    if (shadow.frameTransport) {
+        shadow.frameTransport->consumerRetired();
+        shadow.frameTransport.reset();
+    }
     shadow.frameTransportReusable = true;
     shadow.importedWait.reset();
     shadow.ingestFenceNeedsReset = true;
@@ -1785,6 +1914,7 @@ RuntimeRetirementStatus RuntimeGenerateSessionImpl::tryRetireShadowGenerate() {
     if (result == VK_NOT_READY)
         return RuntimeRetirementStatus::NOT_READY;
     if (result != VK_SUCCESS) {
+        if (shadow.frameTransport) shadow.frameTransport->consumerFailed();
         shadow.ingestReadyEpoch.consumerFailed(epoch);
         shadow.generateState->generationReadyEpoch.consumerFailed(
             shadow.generateState->generation);
@@ -1798,6 +1928,10 @@ RuntimeRetirementStatus RuntimeGenerateSessionImpl::tryRetireShadowGenerate() {
     shadow.ingestReadyEpoch.makeAvailable(epoch);
     shadow.pending->submissionAuthority().retire(epoch);
     shadow.pending->payloadAuthority().waitRetired(epoch);
+    if (shadow.frameTransport) {
+        shadow.frameTransport->consumerRetired();
+        shadow.frameTransport.reset();
+    }
     shadow.frameTransportReusable = true;
     shadow.ingestFenceNeedsReset = true;
     shadow.pending.reset();
@@ -1950,12 +2084,15 @@ void RuntimeGenerateSessionImpl::recordPrepassGenerateCommands(
 
 std::optional<RuntimeGenerateDiagnosticPending>
 RuntimeGenerateSessionImpl::processSubmission(
-        VkImage transportImage, vk::SyncFdPayload payload, bool deferGenerateCompletion,
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport,
+        bool deferGenerateCompletion,
         std::optional<TemporalSourceSlot> explicitDestination, uint64_t frameId,
         std::optional<RuntimeTemporalPairIdentity> explicitPair) {
     static_cast<void>(deferGenerateCompletion);
     if (pendingGeneration)
         throw std::logic_error("runtime Generate diagnostic already has a pending generation");
+    if (!transport.valid())
+        throw std::invalid_argument("runtime Generate frame transport authority is invalid");
     RuntimeGenerateDiagnosticStep step{};
     if (mode == RuntimeGenerateMode::OneShot) {
         step = state.advance();
@@ -2007,6 +2144,7 @@ RuntimeGenerateSessionImpl::processSubmission(
             temporalFrameIds[frameIndex] = frameId;
     }
 
+    auto payload = transport.releasePayload();
     const vk::ExternalSemaphoreDevice semaphoreDevice{vk.dev(), {
         vk.df().CreateSemaphore, vk.df().DestroySemaphore,
         vk.df().GetSemaphoreFdKHR, vk.df().ImportSemaphoreFdKHR}};
@@ -2015,7 +2153,8 @@ RuntimeGenerateSessionImpl::processSubmission(
 
     vk::CommandBuffer command(vk);
     command.begin(vk);
-    recordTemporalIngestCommands(vk, command, transportImage, frameIndex, seed, family);
+    recordTemporalIngestCommands(vk, command, transportImage, frameIndex, seed,
+        !temporalInitialized[frameIndex], family);
     recordPrepassGenerateCommands(vk, command, frameIndex, runGammaDelta, runGenerate);
 
     command.end(vk);
@@ -2039,6 +2178,10 @@ RuntimeGenerateSessionImpl::processSubmission(
         command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
             {pending->readiness->handle()}, VK_NULL_HANDLE, 0,
             pending->fence->handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+        transport.consumerSubmitted();
+        pending->frameTransport.emplace(std::move(transport));
+        if (seed) temporalInitialized = {true, true};
+        else temporalInitialized[frameIndex] = true;
         pendingGeneration = pending;
         return RuntimeGenerateDiagnosticPending(pending);
     }
@@ -2046,8 +2189,12 @@ RuntimeGenerateSessionImpl::processSubmission(
     vk::Fence fence(vk);
     command.submit(vk, vk.queue(), {waitSemaphore.handle()}, VK_NULL_HANDLE, 0,
         {}, VK_NULL_HANDLE, 0, fence.handle(), VK_PIPELINE_STAGE_TRANSFER_BIT);
+    transport.consumerSubmitted();
+    if (seed) temporalInitialized = {true, true};
+    else temporalInitialized[frameIndex] = true;
     if (!fence.wait(vk))
         throw backend::error("P4C-D2 backend fence wait failed");
+    transport.consumerRetired();
 
     if (step.action == RuntimeGenerateDiagnosticAction::SEED_ONLY) {
         std::cerr << "[DG2X-P4C-D2] Diagnostic temporal seed\n"
@@ -2071,6 +2218,7 @@ RuntimeGenerateSessionImpl::processSubmission(
 
     throw std::logic_error("runtime Generate submission did not produce pending state");
     } catch (...) {
+        transport.consumerFailed();
         if (mode == RuntimeGenerateMode::OneShot) state.recordFailure();
         else serialState.fail();
         throw;
@@ -2085,6 +2233,10 @@ RuntimeGenerateSessionImpl::validateCompletedGeneration(
         throw std::logic_error("invalid or already completed D3A2 generation");
     if (!pending->fence->wait(vk))
         throw backend::error("P4C-D2 delayed backend fence wait failed");
+    if (pending->frameTransport) {
+        pending->frameTransport->consumerRetired();
+        pending->frameTransport.reset();
+    }
     const auto bytes = readback.read(vk, capturedBytes);
     if (bytes.size() != capturedBytes)
         throw backend::error("P4C-D2 generated readback byte count mismatch");
@@ -2133,14 +2285,14 @@ RuntimeGenerateSessionImpl::validateCompletedGeneration(
 }
 
 std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateSessionImpl::process(
-        VkImage transportImage, vk::SyncFdPayload payload) {
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
     const auto step = state.nextStep();
     const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
     std::optional<RuntimeTemporalPairIdentity> pair;
     if (step.action == RuntimeGenerateDiagnosticAction::GENERATE)
         pair = RuntimeTemporalPairIdentity{TemporalSourceSlot::Slot1,
             TemporalSourceSlot::Slot0, 2, 3, generation};
-    auto pending = processSubmission(transportImage, std::move(payload), false,
+    auto pending = processSubmission(transportImage, std::move(transport), false,
         slot, step.directFrames, pair);
     if (!pending) return std::nullopt;
     pending->consumeTransport();
@@ -2148,23 +2300,23 @@ std::optional<RuntimeGenerateDiagnosticResult> RuntimeGenerateSessionImpl::proce
 }
 
 std::optional<RuntimeGenerateDiagnosticPending> RuntimeGenerateSessionImpl::submit(
-        VkImage transportImage, vk::SyncFdPayload payload) {
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport) {
     const auto step = state.nextStep();
     const auto slot = step.frameIndex == 0 ? TemporalSourceSlot::Slot0 : TemporalSourceSlot::Slot1;
     std::optional<RuntimeTemporalPairIdentity> pair;
     if (step.action == RuntimeGenerateDiagnosticAction::GENERATE)
         pair = RuntimeTemporalPairIdentity{TemporalSourceSlot::Slot1,
             TemporalSourceSlot::Slot0, 2, 3, generation};
-    return submitExplicit(transportImage, std::move(payload), slot,
+    return submitExplicit(transportImage, std::move(transport), slot,
         step.directFrames, pair);
 }
 
 std::optional<RuntimeGenerateDiagnosticPending>
 RuntimeGenerateSessionImpl::submitExplicit(
-        VkImage transportImage, vk::SyncFdPayload payload,
+        VkImage transportImage, vk::RuntimeFrameTransportSubmission transport,
         TemporalSourceSlot destinationSlot, uint64_t frameId,
         std::optional<RuntimeTemporalPairIdentity> pair) {
-    return processSubmission(transportImage, std::move(payload), true,
+    return processSubmission(transportImage, std::move(transport), true,
         destinationSlot, frameId, pair);
 }
 
@@ -2179,6 +2331,10 @@ RuntimeGenerateDiagnosticResult RuntimeGenerateSessionImpl::complete(
             if (serialState.currentPhase() == RuntimeGenerateSerialPhase::IN_FLIGHT) {
                 if (!pending->fence || !pending->fence->wait(instance.getVulkan()))
                     throw backend::error("serial Generate source-read fence wait failed");
+                if (pending->frameTransport) {
+                    pending->frameTransport->consumerRetired();
+                    pending->frameTransport.reset();
+                }
                 serialState.sourceReadsRetired(pending->generation);
             } else if (serialState.currentPhase()
                     != RuntimeGenerateSerialPhase::SOURCE_READS_RETIRED) {

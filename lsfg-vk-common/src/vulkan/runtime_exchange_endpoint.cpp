@@ -21,6 +21,8 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         vk.fi().GetDeviceProcAddr(vk.dev(), "vkCmdCopyImage"));
     const auto getSubresourceLayout = reinterpret_cast<PFN_vkGetImageSubresourceLayout>(
         vk.fi().GetDeviceProcAddr(vk.dev(), "vkGetImageSubresourceLayout"));
+    const auto resetCommandBuffer = reinterpret_cast<PFN_vkResetCommandBuffer>(
+        vk.fi().GetDeviceProcAddr(vk.dev(), "vkResetCommandBuffer"));
     if (!getMemoryFdProperties)
         throw ls::vulkan_error("vkGetMemoryFdPropertiesKHR unavailable for runtime exchange endpoint");
 
@@ -90,5 +92,6 @@ RuntimeExchangeEndpoint vk::makeRuntimeExchangeEndpoint(const Vulkan& vk) {
         ,.DestroyBuffer = vk.df().DestroyBuffer
         ,.GetBufferMemoryRequirements = vk.df().GetBufferMemoryRequirements
         ,.BindBufferMemory = vk.df().BindBufferMemory
+        ,.ResetCommandBuffer = resetCommandBuffer
     };
 }

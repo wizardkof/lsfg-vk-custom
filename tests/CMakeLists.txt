@@ -250,6 +250,14 @@ add_test(
     NAME lsfg-vk-test-runtime-payload-exchange
     COMMAND lsfg-vk-test-runtime-payload-exchange)
 
+add_executable(lsfg-vk-test-runtime-image-observation
+    runtime_image_observation_test.cpp)
+target_compile_options(lsfg-vk-test-runtime-image-observation PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-runtime-image-observation PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-runtime-image-observation
+    COMMAND lsfg-vk-test-runtime-image-observation)
+
 if(LSFGVK_BUILD_VK_LAYER)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(TEST_RUNTIME_GBM REQUIRED IMPORTED_TARGET gbm)
