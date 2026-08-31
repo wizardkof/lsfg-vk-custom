@@ -160,20 +160,21 @@ namespace {
     }
     /// create an image view
     ls::owned_ptr<VkImageView> createImageView(const vk::Vulkan& vk,
-            VkImage image, VkFormat format) {
+            VkImage image, VkFormat format, uint32_t arrayLayers) {
         VkImageView handle{};
 
         const VkImageViewCreateInfo viewInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .image = image,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .viewType = arrayLayers > 1
+                ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
             .format = format,
             .subresourceRange = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                 .baseMipLevel = 0,
                 .levelCount = 1,
                 .baseArrayLayer = 0,
-                .layerCount = 1
+                .layerCount = arrayLayers
             }
         };
         auto res = vk.df().CreateImageView(vk.dev(), &viewInfo, VK_NULL_HANDLE, &handle);
@@ -268,7 +269,7 @@ Image::Image(const vk::Vulkan& vk,
                 .format = format,
                 .extent = { extent.width, extent.height, 1 },
                 .mipLevels = 1,
-                .arrayLayers = 1,
+                .arrayLayers = options.arrayLayers,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                 .usage = usage,
@@ -277,7 +278,7 @@ Image::Image(const vk::Vulkan& vk,
         extent(extent) {
     auto allocation = allocateMemory(vk, *this->image, nullptr, std::nullopt, false);
     this->memory = std::move(allocation.memory);
-    this->view = createImageView(vk, *this->image, format);
+    this->view = createImageView(vk, *this->image, format, options.arrayLayers);
 }
 
 Image::Image(const vk::Vulkan& vk,
@@ -287,7 +288,8 @@ Image::Image(const vk::Vulkan& vk,
         extent{ descriptor.extent.width, descriptor.extent.height } {
     auto allocation = allocateMemory(vk, *this->image, nullptr, std::nullopt, true);
     this->memory = std::move(allocation.memory);
-    this->view = createImageView(vk, *this->image, descriptor.format);
+    this->view = createImageView(
+        vk, *this->image, descriptor.format, descriptor.arrayLayers);
     exportedImage = {
         .fd = exportMemoryFd(vk, *this->memory),
         .descriptor = descriptor,
@@ -302,5 +304,6 @@ Image::Image(const vk::Vulkan& vk, ExternalImage&& importedImage) :
     auto allocation = allocateMemory(vk, *this->image,
         &importedImage.fd, importedImage.allocation, false);
     this->memory = std::move(allocation.memory);
-    this->view = createImageView(vk, *this->image, importedImage.descriptor.format);
+    this->view = createImageView(vk, *this->image,
+        importedImage.descriptor.format, importedImage.descriptor.arrayLayers);
 }

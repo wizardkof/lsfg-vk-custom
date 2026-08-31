@@ -1,6 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "instance.hpp"
+#include "adaptive_1x_preparation_reservation.hpp"
+#include "batch_application_present_bridge_authority.hpp"
+#include "batch_present_transaction.hpp"
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+#include "entrypoint_test_seam.hpp"
+#endif
+#include "present_batch_projection.hpp"
+#include "aborted_present_semantics.hpp"
+#include "borrowed_present_fence_registry.hpp"
+#include "device_retirement_reactor.hpp"
+#include "d2_vulkan_shadow_runtime.hpp"
 #include "fixed_present_mode.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -12,6 +23,7 @@
 #include "virtual_swapchain_runtime.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +36,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan_core.h>
@@ -158,14 +172,10 @@ namespace {
                 info.ppEnabledExtensionNames = this->enabledExtensions.data();
 
                 bool featureAlreadyPresent{};
-                auto* current = reinterpret_cast<VkBaseOutStructure*>(
-                    const_cast<void*>(info.pNext));
+                auto* current = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
                 while (current) {
                     if (current->sType
                             == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR) {
-                        auto* features = reinterpret_cast<
-                            VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR*>(current);
-                        features->internallySynchronizedQueues = VK_TRUE;
                         featureAlreadyPresent = true;
                         break;
                     }
@@ -288,18 +298,16 @@ namespace {
         return maintenanceFeatures.swapchainMaintenance1 == VK_TRUE;
     }
 
-    void enableSwapchainMaintenanceFeature(
+    [[nodiscard]] bool enableSwapchainMaintenanceFeature(
             VkDeviceCreateInfo& info,
             VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR& storage) {
-        auto* current = reinterpret_cast<VkBaseOutStructure*>(
-            const_cast<void*>(info.pNext));
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
         while (current) {
             if (current->sType
                     == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR) {
-                auto* features = reinterpret_cast<
-                    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR*>(current);
-                features->swapchainMaintenance1 = VK_TRUE;
-                return;
+                return reinterpret_cast<const
+                    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR*>(current)
+                    ->swapchainMaintenance1 == VK_TRUE;
             }
             current = current->pNext;
         }
@@ -307,6 +315,23 @@ namespace {
         storage.pNext = const_cast<void*>(info.pNext);
         storage.swapchainMaintenance1 = VK_TRUE;
         info.pNext = &storage;
+        return true;
+    }
+
+    [[nodiscard]] bool timelineSemaphoreUsable(const VkDeviceCreateInfo& info) {
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
+        while (current) {
+            if (current->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                return reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(current)
+                    ->timelineSemaphore == VK_TRUE;
+            if (current->sType
+                    == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
+                return reinterpret_cast<const
+                    VkPhysicalDeviceTimelineSemaphoreFeatures*>(current)
+                    ->timelineSemaphore == VK_TRUE;
+            current = current->pNext;
+        }
+        return true;
     }
 
     [[nodiscard]] bool supportsInternallySynchronizedQueues(
@@ -447,6 +472,14 @@ namespace {
                     && queueInfo.queueCount > 0
                     && supportsInternallySynchronizedQueues(
                         physdev, funcs, getPhysicalDeviceFeatures2)) {
+                const auto* feature = reinterpret_cast<const VkBaseInStructure*>(info.pNext);
+                while (feature && feature->sType
+                        != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR)
+                    feature = feature->pNext;
+                if (feature && reinterpret_cast<const
+                        VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR*>(feature)
+                        ->internallySynchronizedQueues != VK_TRUE)
+                    return QueueReservation{};
                 const bool duplicateInternalGroup = std::ranges::any_of(
                     result.queueInfos,
                     [graphicsFamily](const VkDeviceQueueCreateInfo& candidate) {
@@ -684,7 +717,10 @@ namespace {
                     fixedCaps->compatibleModes, VK_PRESENT_MODE_FIFO_KHR))
             return false;
 
-        const auto requiredUsage = info.imageUsage;
+        const auto effectiveUsage = effectiveSwapchainImageUsage(info);
+        if ((effectiveUsage & ~VkImageUsageFlags2KHR{UINT32_MAX}) != 0)
+            return false;
+        const auto requiredUsage = static_cast<VkImageUsageFlags>(effectiveUsage);
         if ((adaptiveCaps->supportedUsageFlags & requiredUsage) != requiredUsage
                 || (fixedCaps->supportedUsageFlags & requiredUsage) != requiredUsage)
             return false;
@@ -733,7 +769,10 @@ namespace {
         if (info.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR)
             alternatives.push_back(VK_PRESENT_MODE_IMMEDIATE_KHR);
 
-        const auto requiredUsage = info.imageUsage;
+        const auto effectiveUsage = effectiveSwapchainImageUsage(info);
+        if ((effectiveUsage & ~VkImageUsageFlags2KHR{UINT32_MAX}) != 0)
+            return false;
+        const auto requiredUsage = static_cast<VkImageUsageFlags>(effectiveUsage);
         if ((initialCaps->supportedUsageFlags & requiredUsage) != requiredUsage)
             return false;
 
@@ -785,22 +824,47 @@ namespace {
             uint32_t family{VK_QUEUE_FAMILY_IGNORED};
             uint32_t index{};
             VkQueueFlags flags{};
+            // Every layer submit to this queue, including the batch bridge and
+            // each reserved Adaptive producer, shares this serialization
+            // authority.
+            std::shared_ptr<std::mutex> mutex{std::make_shared<std::mutex>()};
         };
         std::vector<VkInstance> handles; // there may be several instances
         uint32_t applicationApiVersion{VK_API_VERSION_1_0};
         vk::VulkanInstanceFuncs funcs;
 
         std::unordered_map<VkDevice, vk::Vulkan> devices;
+        std::unordered_map<VkDevice, std::shared_ptr<DeviceRetirementReactor>>
+            deviceRetirementReactors;
+        std::unordered_map<VkDevice, std::shared_ptr<D3B3DeviceLifetimeQuarantine>>
+            deviceQuarantines;
+        std::unordered_map<VkDevice,
+            std::shared_ptr<PresentedPhysicalImageLeaseRegistry>>
+            devicePresentedPhysicalImages;
+        std::unordered_map<VkDevice,
+            std::shared_ptr<BorrowedPresentFenceRegistry>>
+            deviceBorrowedPresentFences;
+        std::unordered_map<VkDevice,
+            std::shared_ptr<AcquireFenceProxyRegistry>> deviceAcquireFenceProxies;
+        std::unordered_map<VkDevice,
+            std::shared_ptr<DeferredVirtualRetirementOwner>>
+            deviceDeferredVirtualRetirements;
         SwapchainMaintenanceFamily surfaceMaintenanceFamily{
             SwapchainMaintenanceFamily::None
         };
         std::unordered_map<VkDevice, SwapchainMaintenanceFamily>
             swapchainMaintenanceFamilies;
+        std::unordered_map<VkDevice, bool> deviceTimelineSemaphoreAvailable;
+        std::unordered_map<VkDevice, bool> deviceD2SyncFdAvailable;
+        std::unordered_map<VkDevice, bool> deviceD2SinglePhysicalDevice;
         std::unordered_map<VkDevice, OffloadQueueInfo> offloadQueues;
         std::unordered_map<VkQueue, QueueMetadata> queues;
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
-        std::unordered_map<VkSwapchainKHR, std::unique_ptr<VirtualSwapchainRuntime>>
+        std::unordered_map<VkDevice,
+            std::vector<std::shared_ptr<D2VulkanShadowRuntime>>>
+            deviceD2VulkanRuntimeOwners;
+        std::unordered_map<VkSwapchainKHR, std::shared_ptr<VirtualSwapchainRuntime>>
             virtualSwapchains;
     }* instance_info; // NOLINT (global variable)
 
@@ -869,6 +933,17 @@ namespace {
                         : nullptr);
                 appendExtension(compatibilityInstanceExtensions,
                     GET_PHYSICAL_DEVICE_PROPERTIES_2_KHR);
+                if (configSnapshot.activeProfile().gpu.has_value()) {
+                    if (!hasInstanceExtension(layer_info->GetInstanceProcAddr,
+                            VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME)) {
+                        std::cerr << "lsfg-vk: event retirement unavailable: "
+                            << VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME
+                            << " not available\n";
+                        return VK_ERROR_EXTENSION_NOT_PRESENT;
+                    }
+                    appendExtension(compatibilityInstanceExtensions,
+                        VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME);
+                }
                 newInfo.enabledExtensionCount =
                     static_cast<uint32_t>(compatibilityInstanceExtensions.size());
                 newInfo.ppEnabledExtensionNames = compatibilityInstanceExtensions.data();
@@ -990,14 +1065,25 @@ namespace {
         // capable of entering the asynchronous Fixed path after a future mode
         // switch while leaving worker/swapchain activation gated by fixedMode().
         QueueReservation offloadReservation{};
+        const bool applicationTimelineSemaphoreUsable = timelineSemaphoreUsable(*info);
         SwapchainMaintenanceFamily deviceMaintenanceFamily{
             SwapchainMaintenanceFamily::None
         };
+        bool d2SyncFdExtensionsEnabled{};
         std::vector<const char*> maintenanceDeviceExtensions;
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenanceFeatures{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR
         };
         const auto configSnapshot = layer_info->root.snapshot();
+        bool d2SinglePhysicalDevice = true;
+        for (auto* node = reinterpret_cast<const VkBaseInStructure*>(info->pNext);
+                node; node = node->pNext)
+            if (node->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO) {
+                const auto* group = reinterpret_cast<
+                    const VkDeviceGroupDeviceCreateInfo*>(node);
+                d2SinglePhysicalDevice = group->physicalDeviceCount <= 1;
+                break;
+            }
 
         // create device
         try {
@@ -1060,6 +1146,32 @@ namespace {
                         return VK_ERROR_EXTENSION_NOT_PRESENT;
                     }
                 }
+                if (!hasDeviceExtension(physdev, instance_info->funcs,
+                        VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME)
+                        || (vulkan10 && !hasDeviceExtension(physdev,
+                            instance_info->funcs,
+                            VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME))) {
+                    std::cerr << "lsfg-vk: event retirement unavailable: external fence "
+                        "SYNC_FD contract is not advertised\n";
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
+                }
+                if (compatibilityDeviceExtensions.empty()) {
+                    compatibilityDeviceExtensions.assign(
+                        newInfo.ppEnabledExtensionNames
+                            ? newInfo.ppEnabledExtensionNames : nullptr,
+                        newInfo.ppEnabledExtensionNames
+                            ? newInfo.ppEnabledExtensionNames
+                                + newInfo.enabledExtensionCount : nullptr);
+                }
+                if (vulkan10)
+                    appendExtension(compatibilityDeviceExtensions,
+                        VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
+                appendExtension(compatibilityDeviceExtensions,
+                    VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
+                newInfo.enabledExtensionCount = static_cast<uint32_t>(
+                    compatibilityDeviceExtensions.size());
+                newInfo.ppEnabledExtensionNames =
+                    compatibilityDeviceExtensions.data();
             }
             if (configSnapshot.active()) {
                 const auto getPhysicalDeviceFeatures2 = reinterpret_cast<
@@ -1070,22 +1182,60 @@ namespace {
                     instance_info->applicationApiVersion, newInfo);
                 offloadReservation.apply(newInfo);
 
+                const bool semaphoreFdAvailable = hasDeviceExtension(
+                    physdev, instance_info->funcs,
+                    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+                const bool fenceFdAvailable = hasDeviceExtension(
+                    physdev, instance_info->funcs,
+                    VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
+                const bool baseSemaphoreAvailable = !vulkan10
+                    || hasDeviceExtension(physdev, instance_info->funcs,
+                        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+                const bool baseFenceAvailable = !vulkan10
+                    || hasDeviceExtension(physdev, instance_info->funcs,
+                        VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
+                if (semaphoreFdAvailable && fenceFdAvailable
+                        && baseSemaphoreAvailable && baseFenceAvailable) {
+                    if (compatibilityDeviceExtensions.empty())
+                        compatibilityDeviceExtensions.assign(
+                            newInfo.ppEnabledExtensionNames,
+                            newInfo.ppEnabledExtensionNames
+                                + newInfo.enabledExtensionCount);
+                    if (vulkan10) {
+                        appendExtension(compatibilityDeviceExtensions,
+                            VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+                        appendExtension(compatibilityDeviceExtensions,
+                            VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME);
+                    }
+                    appendExtension(compatibilityDeviceExtensions,
+                        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+                    appendExtension(compatibilityDeviceExtensions,
+                        VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME);
+                    newInfo.enabledExtensionCount = static_cast<uint32_t>(
+                        compatibilityDeviceExtensions.size());
+                    newInfo.ppEnabledExtensionNames =
+                        compatibilityDeviceExtensions.data();
+                    d2SyncFdExtensionsEnabled = true;
+                }
+
                 const auto requestedFamily = instance_info->surfaceMaintenanceFamily;
                 if (supportsSwapchainMaintenance(
                         physdev, instance_info->funcs,
                         getPhysicalDeviceFeatures2, requestedFamily)) {
-                    deviceMaintenanceFamily = requestedFamily;
-                    if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
-                        maintenanceDeviceExtensions.assign(
-                            newInfo.ppEnabledExtensionNames,
-                            newInfo.ppEnabledExtensionNames + newInfo.enabledExtensionCount);
+                    if (enableSwapchainMaintenanceFeature(newInfo, maintenanceFeatures)) {
+                        deviceMaintenanceFamily = requestedFamily;
+                        if (newInfo.enabledExtensionCount && newInfo.ppEnabledExtensionNames) {
+                            maintenanceDeviceExtensions.assign(
+                                newInfo.ppEnabledExtensionNames,
+                                newInfo.ppEnabledExtensionNames
+                                    + newInfo.enabledExtensionCount);
+                        }
+                        appendExtension(maintenanceDeviceExtensions,
+                            swapchainMaintenanceExtension(deviceMaintenanceFamily));
+                        newInfo.enabledExtensionCount =
+                            static_cast<uint32_t>(maintenanceDeviceExtensions.size());
+                        newInfo.ppEnabledExtensionNames = maintenanceDeviceExtensions.data();
                     }
-                    appendExtension(maintenanceDeviceExtensions,
-                        swapchainMaintenanceExtension(deviceMaintenanceFamily));
-                    newInfo.enabledExtensionCount =
-                        static_cast<uint32_t>(maintenanceDeviceExtensions.size());
-                    newInfo.ppEnabledExtensionNames = maintenanceDeviceExtensions.data();
-                    enableSwapchainMaintenanceFeature(newInfo, maintenanceFeatures);
                 }
             }
 
@@ -1125,6 +1275,28 @@ namespace {
                         : VkDeviceQueueCreateFlags{0}
                 )
             );
+            instance_info->deviceQuarantines.emplace(
+                *device, std::make_shared<D3B3DeviceLifetimeQuarantine>());
+            instance_info->deviceRetirementReactors.emplace(
+                *device, std::make_shared<DeviceRetirementReactor>());
+            instance_info->devicePresentedPhysicalImages.emplace(
+                *device, std::make_shared<PresentedPhysicalImageLeaseRegistry>());
+            instance_info->deviceBorrowedPresentFences.emplace(
+                *device, std::make_shared<BorrowedPresentFenceRegistry>(
+                    instance_info->deviceQuarantines.at(*device)->identity()));
+            instance_info->deviceAcquireFenceProxies.emplace(*device,
+                std::make_shared<AcquireFenceProxyRegistry>(
+                    instance_info->deviceBorrowedPresentFences.at(*device)));
+            instance_info->deviceDeferredVirtualRetirements.emplace(
+                *device, std::make_shared<DeferredVirtualRetirementOwner>());
+            instance_info->deviceTimelineSemaphoreAvailable.emplace(
+                *device, applicationTimelineSemaphoreUsable);
+            instance_info->deviceD2SyncFdAvailable.emplace(
+                *device, d2SyncFdExtensionsEnabled);
+            instance_info->deviceD2SinglePhysicalDevice.emplace(
+                *device, d2SinglePhysicalDevice);
+            instance_info->deviceD2VulkanRuntimeOwners.emplace(*device,
+                std::vector<std::shared_ptr<D2VulkanShadowRuntime>>{});
         } catch (const std::exception& e) {
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk initialization:\n";
             std::cerr << "- " << e.what() << '\n';
@@ -1224,15 +1396,100 @@ namespace {
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
         // A well-behaved application destroys swapchains first, but stop any
         // remaining workers defensively before their VkDevice/queue disappears.
+        std::vector<VkSwapchainKHR> deviceSwapchains;
         for (auto& [swapchain, runtime] : instance_info->virtualSwapchains) {
             const auto swapchainIt = instance_info->swapchains.find(swapchain);
             if (swapchainIt != instance_info->swapchains.end()
-                    && swapchainIt->second.get().dev() == device)
-                runtime->stop();
+                    && swapchainIt->second.get().dev() == device) {
+                if (!runtime->stopAndDetach(
+                        instance_info->deviceDeferredVirtualRetirements.at(device)))
+                    std::terminate();
+                deviceSwapchains.push_back(swapchain);
+            }
+        }
+
+        // Keep the reactor alive while internal present SYNC_FDs are drained.
+        // Erasing it below stops registrations only after exact WSI authority
+        // has been resolved.
+        const auto reactorIt = instance_info->deviceRetirementReactors.find(device);
+
+        // Device destruction is a terminal synchronization boundary for
+        // device-owned work. It does not fabricate presentation completion:
+        // every pending authority was already spliced into the deferred owner.
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt != instance_info->devices.end()) {
+            const auto idle = deviceIt->second.df().DeviceWaitIdle(device);
+            if (idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST) {
+                instance_info->deviceDeferredVirtualRetirements.at(device)
+                    ->notifyDeviceRetirement();
+            } else {
+                std::cerr << "lsfg-vk: final vkDestroyDevice idle boundary failed: "
+                    << idle << '\n';
+            }
+
+            // Device destruction is the application's terminal fence-use
+            // boundary. Observe/drain borrowed present fences explicitly;
+            // DeviceWaitIdle above is not presentation-engine authority.
+            const auto borrowed =
+                instance_info->deviceBorrowedPresentFences.find(device);
+            if (borrowed != instance_info->deviceBorrowedPresentFences.end()) {
+                static_cast<void>(borrowed->second->drainForTeardown(
+                    [&](VkFence fence) {
+                        return deviceIt->second.df().GetFenceStatus(device, fence);
+                    }, [&](VkFence fence) {
+                        return deviceIt->second.df().WaitForFences(
+                            device, 1, &fence, VK_TRUE, UINT64_MAX);
+                    }));
+            }
+            const auto leases =
+                instance_info->devicePresentedPhysicalImages.find(device);
+            if (leases != instance_info->devicePresentedPhysicalImages.end()) {
+                // Internal present fences, rather than DeviceWaitIdle, retire
+                // committed WSI leases. Only uncommitted producer-only
+                // reservations are released by the successful idle boundary.
+                static_cast<void>(leases->second->drainInternalFencesForTeardown());
+                if (idle == VK_SUCCESS || idle == VK_ERROR_DEVICE_LOST)
+                    static_cast<void>(leases->second
+                        ->releasePreparedProducerBackingsAfterDeviceIdle());
+                if (idle == VK_SUCCESS && leases->second->size() != 0) {
+                    std::cerr << "lsfg-vk: refusing to destroy a healthy device "
+                        "with unresolved WSI present leases\n";
+                    std::terminate();
+                }
+            }
+        }
+        for (const auto swapchain : deviceSwapchains) {
+            instance_info->virtualSwapchains.erase(swapchain);
+            instance_info->swapchainInfos.erase(swapchain);
+            instance_info->swapchains.erase(swapchain);
+            layer_info->root.removeSwapchainContext(swapchain);
         }
 
         instance_info->offloadQueues.erase(device);
         instance_info->swapchainMaintenanceFamilies.erase(device);
+
+        // Device teardown is the explicit boundary where a final device-wide
+        // synchronization is permitted. Stop new reactor registrations first,
+        // then make healthy accepted work safe before releasing child objects.
+        if (reactorIt != instance_info->deviceRetirementReactors.end()) {
+            instance_info->deviceRetirementReactors.erase(reactorIt);
+        }
+
+        // Release accepted device-lost backings at the actual device lifetime
+        // boundary, while vkDestroySemaphore can still target a live device.
+        instance_info->deviceQuarantines.erase(device);
+        instance_info->devicePresentedPhysicalImages.erase(device);
+        instance_info->deviceAcquireFenceProxies.erase(device);
+        instance_info->deviceBorrowedPresentFences.erase(device);
+        instance_info->deviceTimelineSemaphoreAvailable.erase(device);
+        instance_info->deviceD2SyncFdAvailable.erase(device);
+        instance_info->deviceD2SinglePhysicalDevice.erase(device);
+        instance_info->deviceD2VulkanRuntimeOwners.erase(device);
+        if (const auto deferred = instance_info->deviceDeferredVirtualRetirements.find(device);
+                deferred != instance_info->deviceDeferredVirtualRetirements.end()) {
+            deferred->second->notifyDeviceRetirement();
+            instance_info->deviceDeferredVirtualRetirements.erase(deferred);
+        }
 
         // destroy layer instance
         auto it = instance_info->devices.find(device);
@@ -1439,6 +1696,291 @@ namespace {
 }
 
 namespace {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    struct DeviceEntrypointTestContext {
+        VkDevice device{VK_NULL_HANDLE};
+        vk::VulkanDeviceFuncs downstream{};
+        std::shared_ptr<PresentedPhysicalImageLeaseRegistry> leases;
+        std::shared_ptr<BorrowedPresentFenceRegistry> borrowed;
+        std::shared_ptr<AcquireFenceProxyRegistry> proxies;
+    };
+    std::unique_ptr<DeviceEntrypointTestContext> deviceEntrypointTestContext;
+    bool queuePresentHarnessInstalled{};
+    PresentedPhysicalImageIdentity queuePresentHarnessLastIdentity{};
+    std::shared_ptr<DeferredVirtualRetirementOwner>
+        queuePresentHarnessDeferredOwner;
+    std::shared_ptr<std::atomic_bool> queuePresentHarnessSeededDone;
+    std::weak_ptr<void> queuePresentHarnessSeededBacking;
+    uint32_t queuePresentHarnessSeededDestroys{};
+    std::atomic<VkResult> queuePresentHarnessWorkerInternalFailure{VK_SUCCESS};
+    std::atomic_bool queuePresentHarnessFailD2Bookkeeping{};
+    std::atomic_bool queuePresentHarnessFailD2BatchReservation{};
+    std::weak_ptr<D2RealWsiState> queuePresentHarnessLastD2State;
+#endif
+
+    VkResult myvkCreateFence(VkDevice device, const VkFenceCreateInfo* info,
+            const VkAllocationCallbacks* alloc, VkFence* fence) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            const auto result = deviceEntrypointTestContext->downstream.CreateFence(
+                device, info, alloc, fence);
+            if (result == VK_SUCCESS && fence && *fence != VK_NULL_HANDLE)
+                static_cast<void>(deviceEntrypointTestContext->borrowed->created(*fence));
+            return result;
+        }
+#endif
+        const auto it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        const auto result = it->second.df().CreateFence(device, info, alloc, fence);
+        if (result == VK_SUCCESS && fence && *fence != VK_NULL_HANDLE) {
+            const auto registry = instance_info->deviceBorrowedPresentFences.find(device);
+            if (registry == instance_info->deviceBorrowedPresentFences.end()
+                    || !registry->second->created(*fence).valid()) {
+                // Observation metadata is optional. Never replace a successful
+                // application create, substitute its handle, or add a hidden
+                // destroy. A later present using an untracked fence retains its
+                // WSI lease conservatively instead.
+                std::cerr << "lsfg-vk: application fence lifecycle could not be "
+                    "tracked; preserving downstream create result\n";
+            }
+        }
+        return result;
+    }
+
+    void myvkDestroyFence(VkDevice device, VkFence fence,
+            const VkAllocationCallbacks* alloc) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            deviceEntrypointTestContext->proxies->destroy(fence);
+            observeBorrowedDestroyFence(*deviceEntrypointTestContext->borrowed,
+                fence, [&] { deviceEntrypointTestContext->downstream.DestroyFence(
+                    device, fence, alloc); });
+            return;
+        }
+#endif
+        const auto registry = instance_info->deviceBorrowedPresentFences.find(device);
+        if (const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+                proxies != instance_info->deviceAcquireFenceProxies.end())
+            proxies->second->destroy(fence);
+        const auto vulkan = instance_info->devices.find(device);
+        bool forwarded{};
+        if (registry != instance_info->deviceBorrowedPresentFences.end()
+                && vulkan != instance_info->devices.end()) {
+            observeBorrowedDestroyFence(*registry->second, fence, [&] {
+                vulkan->second.df().DestroyFence(device, fence, alloc);
+            });
+            forwarded = true;
+        }
+        if (const auto deferred = instance_info->deviceDeferredVirtualRetirements.find(device);
+                deferred != instance_info->deviceDeferredVirtualRetirements.end())
+            deferred->second->notifyDeviceRetirement();
+        if (!forwarded && vulkan != instance_info->devices.end())
+            vulkan->second.df().DestroyFence(device, fence, alloc);
+    }
+
+    VkResult myvkGetFenceStatus(VkDevice device, VkFence fence) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            if (!deviceEntrypointTestContext->proxies
+                    ->applicationOperationAllowed(fence))
+                return VK_ERROR_DEVICE_LOST;
+            const auto projected = deviceEntrypointTestContext->proxies->project(fence);
+            if (projected != fence)
+                return deviceEntrypointTestContext->downstream.GetFenceStatus(
+                    device, projected);
+            return observeBorrowedGetFenceStatus(
+                *deviceEntrypointTestContext->borrowed, fence, [&] {
+                    return deviceEntrypointTestContext->downstream.GetFenceStatus(
+                        device, deviceEntrypointTestContext->proxies->project(fence)); });
+        }
+#endif
+        const auto it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        const auto registry = instance_info->deviceBorrowedPresentFences.find(device);
+        const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+        if (proxies != instance_info->deviceAcquireFenceProxies.end()
+                && !proxies->second->applicationOperationAllowed(fence))
+            return VK_ERROR_DEVICE_LOST;
+        const auto projected = proxies == instance_info->deviceAcquireFenceProxies.end()
+            ? fence : proxies->second->project(fence);
+        if (projected != fence)
+            return it->second.df().GetFenceStatus(device, projected);
+        const auto result = registry == instance_info->deviceBorrowedPresentFences.end()
+            ? it->second.df().GetFenceStatus(device, projected)
+            : observeBorrowedGetFenceStatus(*registry->second, fence, [&] {
+                return it->second.df().GetFenceStatus(device, projected);
+            });
+        if (result == VK_SUCCESS) {
+            if (const auto deferred = instance_info->deviceDeferredVirtualRetirements.find(device);
+                    deferred != instance_info->deviceDeferredVirtualRetirements.end())
+                deferred->second->notifyDeviceRetirement();
+        }
+        return result;
+    }
+
+    VkResult myvkWaitForFences(VkDevice device, uint32_t fenceCount,
+            const VkFence* fences, VkBool32 waitAll, uint64_t timeout) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            for (uint32_t i = 0; fences && i < fenceCount; ++i)
+                if (!deviceEntrypointTestContext->proxies
+                        ->applicationOperationAllowed(fences[i]))
+                    return VK_ERROR_DEVICE_LOST;
+            std::vector<VkFence> projected;
+            try {
+                projected = deviceEntrypointTestContext->proxies->project(
+                    fenceCount, fences);
+            } catch (const std::bad_alloc&) {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            bool hasProjection{};
+            for (uint32_t i = 0; i < fenceCount; ++i)
+                hasProjection = hasProjection || projected[i] != fences[i];
+            return observeBorrowedWaitForFences(
+                *deviceEntrypointTestContext->borrowed,
+                fenceCount, fences, hasProjection ? VK_FALSE : waitAll, [&] {
+                    return deviceEntrypointTestContext->downstream.WaitForFences(
+                        device, fenceCount, projected.data(), waitAll, timeout); },
+                [&](VkFence fence) {
+                    for (uint32_t i = 0; i < fenceCount; ++i)
+                        if (fences[i] == fence && projected[i] != fence)
+                            return VK_NOT_READY;
+                    return deviceEntrypointTestContext->downstream.GetFenceStatus(
+                        device, fence);
+                });
+        }
+#endif
+        const auto it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        const auto registry = instance_info->deviceBorrowedPresentFences.find(device);
+        std::vector<VkFence> projected;
+        if (const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+                proxies != instance_info->deviceAcquireFenceProxies.end() && fences) {
+            for (uint32_t i = 0; i < fenceCount; ++i)
+                if (!proxies->second->applicationOperationAllowed(fences[i]))
+                    return VK_ERROR_DEVICE_LOST;
+            try {
+                projected = proxies->second->project(fenceCount, fences);
+            } catch (const std::bad_alloc&) {
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+        const auto* downstreamFences = projected.empty() ? fences : projected.data();
+        bool hasProjection{};
+        for (uint32_t i = 0; i < projected.size(); ++i)
+            hasProjection = hasProjection || projected[i] != fences[i];
+        const auto downstream = [&] { return it->second.df().WaitForFences(
+            device, fenceCount, downstreamFences, waitAll, timeout); };
+        const auto result = registry == instance_info->deviceBorrowedPresentFences.end()
+            ? downstream() : observeBorrowedWaitForFences(*registry->second,
+                fenceCount, fences, hasProjection ? VK_FALSE : waitAll,
+                downstream, [&](VkFence fence) {
+                    for (uint32_t i = 0; i < projected.size(); ++i)
+                        if (fences[i] == fence && projected[i] != fence)
+                            return VK_NOT_READY;
+                    return it->second.df().GetFenceStatus(device, fence);
+                });
+        if (result == VK_SUCCESS && fences && (waitAll || fenceCount == 1)) {
+            if (const auto deferred = instance_info->deviceDeferredVirtualRetirements.find(device);
+                    deferred != instance_info->deviceDeferredVirtualRetirements.end())
+                deferred->second->notifyDeviceRetirement();
+        }
+        return result;
+    }
+
+    VkResult myvkResetFences(VkDevice device, uint32_t fenceCount,
+            const VkFence* fences) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            for (uint32_t i = 0; fences && i < fenceCount; ++i)
+                if (!deviceEntrypointTestContext->proxies
+                        ->applicationOperationAllowed(fences[i]))
+                    return VK_ERROR_DEVICE_LOST;
+            const auto result = observeBorrowedResetFences(
+                *deviceEntrypointTestContext->borrowed,
+                fenceCount, fences, [&] {
+                    return deviceEntrypointTestContext->downstream.ResetFences(
+                        device, fenceCount, fences); }, [&](VkFence fence) {
+                    return deviceEntrypointTestContext->downstream.GetFenceStatus(
+                        device, fence);
+                });
+            if (result == VK_SUCCESS)
+                deviceEntrypointTestContext->proxies->resetSuccess(
+                    fenceCount, fences);
+            return result;
+        }
+#endif
+        const auto it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        if (const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+                proxies != instance_info->deviceAcquireFenceProxies.end())
+            for (uint32_t i = 0; fences && i < fenceCount; ++i)
+                if (!proxies->second->applicationOperationAllowed(fences[i]))
+                    return VK_ERROR_DEVICE_LOST;
+        const auto registry = instance_info->deviceBorrowedPresentFences.find(device);
+        const auto downstream = [&] {
+            return it->second.df().ResetFences(device, fenceCount, fences); };
+        const auto result = registry == instance_info->deviceBorrowedPresentFences.end()
+            ? downstream() : observeBorrowedResetFences(*registry->second,
+                fenceCount, fences, downstream, [&](VkFence fence) {
+                    return it->second.df().GetFenceStatus(device, fence);
+                });
+        if (result == VK_SUCCESS)
+            if (const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+                    proxies != instance_info->deviceAcquireFenceProxies.end())
+                proxies->second->resetSuccess(fenceCount, fences);
+        if (fences) {
+            if (const auto deferred = instance_info->deviceDeferredVirtualRetirements.find(device);
+                    deferred != instance_info->deviceDeferredVirtualRetirements.end())
+                deferred->second->notifyDeviceRetirement();
+        }
+        return result;
+    }
+
+    VkResult myvkImportFenceFdKHR(VkDevice device,
+            const VkImportFenceFdInfoKHR* info) {
+        if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (deviceEntrypointTestContext
+                && deviceEntrypointTestContext->device == device) {
+            if (!deviceEntrypointTestContext->proxies
+                    ->applicationOperationAllowed(info->fence))
+                return VK_ERROR_DEVICE_LOST;
+            if (!deviceEntrypointTestContext->downstream.ImportFenceFdKHR)
+                return VK_ERROR_EXTENSION_NOT_PRESENT;
+            const auto result = deviceEntrypointTestContext->downstream.ImportFenceFdKHR(
+                device, info);
+            if (result == VK_SUCCESS) {
+                static_cast<void>(deviceEntrypointTestContext->borrowed
+                    ->importBoundary(info->fence));
+                deviceEntrypointTestContext->proxies->importSuccess(info->fence);
+            }
+            return result;
+        }
+#endif
+        const auto it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end()) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!it->second.df().ImportFenceFdKHR) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        const auto proxies = instance_info->deviceAcquireFenceProxies.find(device);
+        if (proxies != instance_info->deviceAcquireFenceProxies.end()
+                && !proxies->second->applicationOperationAllowed(info->fence))
+            return VK_ERROR_DEVICE_LOST;
+        const auto result = it->second.df().ImportFenceFdKHR(device, info);
+        if (result == VK_SUCCESS) {
+            if (const auto borrowed = instance_info->deviceBorrowedPresentFences.find(device);
+                    borrowed != instance_info->deviceBorrowedPresentFences.end())
+                static_cast<void>(borrowed->second->importBoundary(info->fence));
+            if (proxies != instance_info->deviceAcquireFenceProxies.end())
+                proxies->second->importSuccess(info->fence);
+        }
+        return result;
+    }
+
     VkResult myvkCreateSwapchainKHR(
             VkDevice device,
             const VkSwapchainCreateInfoKHR* info,
@@ -1448,6 +1990,21 @@ namespace {
         if (it == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
+        bool d2DownstreamSwapchainCreated{};
+        const auto cleanupFailedD2Create = [&]() noexcept {
+            if (!d2DownstreamSwapchainCreated || !swapchain
+                    || *swapchain == VK_NULL_HANDLE)
+                return;
+            const auto failed = *swapchain;
+            try { layer_info->root.removeSwapchainContext(failed); } catch (...) {}
+            instance_info->virtualSwapchains.erase(failed);
+            instance_info->swapchainInfos.erase(failed);
+            instance_info->swapchains.erase(failed);
+            it->second.df().DestroySwapchainKHR(device, failed, alloc);
+            *swapchain = VK_NULL_HANDLE;
+            d2DownstreamSwapchainCreated = false;
+        };
+
         try {
             // vkCreateSwapchainKHR retires oldSwapchain immediately. Retired
             // swapchains cannot acquire new real WSI images, so stop/join our
@@ -1455,14 +2012,19 @@ namespace {
             // the runtime and application-visible virtual VkImages alive until
             // vkDestroySwapchainKHR, but drain hidden queue work first.
             if (info && info->oldSwapchain != VK_NULL_HANDLE) {
+                const auto oldInfo =
+                    instance_info->swapchainInfos.find(info->oldSwapchain);
+                if (oldInfo != instance_info->swapchainInfos.end()
+                        && oldInfo->second.d2Foundation
+                        && oldInfo->second.d2State)
+                    oldInfo->second.d2State->retireForLsfgWork();
                 const auto oldRuntime =
                     instance_info->virtualSwapchains.find(info->oldSwapchain);
                 if (oldRuntime != instance_info->virtualSwapchains.end()) {
-                    oldRuntime->second->stop();
-                    const auto idle = it->second.df().DeviceWaitIdle(device);
-                    if (idle != VK_SUCCESS)
-                        throw ls::vulkan_error(idle,
-                            "vkDeviceWaitIdle() failed while retiring old swapchain");
+                    if (!oldRuntime->second->stopAndDetach(
+                            instance_info->deviceDeferredVirtualRetirements.at(device)))
+                        throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                            "failed to detach old virtual swapchain retirement");
                     std::cerr << "lsfg-vk: retired old virtual presentation worker before swapchain recreation\n";
                 }
             }
@@ -1475,7 +2037,7 @@ namespace {
                 ? *updatedSnapshot
                 : layer_info->root.snapshot();
 
-            // create underlying real swapchain
+            constexpr bool d2Foundation = true;
             VkSwapchainCreateInfoKHR newInfo = *info;
             const VkPresentModeKHR applicationPresentMode = newInfo.presentMode;
             const uint32_t applicationMinImageCount = newInfo.minImageCount;
@@ -1485,7 +2047,15 @@ namespace {
             VkSwapchainPresentModesCreateInfoKHR dualPresentModesInfo{
                 .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR
             };
-            layer_info->root.modifySwapchainCreateInfo(configSnapshot, it->second, newInfo,
+            if (d2Foundation) {
+                const auto createResult = it->second.df().CreateSwapchainKHR(
+                    device, info, alloc, swapchain);
+                if (createResult != VK_SUCCESS)
+                    throw ls::vulkan_error(
+                        createResult, "vkCreateSwapchainKHR() failed");
+                d2DownstreamSwapchainCreated = true;
+            } else layer_info->root.modifySwapchainCreateInfo(
+                configSnapshot, it->second, newInfo,
                 [&, newInfo = &newInfo]() {
                     // Only the asynchronous Fixed path changes WSI mode. The
                     // Adaptive and synchronous 3B paths retain their existing
@@ -1576,9 +2146,11 @@ namespace {
             if (res != VK_SUCCESS)
                 throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
 
-            std::unique_ptr<VirtualSwapchainRuntime> virtualRuntime;
+            std::shared_ptr<VirtualSwapchainRuntime> virtualRuntime;
             std::vector<VkImage> applicationImages = realImages;
             bool virtualized{};
+            // Pass 4A D2 foundation: expose the downstream WSI image set
+            // directly. Shadow/carrier transformation is reserved for 4B.
             bool dynamicPresentModeEligible{};
 
             const bool fixedMode = configSnapshot.fixedMode();
@@ -1602,30 +2174,45 @@ namespace {
             const auto spec = makeVirtualSwapchainImageSpec(newInfo);
             const bool queueAvailable =
                 queueIt != instance_info->offloadQueues.end();
-            const bool queuePresentSupported = queueAvailable
+            const bool queuePresentSupported = !d2Foundation && queueAvailable
                 && offloadQueueSupportsSurface(
                     it->second, queueIt->second, newInfo.surface);
             std::vector<uint32_t> surfacePresentFamilies;
-            uint32_t surfaceFamilyCount{};
-            it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
-                it->second.physdev(), &surfaceFamilyCount, nullptr);
-            for (uint32_t family = 0; family < surfaceFamilyCount; ++family) {
-                VkBool32 supported{};
-                if (it->second.fi().GetPhysicalDeviceSurfaceSupportKHR(
-                        it->second.physdev(), family, newInfo.surface, &supported)
-                        == VK_SUCCESS && supported)
-                    surfacePresentFamilies.push_back(family);
+            if (!d2Foundation) {
+                uint32_t surfaceFamilyCount{};
+                it->second.fi().GetPhysicalDeviceQueueFamilyProperties(
+                    it->second.physdev(), &surfaceFamilyCount, nullptr);
+                for (uint32_t family = 0; family < surfaceFamilyCount; ++family) {
+                    VkBool32 supported{};
+                    if (it->second.fi().GetPhysicalDeviceSurfaceSupportKHR(
+                            it->second.physdev(), family, newInfo.surface, &supported)
+                            == VK_SUCCESS && supported)
+                        surfacePresentFamilies.push_back(family);
+                }
             }
             const bool topologyEligible = fixedMode
                 ? fixedAsyncPresentModeEligible
                 : dualPresentModeDeclared;
+            const bool timelineAvailable = !d2Foundation && instance_info
+                ->deviceTimelineSemaphoreAvailable.at(device);
+            const auto maintenanceIt =
+                instance_info->swapchainMaintenanceFamilies.find(device);
+            const bool presentFenceAvailable = maintenanceIt
+                    != instance_info->swapchainMaintenanceFamilies.end()
+                && maintenanceIt->second != SwapchainMaintenanceFamily::None;
 
-            if (topologyEligible
+            if (d2Foundation) {
+                if (configSnapshot.activeProfile().multiplier > 1)
+                    std::cerr << "lsfg-vk: effective multiplier=1 reason="
+                        "D2_FOUNDATION_NO_CARRIER\n";
+            } else if (topologyEligible
                     && queueAvailable
                     && queuePresentSupported
+                    && timelineAvailable
+                    && presentFenceAvailable
                     && spec.supported()) {
                 try {
-                    virtualRuntime = std::make_unique<VirtualSwapchainRuntime>(
+                    virtualRuntime = std::make_shared<VirtualSwapchainRuntime>(
                         it->second,
                         queueIt->second.queue,
                         queueIt->second.mutex,
@@ -1652,6 +2239,9 @@ namespace {
             } else if (!spec.supported()) {
                 std::cerr << "lsfg-vk: swapchain flags are not supported by the "
                     "virtual bridge; keeping the legacy presentation path\n";
+            } else if (!presentFenceAvailable) {
+                std::cerr << "lsfg-vk: swapchain maintenance1 present-fence "
+                    "authority unavailable; transformed WSI path is ineligible\n";
             } else if (adaptiveMode) {
                 std::cerr << "lsfg-vk: Adaptive virtual topology prerequisites "
                     "unavailable; keeping the legacy Adaptive path\n";
@@ -1660,6 +2250,11 @@ namespace {
                     "keeping FIFO synchronous 3B path\n";
             }
 
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (queuePresentHarnessInstalled
+                    && queuePresentHarnessFailD2Bookkeeping.exchange(false))
+                throw std::bad_alloc();
+#endif
             auto [infoIt, inserted] = instance_info->swapchainInfos.emplace(
                 *swapchain,
                 SwapchainInfo {
@@ -1668,7 +2263,9 @@ namespace {
                     .format = newInfo.imageFormat,
                     .colorSpace = newInfo.imageColorSpace,
                     .extent = newInfo.imageExtent,
-                    .usage = newInfo.imageUsage,
+                    .arrayLayers = newInfo.imageArrayLayers,
+                    .usage = spec.effectiveUsage,
+                    .timelineSemaphoreAvailable = timelineAvailable,
                     .sharingMode = newInfo.imageSharingMode,
                     .queueFamilyIndices = newInfo.imageSharingMode == VK_SHARING_MODE_CONCURRENT
                         && newInfo.queueFamilyIndexCount && newInfo.pQueueFamilyIndices
@@ -1677,6 +2274,7 @@ namespace {
                         : std::vector<uint32_t>{},
                     .surfacePresentFamilies = std::move(surfacePresentFamilies),
                     .surfaceSupportsTransferSrc = [&]() {
+                        if (d2Foundation) return false;
                         VkSurfaceCapabilitiesKHR capabilities{};
                         const auto query = it->second.fi().GetPhysicalDeviceSurfaceCapabilitiesKHR(
                             it->second.physdev(), newInfo.surface, &capabilities);
@@ -1688,9 +2286,18 @@ namespace {
                     .adaptivePresentMode = adaptivePresentMode,
                     .fixedPresentMode = fixedPresentMode,
                     .virtualized = virtualized,
+                    .d2Foundation = d2Foundation,
+                    .d2State = std::make_shared<D2RealWsiState>(imageCount),
+                    .requestedMultiplier = static_cast<uint32_t>(
+                        configSnapshot.activeProfile().multiplier),
+                    .effectiveMultiplier = 1,
+                    .multiplierReason = configSnapshot.activeProfile().multiplier > 1
+                        ? D2MultiplierReason::FoundationNoCarrier
+                        : D2MultiplierReason::None,
                     .dynamicPresentModeEligible =
                         virtualized && dynamicPresentModeEligible,
                     .fixedContext = fixedMode,
+                    .presentFenceAvailable = presentFenceAvailable,
                     .releaseBackend = [&]() {
                         const auto maintenanceIt = instance_info->swapchainMaintenanceFamilies.find(device);
                         if (maintenanceIt == instance_info->swapchainMaintenanceFamilies.end())
@@ -1709,6 +2316,100 @@ namespace {
             auto& swapchainInfo = infoIt->second;
 
             try {
+                if (d2Foundation) {
+                    const auto& df = it->second.df();
+                    VkFormatProperties2 formatProperties{
+                        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
+                    if (it->second.fi().GetPhysicalDeviceFormatProperties2)
+                        it->second.fi().GetPhysicalDeviceFormatProperties2(
+                            it->second.physdev(), newInfo.imageFormat,
+                            &formatProperties);
+                    const auto transferFeatures =
+                        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT
+                        | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+                    const bool usageEligible =
+                        (spec.effectiveUsage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+                        == (VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                    const bool formatEligible =
+                        (formatProperties.formatProperties.optimalTilingFeatures
+                            & transferFeatures)
+                        == transferFeatures;
+                    VkExternalSemaphoreProperties semaphoreProperties{
+                        .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
+                    const VkPhysicalDeviceExternalSemaphoreInfo semaphoreInfo{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+                        .handleType =
+                            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+                    if (it->second.fi()
+                            .GetPhysicalDeviceExternalSemaphoreProperties)
+                        it->second.fi().GetPhysicalDeviceExternalSemaphoreProperties(
+                            it->second.physdev(), &semaphoreInfo,
+                            &semaphoreProperties);
+                    VkExternalFenceProperties fenceProperties{
+                        .sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES};
+                    const VkPhysicalDeviceExternalFenceInfo fenceInfo{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+                        .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+                    if (it->second.fi().GetPhysicalDeviceExternalFenceProperties)
+                        it->second.fi().GetPhysicalDeviceExternalFenceProperties(
+                            it->second.physdev(), &fenceInfo, &fenceProperties);
+                    const bool externalSyncFdEligible =
+                        d2ExternalSyncFdFeaturesEligible(
+                            semaphoreProperties.externalSemaphoreFeatures,
+                            fenceProperties.externalFenceFeatures);
+                    const bool dispatchEligible = df.CmdCopyImage
+                        && df.QueueSubmit && df.CreateSemaphore
+                        && df.DestroySemaphore && df.CreateFence
+                        && df.DestroyFence && df.GetSemaphoreFdKHR
+                        && df.ImportSemaphoreFdKHR && df.GetFenceFdKHR;
+                    const bool syncFdEnabled = instance_info
+                        ->deviceD2SyncFdAvailable.contains(device)
+                        && instance_info->deviceD2SyncFdAvailable.at(device);
+                    const bool singlePhysicalDevice = instance_info
+                        ->deviceD2SinglePhysicalDevice.contains(device)
+                        && instance_info->deviceD2SinglePhysicalDevice.at(device);
+                    const bool queueEligible = queueAvailable
+                        && queueIt->second.familyIndex
+                            == it->second.queueFamilyIndex()
+                        && offloadQueueSupportsSurface(
+                            it->second, queueIt->second, newInfo.surface);
+                    const bool carrierEligible = usageEligible
+                        && formatEligible && newInfo.imageArrayLayers == 1
+                        && !(newInfo.flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR)
+                        && presentFenceAvailable
+                        && swapchainInfo.releaseBackend
+                            != SwapchainReleaseBackend::None
+                        && dispatchEligible
+                        && syncFdEnabled && singlePhysicalDevice
+                        && externalSyncFdEligible
+                        && queueEligible;
+                    if (carrierEligible) {
+                        try {
+                            swapchainInfo.d2VulkanRuntime =
+                                std::make_shared<D2VulkanShadowRuntime>(
+                                    it->second, queueIt->second.queue,
+                                    queueIt->second.mutex,
+                                    swapchainInfo.realImages,
+                                    newInfo.imageFormat, newInfo.imageExtent);
+                            instance_info->deviceD2VulkanRuntimeOwners.at(device)
+                                .push_back(swapchainInfo.d2VulkanRuntime);
+                            swapchainInfo.d2State->configureCarrierCapability(
+                                true, true, queueIt->second.familyIndex);
+                        } catch (const std::exception& e) {
+                            swapchainInfo.d2VulkanRuntime.reset();
+                            swapchainInfo.d2State->configureCarrierCapability(
+                                false, presentFenceAvailable);
+                            std::cerr << "lsfg-vk: D2 shadow allocation unavailable; "
+                                "keeping native 1x: " << e.what() << '\n';
+                        }
+                    } else {
+                        swapchainInfo.d2State->configureCarrierCapability(
+                            false, presentFenceAvailable);
+                    }
+                }
+                if (!d2Foundation) {
                 std::optional<RuntimeExchangeQueue> runtimeExchangeQueue;
                 if (queueIt != instance_info->offloadQueues.end()) {
                     runtimeExchangeQueue = RuntimeExchangeQueue{
@@ -1720,6 +2421,7 @@ namespace {
                 layer_info->root.createSwapchainContext(
                     configSnapshot, it->second, *swapchain, swapchainInfo,
                     std::move(runtimeExchangeQueue));
+                }
 
                 if (virtualRuntime) {
                     const auto workerSwapchain = *swapchain;
@@ -1739,13 +2441,17 @@ namespace {
                                 bool d3bSingleSwapchainEligible,
                                 const GraphicsFinalQueueInfo& graphicsFinalQueue,
                                 BorrowedGraphicsQueueLease& graphicsLease,
-                                bool& stopAfterCompletion) -> VkResult {
+                                bool& stopAfterCompletion,
+                                PresentedPhysicalImageIdentity* presentedIdentity,
+                                std::shared_ptr<void> virtualGpuBacking)
+                                -> PresentExecutionResult {
                             const auto deviceIt = instance_info->devices.find(device);
                             if (deviceIt == instance_info->devices.end())
-                                return VK_ERROR_DEVICE_LOST;
+                                return PresentExecutionResult::failed(VK_ERROR_DEVICE_LOST);
 
                             try {
-                                return layer_info->root.presentSwapchain(
+                                std::unique_ptr<VirtualPresentPendingOperation> pending;
+                                const auto result = layer_info->root.presentSwapchain(
                                     deviceIt->second,
                                     graphicsFinalQueue.queue,
                                     borrowedQueueMutex,
@@ -1761,17 +2467,38 @@ namespace {
                                     d3bSingleSwapchainEligible,
                                     &graphicsFinalQueue,
                                     &graphicsLease,
-                                    &stopAfterCompletion);
-                            } catch (const ls::vulkan_error& e) {
+                                    &stopAfterCompletion,
+                                    instance_info->deviceQuarantines.at(device),
+                                    instance_info->deviceRetirementReactors.at(device),
+                                    instance_info->devicePresentedPhysicalImages.at(device),
+                                    instance_info->deviceBorrowedPresentFences.at(device),
+                                    &pending, presentedIdentity,
+                                    std::move(virtualGpuBacking));
+                                if (pending)
+                                    return PresentExecutionResult::pendingCompletion(
+                                        result.result, std::move(pending),
+                                        result.origin == SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM
+                                            ? PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT
+                                            : PresentResultOrigin::INTERNAL);
+                                return PresentExecutionResult::completed(result.result,
+                                    result.origin == SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM
+                                        ? PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT
+                                        : PresentResultOrigin::INTERNAL);
+                            } catch (const LogicalPresentError& e) {
                                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
                                     std::cerr << "lsfg-vk: asynchronous virtual presentation failed:\n";
                                     std::cerr << "- " << e.what() << '\n';
                                 }
-                                return e.error();
+                                return PresentExecutionResult::failed(e.error(),
+                                    PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT);
+                            } catch (const ls::vulkan_error& e) {
+                                std::cerr << "lsfg-vk: internal asynchronous virtual presentation failed:\n";
+                                std::cerr << "- " << e.what() << '\n';
+                                return PresentExecutionResult::failed(e.error());
                             } catch (const std::exception& e) {
                                 std::cerr << "lsfg-vk: asynchronous virtual presentation failed:\n";
                                 std::cerr << "- " << e.what() << '\n';
-                                return VK_ERROR_UNKNOWN;
+                                return PresentExecutionResult::failed(VK_ERROR_UNKNOWN);
                             }
                         });
                     if (swapchainInfo.dynamicPresentModeEligible) {
@@ -1799,12 +2526,15 @@ namespace {
             instance_info->swapchains.emplace(*swapchain,
                 ls::R<vk::Vulkan>(it->second));
 
+            d2DownstreamSwapchainCreated = false;
             return res;
         } catch (const ls::vulkan_error& e) {
+            cleanupFailedD2Create();
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain creation:\n";
             std::cerr << "- " << e.what() << '\n';
             return e.error();
         } catch (const std::exception& e) {
+            cleanupFailedD2Create();
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain creation:\n";
             std::cerr << "- " << e.what() << '\n';
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -1829,6 +2559,28 @@ namespace {
             device, swapchain, count, images);
     }
 
+    VkResult releaseD2PhysicalImage(VkDevice device,
+            VkSwapchainKHR swapchain, uint32_t index) {
+        const auto deviceIt = instance_info->devices.find(device);
+        const auto swapchainIt = instance_info->swapchainInfos.find(swapchain);
+        if (deviceIt == instance_info->devices.end()
+                || swapchainIt == instance_info->swapchainInfos.end())
+            return VK_ERROR_DEVICE_LOST;
+        const VkReleaseSwapchainImagesInfoKHR releaseInfo{
+            .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
+            .swapchain = swapchain, .imageIndexCount = 1,
+            .pImageIndices = &index};
+        if (swapchainIt->second.releaseBackend == SwapchainReleaseBackend::Khr
+                && deviceIt->second.df().ReleaseSwapchainImagesKHR)
+            return deviceIt->second.df().ReleaseSwapchainImagesKHR(
+                device, &releaseInfo);
+        if (swapchainIt->second.releaseBackend == SwapchainReleaseBackend::Ext
+                && deviceIt->second.df().ReleaseSwapchainImagesEXT)
+            return deviceIt->second.df().ReleaseSwapchainImagesEXT(
+                device, &releaseInfo);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
     VkResult myvkAcquireNextImageKHR(
             VkDevice device,
             VkSwapchainKHR swapchain,
@@ -1843,8 +2595,33 @@ namespace {
         const auto deviceIt = instance_info->devices.find(device);
         if (deviceIt == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
-        return deviceIt->second.df().AcquireNextImageKHR(
+        const auto d2 = instance_info->swapchainInfos.find(swapchain);
+        if (d2 != instance_info->swapchainInfos.end()
+                && d2->second.d2Foundation && d2->second.d2State
+                && d2->second.d2VulkanRuntime
+                && d2->second.d2State->publicAcquireRelayRequired()) {
+            return d2->second.d2VulkanRuntime->publicAcquire(
+                *d2->second.d2State, semaphore, fence, imageIndex,
+                [&](VkSemaphore internalSemaphore, VkFence internalFence,
+                        uint32_t* internalIndex) {
+                    return deviceIt->second.df().AcquireNextImageKHR(
+                        device, swapchain, timeout, internalSemaphore,
+                        internalFence, internalIndex);
+                }, [&](uint32_t index) {
+                    return releaseD2PhysicalImage(
+                        device, swapchain, index);
+                }, instance_info->deviceAcquireFenceProxies.at(device).get());
+        }
+        const auto result = deviceIt->second.df().AcquireNextImageKHR(
             device, swapchain, timeout, semaphore, fence, imageIndex);
+        if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && imageIndex) {
+            const auto state = instance_info->swapchainInfos.find(swapchain);
+            if (state != instance_info->swapchainInfos.end()
+                    && state->second.d2Foundation && state->second.d2State
+                    && !state->second.d2State->acquired(*imageIndex))
+                return VK_ERROR_DEVICE_LOST;
+        }
+        return result;
     }
 
     VkResult myvkAcquireNextImage2KHR(
@@ -1852,6 +2629,9 @@ namespace {
             const VkAcquireNextImageInfoKHR* info,
             uint32_t* imageIndex) {
         if (!info)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
         const auto runtime = instance_info->virtualSwapchains.find(info->swapchain);
@@ -1864,14 +2644,81 @@ namespace {
             instance_info->funcs.GetDeviceProcAddr(device, "vkAcquireNextImage2KHR"));
         if (!next)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
-        return next(device, info, imageIndex);
+        const auto d2 = instance_info->swapchainInfos.find(info->swapchain);
+        if (d2 != instance_info->swapchainInfos.end()
+                && d2->second.d2Foundation && d2->second.d2State
+                && d2->second.d2VulkanRuntime && info->deviceMask == 1
+                && d2->second.d2State->publicAcquireRelayRequired()) {
+            return d2->second.d2VulkanRuntime->publicAcquire(
+                *d2->second.d2State, info->semaphore, info->fence, imageIndex,
+                [&](VkSemaphore internalSemaphore, VkFence internalFence,
+                        uint32_t* internalIndex) {
+                    auto downstreamInfo = *info;
+                    downstreamInfo.semaphore = internalSemaphore;
+                    downstreamInfo.fence = internalFence;
+                    return next(device, &downstreamInfo, internalIndex);
+                }, [&](uint32_t index) {
+                    return releaseD2PhysicalImage(
+                        device, info->swapchain, index);
+                }, instance_info->deviceAcquireFenceProxies.at(device).get());
+        }
+        const auto result = next(device, info, imageIndex);
+        if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) && imageIndex) {
+            const auto state = instance_info->swapchainInfos.find(info->swapchain);
+            if (state != instance_info->swapchainInfos.end()
+                    && state->second.d2Foundation && state->second.d2State
+                    && !state->second.d2State->acquired(*imageIndex))
+                return VK_ERROR_DEVICE_LOST;
+        }
+        return result;
+    }
+
+    template<class Downstream>
+    VkResult releaseD2SwapchainImages(VkDevice device,
+            const VkReleaseSwapchainImagesInfoKHR* info,
+            Downstream&& downstream) {
+        if (!info || info->swapchain == VK_NULL_HANDLE
+                || (info->imageIndexCount != 0 && !info->pImageIndices))
+            return VK_ERROR_UNKNOWN;
+        const auto state = instance_info->swapchainInfos.find(info->swapchain);
+        if (state == instance_info->swapchainInfos.end()
+                || !state->second.d2Foundation || !state->second.d2State)
+            return downstream();
+        const std::span<const uint32_t> indices(
+            info->pImageIndices, info->imageIndexCount);
+        if (!state->second.d2State->prepareRelease(indices))
+            return VK_ERROR_UNKNOWN;
+        const auto result = downstream();
+        state->second.d2State->finishRelease(indices, result == VK_SUCCESS);
+        return result;
+    }
+
+    VkResult myvkReleaseSwapchainImagesKHR(VkDevice device,
+            const VkReleaseSwapchainImagesInfoKHR* info) {
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt == instance_info->devices.end()
+                || !deviceIt->second.df().ReleaseSwapchainImagesKHR)
+            return VK_ERROR_UNKNOWN;
+        return releaseD2SwapchainImages(device, info, [&] {
+            return deviceIt->second.df().ReleaseSwapchainImagesKHR(device, info);
+        });
+    }
+
+    VkResult myvkReleaseSwapchainImagesEXT(VkDevice device,
+            const VkReleaseSwapchainImagesInfoKHR* info) {
+        const auto deviceIt = instance_info->devices.find(device);
+        if (deviceIt == instance_info->devices.end()
+                || !deviceIt->second.df().ReleaseSwapchainImagesEXT)
+            return VK_ERROR_UNKNOWN;
+        return releaseD2SwapchainImages(device, info, [&] {
+            return deviceIt->second.df().ReleaseSwapchainImagesEXT(device, info);
+        });
     }
 
     VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-warning-option"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
-        VkResult result = VK_SUCCESS;
 
         // ensure layer config is up to date
         std::optional<ConfigSnapshot> reload;
@@ -1895,6 +2742,18 @@ namespace {
                     const bool requestedFixed = configSnapshot.fixedMode();
                     const bool modeChanged =
                         swapchainInfo.fixedContext != requestedFixed;
+
+                    if (swapchainInfo.d2Foundation) {
+                        swapchainInfo.requestedMultiplier = static_cast<uint32_t>(
+                            configSnapshot.activeProfile().multiplier);
+                        swapchainInfo.effectiveMultiplier = 1;
+                        swapchainInfo.multiplierReason =
+                            swapchainInfo.requestedMultiplier > 1
+                                ? D2MultiplierReason::FoundationNoCarrier
+                                : D2MultiplierReason::None;
+                        swapchainInfo.fixedContext = requestedFixed;
+                        continue;
+                    }
 
                     if (swapchainInfo.virtualized && modeChanged
                             && !swapchainInfo.dynamicPresentModeEligible) {
@@ -1949,85 +2808,666 @@ namespace {
             }
         }
 
-        // Present each swapchain. A single virtual swapchain with no pNext
-        // chain is the fast asynchronous path. pNext-bearing or batched
-        // presents remain synchronous through the worker so caller-owned data
-        // stays alive and legacy multi-swapchain behavior is preserved.
-        bool allVirtual = info->swapchainCount > 0;
-        for (size_t i = 0; i < info->swapchainCount; ++i) {
-            if (!instance_info->virtualSwapchains.contains(info->pSwapchains[i])) {
-                allVirtual = false;
+        if (!info || info->swapchainCount == 0 || !info->pSwapchains
+                || !info->pImageIndices)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        bool allD2 = true;
+        for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+            const auto state = instance_info->swapchainInfos.find(info->pSwapchains[i]);
+            if (state == instance_info->swapchainInfos.end()
+                    || !state->second.d2Foundation || !state->second.d2State) {
+                allD2 = false;
                 break;
             }
         }
+        if (allD2) {
+            for (uint32_t i = 0; i < info->swapchainCount; ++i)
+                if (!instance_info->swapchainInfos.at(info->pSwapchains[i])
+                        .d2State->canPresent(info->pImageIndices[i]))
+                    return VK_ERROR_DEVICE_LOST;
+            const auto first = instance_info->swapchains.find(info->pSwapchains[0]);
+            if (first == instance_info->swapchains.end())
+                return VK_ERROR_DEVICE_LOST;
+            const auto result = first->second.get().df().QueuePresentKHR(queue, info);
+            const auto aggregateClass = classifyPresentResult(result);
+            if (aggregateClass == PresentResultClass::Normal
+                    || aggregateClass == PresentResultClass::EnqueuedRejection) {
+                const auto queueMetadata = instance_info->queues.find(queue);
+                const std::optional<uint32_t> presentFamily =
+                    queueMetadata == instance_info->queues.end()
+                        ? std::nullopt
+                        : std::optional<uint32_t>{queueMetadata->second.family};
+                for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                    const auto perResult = info->pResults ? info->pResults[i] : result;
+                    const auto classification = classifyPresentResult(perResult);
+                    if (classification == PresentResultClass::Normal
+                            || classification == PresentResultClass::EnqueuedRejection)
+                        instance_info->swapchainInfos.at(info->pSwapchains[i])
+                            .d2State->presented(
+                                info->pImageIndices[i], presentFamily);
+                }
+            }
+            return result;
+        }
 
-        for (size_t i = 0; i < info->swapchainCount; i++) {
-            const auto& swapchain = info->pSwapchains[i];
+        bool anyVirtual{};
+        for (uint32_t i = 0; i < info->swapchainCount; ++i)
+            anyVirtual = anyVirtual
+                || instance_info->virtualSwapchains.contains(info->pSwapchains[i]);
 
-            const auto& it = instance_info->swapchains.find(swapchain);
-            if (it == instance_info->swapchains.end())
-                return VK_ERROR_INITIALIZATION_FAILED;
+        // A multi-swapchain VkPresentInfoKHR is one application queue operation:
+        // it owns one binary wait set, may carry per-swapchain pNext arrays, and
+        // can have platform atomicity semantics.  The current Root presenter is
+        // still per-swapchain and cannot reproduce that transaction without a
+        // batch-aware wait authority.  Preserve native application semantics by
+        // bypassing LSFG transformation for non-virtual batches.  Virtual image
+        // indices cannot be forwarded to the real swapchain, so those batches
+        // fail before any queue side effect until a batch authority exists.
+        if (info->swapchainCount > 1) {
+            if (anyVirtual) {
+                const auto failBeforeBridge = [&](VkResult result) noexcept {
+                    if (info->pResults)
+                        for (uint32_t i = 0; i < info->swapchainCount; ++i)
+                            info->pResults[i] = result;
+                    return result;
+                };
+                const auto queueMetadata = instance_info->queues.find(queue);
+                if (queueMetadata == instance_info->queues.end())
+                    return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                const auto device = queueMetadata->second.device;
+                auto deviceVk = instance_info->devices.find(device);
+                auto reactorIt = instance_info->deviceRetirementReactors.find(device);
+                auto quarantineIt = instance_info->deviceQuarantines.find(device);
+                auto borrowedIt = instance_info->deviceBorrowedPresentFences.find(device);
+                if (deviceVk == instance_info->devices.end()
+                        || reactorIt == instance_info->deviceRetirementReactors.end()
+                        || quarantineIt == instance_info->deviceQuarantines.end()
+                        || borrowedIt == instance_info->deviceBorrowedPresentFences.end())
+                    return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+
+                struct VirtualBatchEntry final {
+                    uint32_t logicalIndex{};
+                    std::shared_ptr<VirtualSwapchainRuntime> runtime;
+                    std::optional<VirtualSwapchainRuntime::BatchPresentReservation>
+                        runtimeReservation;
+                    std::optional<Adaptive1xPreparationReservation> preparation;
+                    std::optional<Adaptive1xPreparedLogicalFinal> prepared;
+                };
+                struct D2BatchEntry final {
+                    uint32_t logicalIndex{};
+                    uint32_t imageIndex{};
+                    uint64_t generation{};
+                    std::shared_ptr<D2RealWsiState> state;
+                    bool reservationActive{true};
+
+                    D2BatchEntry() = default;
+                    D2BatchEntry(uint32_t logical, uint32_t image,
+                            std::shared_ptr<D2RealWsiState> value) noexcept
+                        : logicalIndex(logical), imageIndex(image),
+                          state(std::move(value)) {}
+                    D2BatchEntry(const D2BatchEntry&) = delete;
+                    D2BatchEntry& operator=(const D2BatchEntry&) = delete;
+                    D2BatchEntry(D2BatchEntry&&) noexcept = default;
+                    D2BatchEntry& operator=(D2BatchEntry&&) noexcept = default;
+                    ~D2BatchEntry() {
+                        if (state && reservationActive)
+                            static_cast<void>(state->abortBatchPresent(
+                                imageIndex, generation));
+                    }
+                    [[nodiscard]] bool commit(
+                            std::optional<uint32_t> family) noexcept {
+                        if (!state || !reservationActive) return false;
+                        reservationActive = false;
+                        return state->commitBatchPresent(
+                            imageIndex, generation, family);
+                    }
+                    [[nodiscard]] bool abort() noexcept {
+                        if (!state || !reservationActive) return false;
+                        reservationActive = false;
+                        return state->abortBatchPresent(imageIndex, generation);
+                    }
+                    void retainIndeterminate() noexcept {
+                        reservationActive = false;
+                    }
+                };
+                struct BatchSemaphoreBacking final {
+                    explicit BatchSemaphoreBacking(const vk::Vulkan& vk) : value(vk) {}
+                    vk::Semaphore value;
+                };
+                struct BatchFenceBacking final {
+                    explicit BatchFenceBacking(const vk::Vulkan& vk)
+                        : value(vk, vk::Fence::ExternalHandle::SyncFd) {}
+                    vk::Fence value;
+                };
+                struct BatchLifetimeBacking final {
+                    std::shared_ptr<D3B3DeviceLifetimeQuarantine> device;
+                    std::vector<std::shared_ptr<D2RealWsiState>> d2States;
+                };
+
+                static std::atomic_uint64_t nextBatchTransaction{1};
+                const auto transactionId = nextBatchTransaction.fetch_add(
+                    1, std::memory_order_relaxed);
+                auto transaction = BatchPresentTransaction::create(
+                    device, queue, transactionId, *info);
+                if (!transaction)
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+
+                std::vector<PresentBatchPNextProjection::Path> projectionPaths;
+                std::vector<VirtualBatchEntry> virtualEntries;
+                std::vector<D2BatchEntry> d2Entries;
+                std::vector<VkResult> mappedResults;
+                try {
+                    projectionPaths.reserve(info->swapchainCount);
+                    virtualEntries.reserve(info->swapchainCount);
+                    d2Entries.reserve(info->swapchainCount);
+                    mappedResults.assign(info->swapchainCount, VK_SUCCESS);
+                    for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                        const auto swapchain = info->pSwapchains[i];
+                        const auto vkIt = instance_info->swapchains.find(swapchain);
+                        if (vkIt == instance_info->swapchains.end()
+                                || vkIt->second.get().dev() != device)
+                            return failBeforeBridge(VK_ERROR_UNKNOWN);
+                        const auto runtimeIt =
+                            instance_info->virtualSwapchains.find(swapchain);
+                        if (runtimeIt != instance_info->virtualSwapchains.end()) {
+                            const auto stateIt = instance_info->swapchainInfos.find(swapchain);
+                            if (stateIt == instance_info->swapchainInfos.end()
+                                    || stateIt->second.d2Foundation
+                                    || stateIt->second.fixedContext
+                                    || stateIt->second.effectiveMultiplier != 1)
+                                return failBeforeBridge(VK_ERROR_UNKNOWN);
+                            projectionPaths.push_back(
+                                PresentBatchPNextProjection::Path::VirtualPrepared);
+                            transaction->entry(i).path =
+                                BatchPresentTransaction::Path::VirtualPrepared;
+                            virtualEntries.push_back(VirtualBatchEntry{
+                                .logicalIndex = i, .runtime = runtimeIt->second});
+                        } else {
+                            const auto stateIt = instance_info->swapchainInfos.find(swapchain);
+                            if (stateIt != instance_info->swapchainInfos.end()
+                                    && stateIt->second.d2Foundation) {
+                                if (!stateIt->second.d2State)
+                                    return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                                projectionPaths.push_back(
+                                    PresentBatchPNextProjection::Path::D2);
+                                transaction->entry(i).path =
+                                    BatchPresentTransaction::Path::D2;
+                                d2Entries.emplace_back(i, info->pImageIndices[i],
+                                    stateIt->second.d2State);
+                            } else {
+                                projectionPaths.push_back(
+                                    PresentBatchPNextProjection::Path::Native);
+                                transaction->entry(i).path =
+                                    BatchPresentTransaction::Path::Native;
+                            }
+                        }
+                    }
+                } catch (const std::bad_alloc&) {
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                }
+
+                auto projection = PresentBatchPNextProjection::build(
+                    info->pNext, info->swapchainCount, projectionPaths);
+                if (!projection.supported())
+                    return failBeforeBridge(VK_ERROR_UNKNOWN);
+                for (uint32_t i = 0; i < info->swapchainCount; ++i)
+                    if (projection.applicationFence(i) != VK_NULL_HANDLE)
+                        return failBeforeBridge(VK_ERROR_UNKNOWN);
+
+                for (auto& entry : d2Entries) {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+                    if (queuePresentHarnessFailD2BatchReservation.load(
+                            std::memory_order_relaxed))
+                        return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+#endif
+                    const auto generation = entry.state->reserveBatchPresent(
+                        entry.imageIndex);
+                    if (!generation)
+                        return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                    entry.generation = *generation;
+                    auto& value = transaction->entry(entry.logicalIndex);
+                    value.lifecycleGeneration = *generation + 1;
+                    value.preparationAccepted = true;
+                }
+
+                std::shared_ptr<BatchLifetimeBacking> batchLifetime;
+                try {
+                    batchLifetime = std::make_shared<BatchLifetimeBacking>();
+                    batchLifetime->device = quarantineIt->second;
+                    batchLifetime->d2States.reserve(d2Entries.size());
+                    for (const auto& entry : d2Entries)
+                        batchLifetime->d2States.push_back(entry.state);
+                } catch (const std::bad_alloc&) {
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                }
+
+                for (auto& entry : virtualEntries) {
+                    VkResult failure{VK_SUCCESS};
+                    entry.runtimeReservation = entry.runtime->reserveBatchPresent(
+                        info->pImageIndices[entry.logicalIndex], &failure);
+                    if (!entry.runtimeReservation)
+                        return failBeforeBridge(failure);
+                    try {
+                        entry.preparation.emplace(
+                            layer_info->root.getSwapchainContext(
+                                info->pSwapchains[entry.logicalIndex])
+                                .reserveAdaptive1xPreparation(deviceVk->second, queue,
+                                    queueMetadata->second.mutex,
+                                    info->pSwapchains[entry.logicalIndex],
+                                    info->pImageIndices[entry.logicalIndex],
+                                    VK_NULL_HANDLE, {},
+                                    entry.runtimeReservation->imageBacking(),
+                                    reactorIt->second, borrowedIt->second,
+                                    entry.runtimeReservation->completionPublication()));
+                    } catch (const ls::vulkan_error& e) {
+                        return failBeforeBridge(e.error());
+                    } catch (const std::bad_alloc&) {
+                        return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                    } catch (...) {
+                        return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                    }
+                }
+
+                auto bridgeFence = std::make_shared<std::shared_ptr<BatchFenceBacking>>();
+                auto retirementTicket = std::make_shared<DeviceRetirementTicket>();
+                auto reservedJob = std::make_shared<DeviceRetirementReactor::ReservedJob>();
+                auto jobReservation = reactorIt->second->reserveJob(
+                    DeviceRetirementJob{
+                        .deviceIdentity = quarantineIt->second->identity(),
+                        .swapchainLifecycleIdentity = transactionId,
+                        .operationIdentity = transactionId,
+                        .ticket = retirementTicket});
+                if (!jobReservation)
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                *reservedJob = std::move(*jobReservation);
+                if (!reservedJob->valid())
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                auto bridge = BatchApplicationPresentBridgeAuthority::create(
+                    queue, info->pWaitSemaphores, info->waitSemaphoreCount,
+                    static_cast<uint32_t>(virtualEntries.size()),
+                    batchLifetime,
+                    BatchApplicationPresentBridgeAuthority::Operations{
+                        .createSemaphore = [&deviceVk]()
+                                -> std::optional<BatchApplicationPresentBridgeAuthority::OwnedSemaphore> {
+                            try {
+                                auto backing = std::make_shared<BatchSemaphoreBacking>(
+                                    deviceVk->second);
+                                return BatchApplicationPresentBridgeAuthority::OwnedSemaphore{
+                                    backing->value.handle(), backing};
+                            } catch (...) { return std::nullopt; }
+                        },
+                        .createFence = [&deviceVk, bridgeFence]()
+                                -> std::optional<BatchApplicationPresentBridgeAuthority::OwnedFence> {
+                            try {
+                                auto backing = std::make_shared<BatchFenceBacking>(
+                                    deviceVk->second);
+                                *bridgeFence = backing;
+                                return BatchApplicationPresentBridgeAuthority::OwnedFence{
+                                    backing->value.handle(), backing};
+                            } catch (...) { return std::nullopt; }
+                        },
+                        .submit = [dispatch = deviceVk->second.df(),
+                                mutex = queueMetadata->second.mutex](VkQueue q,
+                                const VkSubmitInfo& submit, VkFence fence) {
+                            const std::scoped_lock lock(*mutex);
+                            return dispatch.QueueSubmit(q, 1, &submit, fence);
+                        },
+                        .waitBridgeFence = [dispatch = deviceVk->second.df(), device](
+                                VkFence fence) {
+                            return dispatch.WaitForFences(
+                                device, 1, &fence, VK_TRUE, UINT64_MAX);
+                        },
+                        .retireAsync = [reactor = reactorIt->second, reservedJob,
+                                bridgeFence, vk = &deviceVk->second](VkFence,
+                                std::shared_ptr<void> lifetime) {
+                            try {
+                                if (!*bridgeFence) return false;
+                                const auto fd = (*bridgeFence)->value.exportSyncFd(*vk);
+                                if (fd == -1) return true;
+                                if (!reactor->registerReservedJob(
+                                        *reservedJob, fd, std::move(lifetime))) {
+                                    static_cast<void>(::close(fd));
+                                    return false;
+                                }
+                                return true;
+                            } catch (...) { return false; }
+                        },
+                        .retainConservatively = [reactor = reactorIt->second](
+                                std::shared_ptr<void> value) {
+                            return reactor->retainEventSourceLost(std::move(value));
+                        }});
+                if (!bridge || !transaction->markWaitBridgePrepared())
+                    return failBeforeBridge(VK_ERROR_OUT_OF_HOST_MEMORY);
+                for (uint32_t i = 0; i < virtualEntries.size(); ++i)
+                    if (!virtualEntries[i].preparation->attachWaitBacking(
+                            bridge->signalBacking(i)))
+                        return failBeforeBridge(VK_ERROR_UNKNOWN);
+
+                const auto bridgeResult = bridge->submit();
+                if (bridgeResult != VK_SUCCESS)
+                    return failBeforeBridge(bridgeResult);
+                static_cast<void>(transaction->markWaitBridgeAccepted());
+                for (auto& entry : virtualEntries)
+                    if (!entry.runtimeReservation->commitAfterBridge()) {
+                        bridge->retainDeviceLost();
+                        entry.runtimeReservation->retainIndeterminate();
+                        return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                    }
+                static_cast<void>(transaction->markEntriesPreparing());
+
+                VkResult postBridgeFailure{VK_SUCCESS};
+                for (uint32_t i = 0; i < virtualEntries.size(); ++i) {
+                    auto& virtualEntry = virtualEntries[i];
+                    try {
+                        virtualEntry.prepared.emplace(
+                            virtualEntry.preparation->execute(bridge->signal(i)));
+                    } catch (const ls::vulkan_error& e) {
+                        postBridgeFailure = e.error();
+                        break;
+                    } catch (...) {
+                        postBridgeFailure = VK_ERROR_DEVICE_LOST;
+                        break;
+                    }
+                    if (!virtualEntry.prepared->valid()
+                            || !bridge->markSignalConsumed(i)) {
+                        postBridgeFailure = VK_ERROR_DEVICE_LOST;
+                        break;
+                    }
+                    auto& value = transaction->entry(virtualEntry.logicalIndex);
+                    value.physicalSwapchain =
+                        virtualEntry.prepared->physicalSwapchain();
+                    value.physicalImageIndex =
+                        virtualEntry.prepared->physicalImageIndex();
+                    value.completionSemaphore =
+                        virtualEntry.prepared->presentReadySemaphore();
+                    value.deviceLifetimeIdentity =
+                        virtualEntry.prepared->presentedIdentity()
+                            .deviceLifetimeIdentity;
+                    value.lifecycleGeneration = virtualEntry.prepared->generation();
+                    value.presentOperationIdentity =
+                        virtualEntry.prepared->presentedIdentity()
+                            .presentOperationIdentity;
+                    value.preparationAccepted = true;
+                    if (!projection.patchInternalPresentFence(
+                            virtualEntry.logicalIndex,
+                            virtualEntry.prepared->internalPresentFence())) {
+                        postBridgeFailure = VK_ERROR_DEVICE_LOST;
+                        break;
+                    }
+                }
+                if (postBridgeFailure != VK_SUCCESS) {
+                    for (auto& entry : virtualEntries) {
+                        if (entry.prepared && entry.prepared->valid())
+                            static_cast<void>(entry.prepared->abandonWithoutLogicalPresent());
+                        if (entry.runtimeReservation)
+                            static_cast<void>(entry.runtimeReservation->abortCleanly());
+                    }
+                    for (auto& entry : d2Entries)
+                        static_cast<void>(entry.abort());
+                    const auto recovered = bridge->recoverPartial();
+                    const auto result = recovered == VK_SUCCESS
+                        ? publicPresentResult(postBridgeFailure,
+                            PresentResultOrigin::INTERNAL,
+                            PresentTransactionPhase::POST_COMMIT)
+                        : VK_ERROR_DEVICE_LOST;
+                    return failBeforeBridge(result);
+                }
+
+                static_cast<void>(transaction->markEntriesReady());
+                uint32_t virtualOrdinal{};
+                for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                    if (transaction->entry(i).path
+                            == BatchPresentTransaction::Path::VirtualPrepared) {
+                        auto& prepared = *virtualEntries[virtualOrdinal++].prepared;
+                        static_cast<void>(transaction->setFinalEntry(i,
+                            prepared.physicalSwapchain(),
+                            prepared.physicalImageIndex()));
+                        static_cast<void>(transaction->appendFinalWait(
+                            prepared.presentReadySemaphore()));
+                    } else {
+                        static_cast<void>(transaction->setFinalEntry(i,
+                            info->pSwapchains[i], info->pImageIndices[i]));
+                    }
+                }
+                auto finalInfo = transaction->prepareFinalPresentInfo(
+                    projection.head(), info->pResults,
+                    static_cast<uint32_t>(virtualEntries.size()));
+                if (!finalInfo) {
+                    bridge->retainDeviceLost();
+                    for (auto& entry : virtualEntries)
+                        entry.runtimeReservation->retainIndeterminate();
+                    for (auto& entry : d2Entries)
+                        entry.retainIndeterminate();
+                    return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                }
+                for (auto& entry : virtualEntries)
+                    if (!entry.prepared->markLogicalPresentCalled()) {
+                        bridge->retainDeviceLost();
+                        entry.runtimeReservation->retainIndeterminate();
+                        for (auto& d2Entry : d2Entries)
+                            d2Entry.retainIndeterminate();
+                        return failBeforeBridge(VK_ERROR_DEVICE_LOST);
+                    }
+                static_cast<void>(transaction->markFinalPresentCalled());
+                const auto downstream = deviceVk->second.df().QueuePresentKHR(
+                    queue, &*finalInfo);
+                static_cast<void>(transaction->markFinalPresentResult(downstream));
+                const auto downstreamClass = classifyPresentResult(downstream);
+                VkResult publicResult = publicPresentResult(downstream,
+                    PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT,
+                    PresentTransactionPhase::POST_COMMIT);
+                for (auto& entry : virtualEntries) {
+                    const bool perEntryResultsDefined = info->pResults
+                        && (downstreamClass == PresentResultClass::Normal
+                            || downstreamClass
+                                == PresentResultClass::EnqueuedRejection);
+                    const auto logicalResult = perEntryResultsDefined
+                        ? info->pResults[entry.logicalIndex] : downstream;
+                    mappedResults[entry.logicalIndex] = logicalResult;
+                    const auto finalized =
+                        entry.prepared->finalizeLogicalPresent(logicalResult);
+                    if (finalized != VK_SUCCESS) publicResult = VK_ERROR_DEVICE_LOST;
+                    const auto logicalClass = classifyPresentResult(logicalResult);
+                    if (logicalClass == PresentResultClass::Normal
+                            || logicalClass == PresentResultClass::EnqueuedRejection) {
+                        if (!entry.runtimeReservation->installPublishedCompletion())
+                            publicResult = VK_ERROR_DEVICE_LOST;
+                    } else if (logicalClass == PresentResultClass::PreEnqueueFailure) {
+                        if (!entry.runtimeReservation->abortCleanly())
+                            publicResult = VK_ERROR_DEVICE_LOST;
+                    } else {
+                        entry.runtimeReservation->retainIndeterminate();
+                    }
+                }
+                const auto queueFamily = std::optional<uint32_t>{
+                    queueMetadata->second.family};
+                for (auto& entry : d2Entries) {
+                    const bool perEntryResultsDefined = info->pResults
+                        && (downstreamClass == PresentResultClass::Normal
+                            || downstreamClass
+                                == PresentResultClass::EnqueuedRejection);
+                    const auto logicalResult = perEntryResultsDefined
+                        ? info->pResults[entry.logicalIndex] : downstream;
+                    mappedResults[entry.logicalIndex] = logicalResult;
+                    const auto logicalClass = classifyPresentResult(logicalResult);
+                    if (logicalClass == PresentResultClass::Normal
+                            || logicalClass
+                                == PresentResultClass::EnqueuedRejection) {
+                        if (!entry.commit(queueFamily))
+                            publicResult = VK_ERROR_DEVICE_LOST;
+                    } else if (logicalClass
+                            == PresentResultClass::PreEnqueueFailure) {
+                        if (!entry.abort()) publicResult = VK_ERROR_DEVICE_LOST;
+                    } else {
+                        entry.retainIndeterminate();
+                    }
+                }
+                if (downstreamClass == PresentResultClass::DeviceLost
+                        || downstreamClass == PresentResultClass::Indeterminate)
+                    bridge->retainDeviceLost();
+                else if (!bridge->retireNormalAsync()) {
+                    bridge->retainDeviceLost();
+                    publicResult = VK_ERROR_DEVICE_LOST;
+                }
+                if (downstreamClass == PresentResultClass::PreEnqueueFailure)
+                    publicResult = VK_ERROR_DEVICE_LOST;
+                if (info->pResults) {
+                    for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+                        const bool perEntryResultsDefined =
+                            downstreamClass == PresentResultClass::Normal
+                            || downstreamClass
+                                == PresentResultClass::EnqueuedRejection;
+                        const auto actual = perEntryResultsDefined
+                            ? info->pResults[i] : downstream;
+                        info->pResults[i] = publicPresentResult(actual,
+                            PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT,
+                            PresentTransactionPhase::POST_COMMIT);
+                        mappedResults[i] = info->pResults[i];
+                    }
+                    const auto mappedAggregate = aggregatePresentResults(mappedResults);
+                    if (mappedAggregate != VK_SUCCESS)
+                        publicResult = mappedAggregate;
+                }
+                return publicResult;
+            }
+
+            const auto first = instance_info->swapchains.find(info->pSwapchains[0]);
+            if (first == instance_info->swapchains.end()) {
+                if (info->pResults) {
+                    for (uint32_t i = 0; i < info->swapchainCount; ++i)
+                        info->pResults[i] = VK_ERROR_UNKNOWN;
+                }
+                return VK_ERROR_UNKNOWN;
+            }
+            // The unmodified application batch is the only currently-qualified
+            // way to preserve one wait set, pNext array cardinality, aggregate
+            // result semantics, and any implementation-supported atomic present.
+            return first->second.get().df().QueuePresentKHR(queue, info);
+        }
+
+        // Single-swapchain calls need no pNext projection.  Keep caller memory
+        // immutable and forward the original chain read-only.  Batch projection
+        // is implemented/tested separately for the future batch-aware seam.
+        void* projectedNext = const_cast<void*>(info->pNext);
+
+        std::vector<VkResult> perSwapchainResults(
+            info->swapchainCount, VK_SUCCESS);
+
+        for (uint32_t i = 0; i < info->swapchainCount; ++i) {
+            const auto swapchain = info->pSwapchains[i];
+            const auto it = instance_info->swapchains.find(swapchain);
+            if (it == instance_info->swapchains.end()) {
+                perSwapchainResults[i] = VK_ERROR_DEVICE_LOST;
+                if (info->pResults) info->pResults[i] = perSwapchainResults[i];
+                continue;
+            }
 
             std::vector<VkSemaphore> waitSemaphores;
-            // For an all-virtual batch the dedicated queue establishes FIFO
-            // ordering after the first bridge submit, so the application's
-            // binary present semaphores are consumed exactly once.
-            if (!allVirtual || i == 0) {
+            // The original VkPresentInfoKHR owns one binary wait set for the
+            // complete queue operation.  Decomposition must never wait the same
+            // binary signal more than once.  Queue issue order carries the
+            // established dependency into later decomposed presents.
+            if (i == 0) {
                 waitSemaphores.reserve(info->waitSemaphoreCount);
-                for (size_t j = 0; j < info->waitSemaphoreCount; j++)
+                for (uint32_t j = 0; j < info->waitSemaphoreCount; ++j)
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
             }
 
+            VkResult result = VK_SUCCESS;
+            PresentedPhysicalImageIdentity presentedIdentity{};
             auto virtualIt = instance_info->virtualSwapchains.find(swapchain);
             try {
                 if (virtualIt != instance_info->virtualSwapchains.end()) {
-                    const bool synchronous = info->pNext != nullptr
-                        || info->swapchainCount != 1;
+                    const bool synchronous = info->pNext != nullptr;
                     const auto queueMetadata = instance_info->queues.find(queue);
-                    if (queueMetadata == instance_info->queues.end())
-                        return VK_ERROR_FEATURE_NOT_PRESENT;
-                    const bool surfacePresentSupported = std::ranges::find(
-                        instance_info->swapchainInfos.at(swapchain).surfacePresentFamilies,
-                        queueMetadata->second.family)
-                        != instance_info->swapchainInfos.at(swapchain)
-                            .surfacePresentFamilies.end();
-                    result = virtualIt->second->queuePresent(
-                        queue,
-                        queueMetadata->second.family,
-                        queueMetadata->second.index,
-                        queueMetadata->second.flags,
-                        surfacePresentSupported,
-                        info->pImageIndices[i],
-                        waitSemaphores,
-                        const_cast<void*>(info->pNext),
-                        synchronous);
+                    if (queueMetadata == instance_info->queues.end()) {
+                        result = VK_ERROR_DEVICE_LOST;
+                    } else {
+                        const bool surfacePresentSupported = std::ranges::find(
+                            instance_info->swapchainInfos.at(swapchain).surfacePresentFamilies,
+                            queueMetadata->second.family)
+                            != instance_info->swapchainInfos.at(swapchain)
+                                .surfacePresentFamilies.end();
+                        result = virtualIt->second->queuePresent(
+                            queue,
+                            queueMetadata->second.family,
+                            queueMetadata->second.index,
+                            queueMetadata->second.flags,
+                            surfacePresentSupported,
+                            info->pImageIndices[i],
+                            waitSemaphores,
+                            projectedNext,
+                            synchronous,
+                            &presentedIdentity);
+                    }
                 } else {
-                    result = layer_info->root.presentSwapchain(
+                    const auto execution = layer_info->root.presentSwapchain(
                         it->second,
                         queue,
                         nullptr,
                         swapchain,
-                        const_cast<void*>(info->pNext),
+                        projectedNext,
                         info->pImageIndices[i],
-                        waitSemaphores);
+                        waitSemaphores,
+                        {}, std::nullopt, false, nullptr, nullptr, nullptr,
+                        instance_info->deviceQuarantines.at(it->second.get().dev()),
+                        instance_info->deviceRetirementReactors.at(
+                            it->second.get().dev()),
+                        instance_info->devicePresentedPhysicalImages.at(
+                            it->second.get().dev()),
+                        instance_info->deviceBorrowedPresentFences.at(
+                            it->second.get().dev()),
+                        nullptr, &presentedIdentity);
+                    result = publicPresentResult(execution.result,
+                        execution.origin == SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM
+                            ? PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT
+                            : PresentResultOrigin::INTERNAL,
+                        PresentTransactionPhase::POST_COMMIT);
                 }
-            } catch (const ls::vulkan_error& e) {
+            } catch (const LogicalPresentError& e) {
                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
                     std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain presentation:\n";
                     std::cerr << "- " << e.what() << '\n';
                 }
                 result = e.error();
+            } catch (const ls::vulkan_error& e) {
+                std::cerr << "lsfg-vk: internal failure during lsfg-vk swapchain presentation:\n";
+                std::cerr << "- " << e.what() << '\n';
+                result = publicPresentResult(e.error(), PresentResultOrigin::INTERNAL,
+                    PresentTransactionPhase::POST_COMMIT);
             } catch (const std::exception& e) {
                 std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain presentation:\n";
                 std::cerr << "- " << e.what() << '\n';
-                result = VK_ERROR_UNKNOWN;
+                result = VK_ERROR_DEVICE_LOST;
             }
 
-            if (info->pResults)
-                info->pResults[i] = result;
+            perSwapchainResults[i] = result;
+            if (info->pResults) info->pResults[i] = result;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            if (queuePresentHarnessInstalled && presentedIdentity.valid())
+                queuePresentHarnessLastIdentity = presentedIdentity;
+#endif
+
+            // If the first decomposed operation failed before queue acceptance,
+            // later operations cannot safely inherit a wait that was never
+            // consumed.  Resource/host-memory enqueue failures are guaranteed by
+            // Vulkan to leave synchronization untouched, so stop immediately.
+            if (i == 0 && (result == VK_ERROR_OUT_OF_HOST_MEMORY
+                    || result == VK_ERROR_OUT_OF_DEVICE_MEMORY
+                    || result == VK_ERROR_DEVICE_LOST
+                    || result == VK_ERROR_INITIALIZATION_FAILED
+                    || result == VK_ERROR_FEATURE_NOT_PRESENT
+                    || result == VK_ERROR_UNKNOWN)) {
+                for (uint32_t j = i + 1; j < info->swapchainCount; ++j) {
+                    perSwapchainResults[j] = result;
+                    if (info->pResults) info->pResults[j] = result;
+                }
+                break;
+            }
         }
 
-        return result;
+        return aggregatePresentResults(perSwapchainResults);
 #pragma clang diagnostic pop
     }
 
@@ -2040,21 +3480,23 @@ namespace {
             return;
 
         const auto runtime = instance_info->virtualSwapchains.find(swapchain);
-        if (runtime != instance_info->virtualSwapchains.end()) {
-            runtime->second->stop();
+        const bool wasVirtual = runtime != instance_info->virtualSwapchains.end();
+        if (wasVirtual) {
+            const auto deferredOwner =
+                instance_info->deviceDeferredVirtualRetirements.at(device);
+            const auto detached = runtime->second->stopAndDetach(deferredOwner);
+            if (!detached) std::terminate();
             const bool oneShot = d3b1OneShotRequested(
                 std::getenv("LSFGVK_D3B1_ONESHOT"));
             if (oneShot)
                 std::cerr << "[D3B1-ONESHOT] worker stopped and joined\n";
-            // The asynchronous worker can leave GPU work queued when a stop
-            // request interrupts a bounded acquire/fence wait. Swapchain
-            // destruction is rare, so conservatively drain the device before
-            // destroying worker-owned synchronization and swapchain resources.
+            // Public destruction cannot defer an application allocator. This
+            // idle boundary covers other layer-generated swapchain use, but
+            // exact pending-present authorities remain in deferredOwner.
             const auto idle = it->second.df().DeviceWaitIdle(device);
-            if (oneShot)
-                std::cerr << "[D3B1-ONESHOT] final vkDeviceWaitIdle=" << idle << '\n';
+            deferredOwner->notifyDeviceRetirement();
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
-                std::cerr << "lsfg-vk: vkDeviceWaitIdle() failed during virtual swapchain destruction: "
+                std::cerr << "lsfg-vk: virtual swapchain destroy idle boundary failed: "
                     << idle << '\n';
             }
         }
@@ -2067,10 +3509,628 @@ namespace {
         instance_info->swapchainInfos.erase(swapchain);
         instance_info->swapchains.erase(swapchain);
 
-        // destroy underlying real swapchain
         it->second.df().DestroySwapchainKHR(device, swapchain, alloc);
     }
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+namespace lsfgvk::layer::test {
+__attribute__((visibility("default")))
+bool installDeviceEntrypointHarness(DeviceEntrypointHarnessConfig config) noexcept {
+    if (deviceEntrypointTestContext || config.device == VK_NULL_HANDLE
+            || !config.downstream.CreateFence || !config.downstream.DestroyFence
+            || !config.downstream.GetFenceStatus || !config.downstream.WaitForFences
+            || !config.downstream.ResetFences)
+        return false;
+    try {
+        auto leases = std::make_shared<PresentedPhysicalImageLeaseRegistry>();
+        auto borrowed = std::make_shared<BorrowedPresentFenceRegistry>(
+            config.deviceLifetimeIdentity);
+        auto proxies = std::make_shared<AcquireFenceProxyRegistry>(borrowed);
+        deviceEntrypointTestContext = std::make_unique<DeviceEntrypointTestContext>(
+            DeviceEntrypointTestContext{config.device, config.downstream,
+                std::move(leases), std::move(borrowed), std::move(proxies)});
+        return true;
+    } catch (...) { return false; }
+}
+
+__attribute__((visibility("default")))
+void uninstallDeviceEntrypointHarness() noexcept {
+    deviceEntrypointTestContext.reset();
+}
+
+__attribute__((visibility("default")))
+PFN_vkVoidFunction deviceEntrypoint(const char* name) noexcept {
+    if (!deviceEntrypointTestContext || !name) return nullptr;
+#define TEST_ENTRYPOINT(vkname, impl) \
+    if (std::strcmp(name, vkname) == 0) \
+        return reinterpret_cast<PFN_vkVoidFunction>(impl)
+    TEST_ENTRYPOINT("vkCreateFence", myvkCreateFence);
+    TEST_ENTRYPOINT("vkDestroyFence", myvkDestroyFence);
+    TEST_ENTRYPOINT("vkGetFenceStatus", myvkGetFenceStatus);
+    TEST_ENTRYPOINT("vkWaitForFences", myvkWaitForFences);
+    TEST_ENTRYPOINT("vkResetFences", myvkResetFences);
+    TEST_ENTRYPOINT("vkImportFenceFdKHR", myvkImportFenceFdKHR);
+#undef TEST_ENTRYPOINT
+    return nullptr;
+}
+
+__attribute__((visibility("default")))
+bool installPresentedLease(PresentedPhysicalImageIdentity identity,
+        std::shared_ptr<void> resources) noexcept {
+    return deviceEntrypointTestContext
+        && deviceEntrypointTestContext->leases->install(identity, std::move(resources));
+}
+
+__attribute__((visibility("default")))
+bool associateBorrowedFence(VkFence fence,
+        PresentedPhysicalImageIdentity identity) noexcept {
+    return deviceEntrypointTestContext
+        && deviceEntrypointTestContext->borrowed->associate(fence,
+            deviceEntrypointTestContext->leases, identity);
+}
+
+__attribute__((visibility("default")))
+bool containsPresentedLease(const PresentedPhysicalImageIdentity& identity) noexcept {
+    return deviceEntrypointTestContext
+        && deviceEntrypointTestContext->leases->contains(identity);
+}
+
+__attribute__((visibility("default")))
+size_t borrowedAssociationCount() noexcept {
+    return deviceEntrypointTestContext
+        ? deviceEntrypointTestContext->borrowed->associationCount() : 0;
+}
+
+__attribute__((visibility("default")))
+bool associateAcquireFenceProxy(VkFence fence, VkFence proxy,
+        std::shared_ptr<void> backing) noexcept {
+    if (!deviceEntrypointTestContext) return false;
+    auto prepared = deviceEntrypointTestContext->proxies->prepare(
+        fence, proxy, std::move(backing));
+    if (!prepared) return false;
+    deviceEntrypointTestContext->proxies->commit(*prepared);
+    return !prepared->valid();
+}
+
+__attribute__((visibility("default")))
+size_t acquireFenceProxyAssociationCount() noexcept {
+    return deviceEntrypointTestContext
+        ? deviceEntrypointTestContext->proxies->associationCount() : 0;
+}
+
+__attribute__((visibility("default")))
+VkResult releaseD2PhysicalImageForTesting(VkDevice device,
+        VkSwapchainKHR swapchain, uint32_t index) noexcept {
+    if (!queuePresentHarnessInstalled) return VK_ERROR_INITIALIZATION_FAILED;
+    return releaseD2PhysicalImage(device, swapchain, index);
+}
+
+__attribute__((visibility("default")))
+bool installQueuePresentEntrypointHarness(
+        QueuePresentEntrypointHarnessConfig config) noexcept {
+    if (queuePresentHarnessInstalled || layer_info || instance_info
+            || config.device == VK_NULL_HANDLE || config.queue == VK_NULL_HANDLE
+            || config.swapchain == VK_NULL_HANDLE || !config.vulkan
+            || !config.backend || config.vulkan->dev() != config.device)
+        return false;
+    try {
+        auto ownedLayer = std::make_unique<LayerInfo>();
+        auto ownedInstance = std::make_unique<InstanceInfo>();
+        ls::GameConf profile{};
+        profile.multiplier = config.frameGenerationMultiplier;
+        profile.frame_generation_mode = ls::FrameGenerationMode::Adaptive;
+        ownedLayer->root.setProfileForTesting(profile);
+        ownedInstance->devices.emplace(config.device, std::move(*config.vulkan));
+        auto& installedVk = ownedInstance->devices.at(config.device);
+        ownedInstance->funcs = installedVk.fi();
+        std::shared_ptr<VirtualSwapchainRuntime> virtualRuntime;
+        auto swapchainInfo = config.swapchainInfo;
+        if (config.virtualized) {
+            VirtualSwapchainImageSpec spec{
+                .extent = swapchainInfo.extent,
+                .format = swapchainInfo.format,
+                .arrayLayers = swapchainInfo.arrayLayers,
+                .effectiveUsage = swapchainInfo.usage
+                    ? swapchainInfo.usage
+                    : VkImageUsageFlags2KHR(VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                .usage = swapchainInfo.usage
+                    ? static_cast<VkImageUsageFlags>(swapchainInfo.usage)
+                    : VkImageUsageFlags(VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT),
+                .usageFitsLegacy = true,
+                .hasRequiredTransferUsage = true,
+                .sharingMode = swapchainInfo.sharingMode,
+                .queueFamilyIndices = swapchainInfo.queueFamilyIndices};
+            virtualRuntime = std::make_shared<VirtualSwapchainRuntime>(installedVk,
+                config.queue, std::make_shared<std::mutex>(),
+                swapchainInfo.realImages.size(), spec, false);
+            swapchainInfo.images = virtualRuntime->imageHandles();
+            swapchainInfo.virtualized = true;
+        }
+        auto context = std::make_shared<Swapchain>(installedVk,
+            *config.backend, std::move(config.devicePair), std::move(profile),
+            swapchainInfo, config.virtualized ? config.queueFamily
+                                              : VK_QUEUE_FAMILY_IGNORED);
+        if (!ownedLayer->root.installSwapchainContextForTesting(
+                config.swapchain, std::move(context)))
+            return false;
+        ownedInstance->queues.emplace(config.queue, InstanceInfo::QueueMetadata{
+            config.device, config.queueFamily, config.queueIndex, config.queueFlags});
+        ownedInstance->swapchains.emplace(config.swapchain, ls::R<vk::Vulkan>(installedVk));
+        ownedInstance->swapchainInfos.emplace(config.swapchain, swapchainInfo);
+        ownedInstance->deviceD2VulkanRuntimeOwners.emplace(config.device,
+            std::vector<std::shared_ptr<D2VulkanShadowRuntime>>{});
+        if (swapchainInfo.d2VulkanRuntime)
+            ownedInstance->deviceD2VulkanRuntimeOwners.at(config.device)
+                .push_back(swapchainInfo.d2VulkanRuntime);
+        auto quarantine = std::make_shared<D3B3DeviceLifetimeQuarantine>();
+        ownedInstance->deviceQuarantines.emplace(config.device, quarantine);
+        ownedInstance->deviceRetirementReactors.emplace(config.device,
+            std::make_shared<DeviceRetirementReactor>());
+        auto deferredOwner = std::make_shared<DeferredVirtualRetirementOwner>();
+        ownedInstance->deviceDeferredVirtualRetirements.emplace(
+            config.device, deferredOwner);
+        ownedInstance->devicePresentedPhysicalImages.emplace(config.device,
+            std::make_shared<PresentedPhysicalImageLeaseRegistry>());
+        auto borrowed = std::make_shared<BorrowedPresentFenceRegistry>(
+            quarantine->identity());
+        ownedInstance->deviceBorrowedPresentFences.emplace(config.device, borrowed);
+        ownedInstance->deviceAcquireFenceProxies.emplace(config.device,
+            std::make_shared<AcquireFenceProxyRegistry>(borrowed));
+        ownedLayer->root.getSwapchainContext(config.swapchain)
+            .primeAdaptiveBuilderForTesting(installedVk, config.queueFamily,
+                quarantine,
+                ownedInstance->devicePresentedPhysicalImages.at(config.device));
+        layer_info = ownedLayer.release();
+        instance_info = ownedInstance.release();
+        if (virtualRuntime) {
+            auto* root = &layer_info->root;
+            const auto swapchain = config.swapchain;
+            const auto device = config.device;
+            virtualRuntime->startWorker([root, swapchain, device](uint32_t imageIndex,
+                    VkSemaphore ready, VkSemaphore, void* nextChain,
+                    std::stop_token stopToken,
+                    std::chrono::steady_clock::time_point sourceTime,
+                    bool eligible, const GraphicsFinalQueueInfo& queueInfo,
+                    BorrowedGraphicsQueueLease& lease, bool& stopAfter,
+                    PresentedPhysicalImageIdentity* identity,
+                    std::shared_ptr<void> backing) -> PresentExecutionResult {
+                try {
+                    const auto injected =
+                        queuePresentHarnessWorkerInternalFailure.load();
+                    if (injected != VK_SUCCESS)
+                        throw ls::vulkan_error(injected,
+                            "injected internal virtual presenter failure");
+                    std::unique_ptr<VirtualPresentPendingOperation> pending;
+                    const auto result = root->presentSwapchain(
+                        instance_info->devices.at(device), queueInfo.queue,
+                        std::make_shared<std::mutex>(), swapchain, nextChain,
+                        imageIndex, {ready}, stopToken, sourceTime, eligible,
+                        &queueInfo, &lease, &stopAfter,
+                        instance_info->deviceQuarantines.at(device),
+                        instance_info->deviceRetirementReactors.at(device),
+                        instance_info->devicePresentedPhysicalImages.at(device),
+                        instance_info->deviceBorrowedPresentFences.at(device),
+                        &pending, identity, std::move(backing));
+                    return pending
+                        ? PresentExecutionResult::pendingCompletion(
+                            result.result, std::move(pending),
+                            result.origin == SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM
+                                ? PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT
+                                : PresentResultOrigin::INTERNAL)
+                        : PresentExecutionResult::completed(result.result,
+                            result.origin == SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM
+                                ? PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT
+                                : PresentResultOrigin::INTERNAL);
+                } catch (const LogicalPresentError& e) {
+                    return PresentExecutionResult::failed(e.error(),
+                        PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT);
+                } catch (const ls::vulkan_error& e) {
+                    return PresentExecutionResult::failed(e.error());
+                } catch (...) {
+                    return PresentExecutionResult::failed(VK_ERROR_UNKNOWN);
+                }
+            });
+            instance_info->virtualSwapchains.emplace(
+                config.swapchain, std::move(virtualRuntime));
+        }
+        queuePresentHarnessLastIdentity = {};
+        queuePresentHarnessDeferredOwner = std::move(deferredOwner);
+        queuePresentHarnessInstalled = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+__attribute__((visibility("default")))
+bool addInstalledVirtualSwapchainForTesting(VkSwapchainKHR swapchain) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info || !layer_info
+            || swapchain == VK_NULL_HANDLE || instance_info->swapchains.empty()
+            || instance_info->virtualSwapchains.empty())
+        return false;
+    try {
+        const auto source = instance_info->virtualSwapchains.begin()->first;
+        const auto& sourceInfo = instance_info->swapchainInfos.at(source);
+        auto& installedVk = instance_info->swapchains.at(source).get();
+        const auto queue = instance_info->queues.begin()->first;
+        VirtualSwapchainImageSpec spec{
+            .extent = sourceInfo.extent,
+            .format = sourceInfo.format,
+            .arrayLayers = sourceInfo.arrayLayers,
+            .effectiveUsage = sourceInfo.usage,
+            .usage = static_cast<VkImageUsageFlags>(sourceInfo.usage),
+            .usageFitsLegacy = true,
+            .hasRequiredTransferUsage = true,
+            .sharingMode = sourceInfo.sharingMode,
+            .queueFamilyIndices = sourceInfo.queueFamilyIndices};
+        auto runtime = std::make_shared<VirtualSwapchainRuntime>(installedVk,
+            queue, std::make_shared<std::mutex>(), sourceInfo.realImages.size(),
+            spec, false);
+        auto clonedInfo = sourceInfo;
+        clonedInfo.images = runtime->imageHandles();
+        auto context = layer_info->root.getSwapchainContext(source)
+            .shared_from_this();
+        if (!layer_info->root.installSwapchainContextForTesting(
+                swapchain, context)) return false;
+        instance_info->swapchains.emplace(
+            swapchain, ls::R<vk::Vulkan>(installedVk));
+        instance_info->swapchainInfos.emplace(swapchain, std::move(clonedInfo));
+        runtime->startWorker([](uint32_t, VkSemaphore, VkSemaphore, void*,
+                std::stop_token, std::chrono::steady_clock::time_point, bool,
+                const GraphicsFinalQueueInfo&, BorrowedGraphicsQueueLease&,
+                bool&, PresentedPhysicalImageIdentity*, std::shared_ptr<void>) {
+            return PresentExecutionResult::failed(VK_ERROR_DEVICE_LOST);
+        });
+        instance_info->virtualSwapchains.emplace(swapchain, std::move(runtime));
+        return true;
+    } catch (...) { return false; }
+}
+
+__attribute__((visibility("default")))
+bool addInstalledNativeSwapchainForTesting(VkSwapchainKHR swapchain) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info || !layer_info
+            || swapchain == VK_NULL_HANDLE || instance_info->swapchains.empty())
+        return false;
+    try {
+        const auto source = instance_info->swapchains.begin()->first;
+        auto& installedVk = instance_info->swapchains.at(source).get();
+        auto info = instance_info->swapchainInfos.at(source);
+        info.virtualized = false;
+        info.d2Foundation = false;
+        info.d2State.reset();
+        info.d2VulkanRuntime.reset();
+        instance_info->swapchains.emplace(
+            swapchain, ls::R<vk::Vulkan>(installedVk));
+        instance_info->swapchainInfos.emplace(swapchain, std::move(info));
+        return true;
+    } catch (...) { return false; }
+}
+
+__attribute__((visibility("default")))
+bool addInstalledD2SwapchainForTesting(VkSwapchainKHR swapchain) noexcept {
+    if (!addInstalledNativeSwapchainForTesting(swapchain)) return false;
+    try {
+        auto& info = instance_info->swapchainInfos.at(swapchain);
+        info.d2Foundation = true;
+        info.d2State = std::make_shared<D2RealWsiState>(
+            std::max<size_t>(1, info.realImages.size()));
+        if (!info.d2State->acquired(0)) return false;
+        queuePresentHarnessLastD2State = info.d2State;
+        return true;
+    } catch (...) {
+        instance_info->swapchainInfos.erase(swapchain);
+        instance_info->swapchains.erase(swapchain);
+        return false;
+    }
+}
+
+__attribute__((visibility("default")))
+std::optional<D2PhysicalImageState> installedD2StateForTesting(
+        VkSwapchainKHR swapchain, uint32_t index) noexcept {
+    if (!instance_info) return std::nullopt;
+    const auto found = instance_info->swapchainInfos.find(swapchain);
+    if (found == instance_info->swapchainInfos.end()
+            || !found->second.d2Foundation || !found->second.d2State)
+        return std::nullopt;
+    return found->second.d2State->state(index);
+}
+
+__attribute__((visibility("default")))
+void setD2BatchReservationFailureForTesting(bool value) noexcept {
+    queuePresentHarnessFailD2BatchReservation.store(
+        value, std::memory_order_relaxed);
+}
+
+__attribute__((visibility("default")))
+bool lastInstalledD2StateAliveForTesting() noexcept {
+    return !queuePresentHarnessLastD2State.expired();
+}
+
+__attribute__((visibility("default")))
+bool replaceInstalledRetirementReactorWithFreshForTesting(
+        VkDevice device) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || !instance_info->deviceRetirementReactors.contains(device))
+        return false;
+    try {
+        auto fresh = std::make_shared<DeviceRetirementReactor>();
+        if (fresh->pendingCount() != 0) return false;
+        instance_info->deviceRetirementReactors.at(device) = std::move(fresh);
+        return instance_info->deviceRetirementReactors.at(device)
+            ->pendingCount() == 0;
+    } catch (...) { return false; }
+}
+
+__attribute__((visibility("default")))
+void uninstallQueuePresentEntrypointHarness() noexcept {
+    if (!queuePresentHarnessInstalled) return;
+    delete instance_info;
+    instance_info = nullptr;
+    delete layer_info;
+    layer_info = nullptr;
+    queuePresentHarnessInstalled = false;
+    queuePresentHarnessLastIdentity = {};
+    queuePresentHarnessDeferredOwner.reset();
+    queuePresentHarnessSeededDone.reset();
+    queuePresentHarnessSeededBacking.reset();
+    queuePresentHarnessSeededDestroys = 0;
+    queuePresentHarnessWorkerInternalFailure.store(VK_SUCCESS);
+    queuePresentHarnessFailD2Bookkeeping.store(false);
+    queuePresentHarnessFailD2BatchReservation.store(false);
+    queuePresentHarnessLastD2State.reset();
+}
+
+__attribute__((visibility("default")))
+PFN_vkVoidFunction queuePresentEntrypoint() noexcept {
+    return queuePresentHarnessInstalled
+        ? reinterpret_cast<PFN_vkVoidFunction>(myvkQueuePresentKHR) : nullptr;
+}
+
+__attribute__((visibility("default")))
+PFN_vkVoidFunction queuePresentAcquireEntrypoint() noexcept {
+    return queuePresentHarnessInstalled
+        ? reinterpret_cast<PFN_vkVoidFunction>(myvkAcquireNextImageKHR) : nullptr;
+}
+
+__attribute__((visibility("default")))
+PFN_vkVoidFunction queuePresentDeviceEntrypoint(const char* name) noexcept {
+    if (!queuePresentHarnessInstalled || !name) return nullptr;
+#define QUEUE_TEST_ENTRYPOINT(vkname, impl) \
+    if (std::strcmp(name, vkname) == 0) \
+        return reinterpret_cast<PFN_vkVoidFunction>(impl)
+    QUEUE_TEST_ENTRYPOINT("vkCreateFence", myvkCreateFence);
+    QUEUE_TEST_ENTRYPOINT("vkDestroyFence", myvkDestroyFence);
+    QUEUE_TEST_ENTRYPOINT("vkGetFenceStatus", myvkGetFenceStatus);
+    QUEUE_TEST_ENTRYPOINT("vkWaitForFences", myvkWaitForFences);
+    QUEUE_TEST_ENTRYPOINT("vkResetFences", myvkResetFences);
+    QUEUE_TEST_ENTRYPOINT("vkImportFenceFdKHR", myvkImportFenceFdKHR);
+    QUEUE_TEST_ENTRYPOINT("vkAcquireNextImage2KHR", myvkAcquireNextImage2KHR);
+    QUEUE_TEST_ENTRYPOINT("vkCreateSwapchainKHR", myvkCreateSwapchainKHR);
+    QUEUE_TEST_ENTRYPOINT("vkGetSwapchainImagesKHR", myvkGetSwapchainImagesKHR);
+    QUEUE_TEST_ENTRYPOINT("vkReleaseSwapchainImagesKHR", myvkReleaseSwapchainImagesKHR);
+    QUEUE_TEST_ENTRYPOINT("vkReleaseSwapchainImagesEXT", myvkReleaseSwapchainImagesEXT);
+    QUEUE_TEST_ENTRYPOINT("vkDestroySwapchainKHR", myvkDestroySwapchainKHR);
+    QUEUE_TEST_ENTRYPOINT("vkDestroyDevice", myvkDestroyDevice);
+#undef QUEUE_TEST_ENTRYPOINT
+    return nullptr;
+}
+
+__attribute__((visibility("default")))
+void setQueuePresentWorkerInternalFailure(VkResult result) noexcept {
+    queuePresentHarnessWorkerInternalFailure.store(result);
+}
+
+__attribute__((visibility("default")))
+void setD2CreateBookkeepingFailure(bool value) noexcept {
+    queuePresentHarnessFailD2Bookkeeping.store(value);
+}
+
+__attribute__((visibility("default")))
+size_t rootSwapchainContextCount() noexcept {
+    return queuePresentHarnessInstalled && layer_info
+        ? layer_info->root.swapchainContextCountForTesting() : 0;
+}
+
+__attribute__((visibility("default")))
+Adaptive1xPreparationReservation reserveInstalledAdaptive1xForTesting(
+        VkFence applicationFence) {
+    if (!queuePresentHarnessInstalled || !layer_info || !instance_info
+            || instance_info->queues.empty() || instance_info->swapchains.empty())
+        throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
+            "Adaptive builder harness is unavailable");
+    const auto& [queue, metadata] = *instance_info->queues.begin();
+    const auto swapchain = instance_info->swapchains.begin()->first;
+    const auto device = metadata.device;
+    auto publication = std::make_shared<
+        std::unique_ptr<VirtualPresentPendingOperation>>();
+    return layer_info->root.getSwapchainContext(swapchain)
+        .reserveAdaptive1xPreparation(instance_info->devices.at(device), queue,
+            std::make_shared<std::mutex>(), swapchain, 0, applicationFence, {},
+            std::make_shared<int>(1),
+            instance_info->deviceRetirementReactors.at(device),
+            instance_info->deviceBorrowedPresentFences.at(device),
+            std::move(publication));
+}
+
+__attribute__((visibility("default")))
+size_t installedPresentedLeaseCount() noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || instance_info->devicePresentedPhysicalImages.empty()) return 0;
+    return instance_info->devicePresentedPhysicalImages.begin()->second->size();
+}
+
+__attribute__((visibility("default")))
+PresentedPhysicalImageLeaseRegistry::PreparationState
+installedPresentedLeasePreparationState(
+        const PresentedPhysicalImageIdentity& identity) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || instance_info->devicePresentedPhysicalImages.empty())
+        return PresentedPhysicalImageLeaseRegistry::PreparationState::Missing;
+    return instance_info->devicePresentedPhysicalImages.begin()->second
+        ->preparationState(identity);
+}
+
+__attribute__((visibility("default")))
+BorrowedPresentFenceRegistry::PreparationState
+installedBorrowedPreparationState(VkFence fence,
+        const PresentedPhysicalImageIdentity& identity) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || instance_info->deviceBorrowedPresentFences.empty())
+        return BorrowedPresentFenceRegistry::PreparationState::Missing;
+    return instance_info->deviceBorrowedPresentFences.begin()->second
+        ->preparationState(fence, identity);
+}
+
+__attribute__((visibility("default")))
+size_t installedBorrowedAssociationCount() noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || instance_info->deviceBorrowedPresentFences.empty()) return 0;
+    return instance_info->deviceBorrowedPresentFences.begin()->second
+        ->associationCount();
+}
+
+__attribute__((visibility("default")))
+SwapchainReleaseBackend setInstalledAdaptiveReleaseBackendForTesting(
+        SwapchainReleaseBackend value) noexcept {
+    if (!queuePresentHarnessInstalled || !layer_info || !instance_info
+            || instance_info->swapchains.empty()) return SwapchainReleaseBackend::None;
+    try {
+        return layer_info->root.getSwapchainContext(
+            instance_info->swapchains.begin()->first)
+            .setReleaseBackendForTesting(value);
+    } catch (...) { return SwapchainReleaseBackend::None; }
+}
+
+__attribute__((visibility("default")))
+bool submitInstalledAdaptiveBridgeForTesting(uint32_t waitCount,
+        const VkSemaphore* waits, uint32_t signalCount,
+        const VkSemaphore* signals) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info
+            || instance_info->queues.empty() || (!waits && waitCount)
+            || (!signals && signalCount)) return false;
+    try {
+        const auto& [queue, metadata] = *instance_info->queues.begin();
+        std::vector<VkPipelineStageFlags> stages(
+            waitCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = waitCount,
+            .pWaitSemaphores = waits,
+            .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
+            .signalSemaphoreCount = signalCount,
+            .pSignalSemaphores = signals};
+        return instance_info->devices.at(metadata.device).df().QueueSubmit(
+            queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS;
+    } catch (...) { return false; }
+}
+
+__attribute__((visibility("default")))
+bool trackedSwapchain(VkSwapchainKHR swapchain) noexcept {
+    return queuePresentHarnessInstalled && instance_info
+        && instance_info->swapchainInfos.contains(swapchain)
+        && instance_info->swapchains.contains(swapchain);
+}
+
+__attribute__((visibility("default")))
+void removeQueueMetadata(VkQueue queue) noexcept {
+    if (queuePresentHarnessInstalled && instance_info)
+        instance_info->queues.erase(queue);
+}
+
+__attribute__((visibility("default")))
+bool seedPendingRetirement(VkSwapchainKHR swapchain) noexcept {
+    class ControlledPending final : public VirtualPresentPendingOperation {
+    public:
+        ControlledPending(std::shared_ptr<std::atomic_bool> done,
+                std::shared_ptr<void> backing) : done(std::move(done)),
+            backing(std::move(backing)) {}
+        ~ControlledPending() override { ++queuePresentHarnessSeededDestroys; }
+        [[nodiscard]] VirtualPresentCompletionStatus tryComplete() noexcept override {
+            return done->load() ? VirtualPresentCompletionStatus::RETIRED
+                                : VirtualPresentCompletionStatus::NOT_READY;
+        }
+    private:
+        std::shared_ptr<std::atomic_bool> done;
+        std::shared_ptr<void> backing;
+    };
+    if (!queuePresentHarnessInstalled || !instance_info) return false;
+    const auto runtime = instance_info->virtualSwapchains.find(swapchain);
+    if (runtime == instance_info->virtualSwapchains.end()) return false;
+    queuePresentHarnessSeededDone = std::make_shared<std::atomic_bool>(false);
+    auto backing = std::make_shared<uint8_t>(0);
+    queuePresentHarnessSeededBacking = backing;
+    queuePresentHarnessSeededDestroys = 0;
+    return runtime->second->installPendingForTesting(
+        UINT32_MAX, UINT64_MAX, std::make_unique<ControlledPending>(
+            queuePresentHarnessSeededDone, std::move(backing)));
+}
+
+__attribute__((visibility("default")))
+void completeSeededPendingRetirement() noexcept {
+    if (queuePresentHarnessSeededDone)
+        queuePresentHarnessSeededDone->store(true);
+}
+
+__attribute__((visibility("default")))
+bool seededPendingBackingAlive() noexcept {
+    return !queuePresentHarnessSeededBacking.expired();
+}
+
+__attribute__((visibility("default")))
+uint32_t seededPendingDestroyCount() noexcept {
+    return queuePresentHarnessSeededDestroys;
+}
+
+__attribute__((visibility("default")))
+size_t deferredPendingCount(VkDevice) noexcept {
+    return queuePresentHarnessDeferredOwner
+        ? queuePresentHarnessDeferredOwner->pendingCount() : 0;
+}
+
+__attribute__((visibility("default")))
+void notifyDeferredRetirement(VkDevice device) noexcept {
+    if (!queuePresentHarnessInstalled || !instance_info) return;
+    const auto owner = instance_info->deviceDeferredVirtualRetirements.find(device);
+    if (owner != instance_info->deviceDeferredVirtualRetirements.end())
+        owner->second->notifyDeviceRetirement();
+}
+
+__attribute__((visibility("default")))
+PresentedPhysicalImageIdentity lastProductionPresentedIdentity() noexcept {
+    return queuePresentHarnessLastIdentity;
+}
+
+__attribute__((visibility("default")))
+bool productionPresentedLeaseInstalled() noexcept {
+    if (!queuePresentHarnessInstalled || !queuePresentHarnessLastIdentity.valid())
+        return false;
+    const auto& identity = queuePresentHarnessLastIdentity;
+    const auto swapchain = reinterpret_cast<VkSwapchainKHR>(
+        identity.physicalSwapchainIdentity);
+    const auto it = instance_info->swapchains.find(swapchain);
+    if (it == instance_info->swapchains.end()) return false;
+    return instance_info->devicePresentedPhysicalImages.at(it->second.get().dev())
+        ->contains(identity);
+}
+
+__attribute__((visibility("default")))
+bool maintenanceFeatureUsable(const VkDeviceCreateInfo& info) noexcept {
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR owned{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
+    auto copy = info;
+    return enableSwapchainMaintenanceFeature(copy, owned);
+}
+
+__attribute__((visibility("default")))
+bool timelineFeatureUsable(const VkDeviceCreateInfo& info) noexcept {
+    return timelineSemaphoreUsable(info);
+}
+
+}
+#endif
 
 /// Vulkan layer entrypoint
 __attribute__((visibility("default")))
@@ -2101,10 +4161,18 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
                 { "vkGetDeviceQueue", VKPTR(myvkGetDeviceQueue) },
                 { "vkGetDeviceQueue2", VKPTR(myvkGetDeviceQueue2) },
+                { "vkCreateFence", VKPTR(myvkCreateFence) },
+                { "vkDestroyFence", VKPTR(myvkDestroyFence) },
+                { "vkGetFenceStatus", VKPTR(myvkGetFenceStatus) },
+                { "vkWaitForFences", VKPTR(myvkWaitForFences) },
+                { "vkResetFences", VKPTR(myvkResetFences) },
+                { "vkImportFenceFdKHR", VKPTR(myvkImportFenceFdKHR) },
                 { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
                 { "vkGetSwapchainImagesKHR", VKPTR(myvkGetSwapchainImagesKHR) },
                 { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },
                 { "vkAcquireNextImage2KHR", VKPTR(myvkAcquireNextImage2KHR) },
+                { "vkReleaseSwapchainImagesKHR", VKPTR(myvkReleaseSwapchainImagesKHR) },
+                { "vkReleaseSwapchainImagesEXT", VKPTR(myvkReleaseSwapchainImagesEXT) },
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR

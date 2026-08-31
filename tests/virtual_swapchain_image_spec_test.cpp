@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "../lsfg-vk-layer/src/virtual_swapchain_image_spec.hpp"
+#include "lsfg-vk-common/vulkan/command_buffer.hpp"
 
 #include <array>
 #include <cassert>
@@ -17,17 +18,22 @@ int main() {
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         info.imageExtent = { 1920, 1080 };
+        info.imageArrayLayers = 2;
         info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
             | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         const auto spec = makeVirtualSwapchainImageSpec(info);
-        assert(spec.supported());
+        // The descriptor remains faithful, but the single-layer FG backend
+        // must be unreachable for a multilayer swapchain.
+        assert(!spec.supported());
         assert(spec.imageFlags == 0);
         assert(spec.extent.width == 1920);
         assert(spec.extent.height == 1080);
         assert(spec.format == VK_FORMAT_B8G8R8A8_UNORM);
+        assert(spec.arrayLayers == 2);
+        assert(spec.effectiveUsage == info.imageUsage);
         assert(spec.usage == info.imageUsage);
         assert(spec.sharingMode == VK_SHARING_MODE_EXCLUSIVE);
         assert(spec.queueFamilyIndices.empty());
@@ -36,6 +42,7 @@ int main() {
 
         const auto options = spec.imageOptions();
         assert(options.flags == 0);
+        assert(options.arrayLayers == 2);
         assert(options.sharingMode == VK_SHARING_MODE_EXCLUSIVE);
         assert(options.queueFamilyIndices.empty());
         assert(options.pNext == nullptr);
@@ -57,7 +64,10 @@ int main() {
         info.flags = VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
         info.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         info.imageExtent = { 2560, 1440 };
+        info.imageArrayLayers = 1;
         info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
         info.queueFamilyIndexCount = static_cast<uint32_t>(queueFamilies.size());
         info.pQueueFamilyIndices = queueFamilies.data();
@@ -65,6 +75,7 @@ int main() {
         const auto spec = makeVirtualSwapchainImageSpec(info);
         assert(spec.supported());
         assert((spec.imageFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0);
+        assert((spec.imageFlags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) != 0);
         assert(spec.hasFormatList);
         assert(spec.viewFormats.size() == 2);
         assert(spec.viewFormats.at(0) == VK_FORMAT_B8G8R8A8_UNORM);
@@ -84,17 +95,66 @@ int main() {
     }
 
     {
+        VkImageUsageFlags2CreateInfoKHR usage2{};
+        usage2.sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR;
+        usage2.usage = VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR
+            | VK_IMAGE_USAGE_2_TRANSFER_DST_BIT_KHR;
+        VkSwapchainCreateInfoKHR info{};
+        info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        info.pNext = &usage2;
+        info.imageArrayLayers = 1;
+        info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        const auto spec = makeVirtualSwapchainImageSpec(info);
+        assert(spec.supported());
+        assert(spec.effectiveUsage == usage2.usage);
+        assert(spec.usage == (VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+        assert(usage2.usage == (VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR
+            | VK_IMAGE_USAGE_2_TRANSFER_DST_BIT_KHR));
+    }
+
+    {
         VkSwapchainCreateInfoKHR info{};
         info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
         info.flags = VK_SWAPCHAIN_CREATE_PRESENT_ID_2_BIT_KHR
             | VK_SWAPCHAIN_CREATE_PRESENT_WAIT_2_BIT_KHR
             | VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+        info.imageArrayLayers = 1;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        info.imageUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
         const auto spec = makeVirtualSwapchainImageSpec(info);
         assert(spec.supported());
         assert(spec.unsupportedSwapchainFlags == 0);
         assert(spec.imageFlags == 0);
+    }
+
+    {
+        VkImageUsageFlags2CreateInfoKHR usage2{};
+        usage2.sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR;
+        usage2.usage = VK_IMAGE_USAGE_2_COLOR_ATTACHMENT_BIT_KHR;
+        VkSwapchainCreateInfoKHR info{};
+        info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        info.pNext = &usage2;
+        info.imageArrayLayers = 1;
+        info.imageUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+            | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        const auto spec = makeVirtualSwapchainImageSpec(info);
+        assert(spec.effectiveUsage == usage2.usage);
+        assert(!spec.hasRequiredTransferUsage);
+        assert(!spec.supported());
+    }
+
+    {
+        const auto region = vk::makeImageBlitRegion(
+            {VkExtent2D{1920, 1080}, VkExtent2D{1920, 1080}}, 2);
+        assert(region.srcSubresource.layerCount == 2);
+        assert(region.dstSubresource.layerCount == 2);
     }
 
     {

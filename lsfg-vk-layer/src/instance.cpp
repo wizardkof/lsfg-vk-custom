@@ -501,20 +501,16 @@ void Root::modifyDeviceCreateInfo(const ConfigSnapshot& snapshot,
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
 
-    bool isFeatureEnabled = false;
-    auto* featureInfo = reinterpret_cast<VkBaseInStructure*>(const_cast<void*>(createInfo.pNext));
+    bool featureAlreadyPresent = false;
+    auto* featureInfo = reinterpret_cast<const VkBaseInStructure*>(createInfo.pNext);
     while (featureInfo) {
         if (featureInfo->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
-            auto* features = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(featureInfo);
-            features->timelineSemaphore = VK_TRUE;
-            isFeatureEnabled = true;
+            featureAlreadyPresent = true;
         } else if (featureInfo->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) {
-            auto* features = reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(featureInfo);
-            features->timelineSemaphore = VK_TRUE;
-            isFeatureEnabled = true;
+            featureAlreadyPresent = true;
         }
 
-        featureInfo = const_cast<VkBaseInStructure*>(featureInfo->pNext);
+        featureInfo = featureInfo->pNext;
     }
 
     VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeatures{
@@ -522,7 +518,7 @@ void Root::modifyDeviceCreateInfo(const ConfigSnapshot& snapshot,
         .pNext = const_cast<void*>(createInfo.pNext),
         .timelineSemaphore = VK_TRUE
     };
-    if (!isFeatureEnabled)
+    if (!featureAlreadyPresent)
         createInfo.pNext = &timelineFeatures;
 
     finish();
@@ -690,12 +686,12 @@ void Root::createSwapchainContext(const ConfigSnapshot& snapshot,
     }
 
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info,
+        std::make_shared<Swapchain>(vk, this->backend.mut(), *runtimePair, profile, info,
             exchangeQueue.has_value() ? exchangeQueue->familyIndex
                 : VK_QUEUE_FAMILY_IGNORED));
 }
 
-VkResult Root::presentSwapchain(const vk::Vulkan& vk,
+SwapchainPresentResult Root::presentSwapchain(const vk::Vulkan& vk,
         VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
         VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
         const std::vector<VkSemaphore>& semaphores,
@@ -704,16 +700,26 @@ VkResult Root::presentSwapchain(const vk::Vulkan& vk,
         bool d3bSingleSwapchainEligible,
         const GraphicsFinalQueueInfo* graphicsFinalQueue,
         BorrowedGraphicsQueueLease* graphicsLease,
-        bool* stopAfterCompletion) {
+        bool* stopAfterCompletion,
+        std::shared_ptr<D3B3DeviceLifetimeQuarantine> deviceQuarantine,
+        std::shared_ptr<DeviceRetirementReactor> deviceRetirementReactor,
+        std::shared_ptr<PresentedPhysicalImageLeaseRegistry> physicalImageLeases,
+        std::shared_ptr<BorrowedPresentFenceRegistry> borrowedPresentFences,
+        std::unique_ptr<VirtualPresentPendingOperation>* pendingCompletion,
+        PresentedPhysicalImageIdentity* presentedIdentity,
+        std::shared_ptr<void> virtualGpuBacking) {
     const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     const auto it = this->swapchains.find(swapchain);
     if (it == this->swapchains.end())
         throw ls::error("swapchain context not found");
 
-    return it->second.present(vk, queue, std::move(queueMutex), swapchain,
+    return it->second->present(vk, queue, std::move(queueMutex), swapchain,
         nextChain, imageIndex, semaphores, std::move(stopToken), sourcePresentTime,
         d3bSingleSwapchainEligible, graphicsFinalQueue, graphicsLease,
-        stopAfterCompletion);
+        stopAfterCompletion, std::move(deviceQuarantine),
+        std::move(deviceRetirementReactor), std::move(physicalImageLeases),
+        std::move(borrowedPresentFences),
+        pendingCompletion, presentedIdentity, std::move(virtualGpuBacking));
 }
 
 void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
@@ -745,7 +751,7 @@ void Root::recreateSwapchainContext(const ConfigSnapshot& snapshot,
 
     this->swapchains.erase(swapchain);
     this->swapchains.emplace(swapchain,
-        Swapchain(vk, this->backend.mut(), *runtimePair, profile, info,
+        std::make_shared<Swapchain>(vk, this->backend.mut(), *runtimePair, profile, info,
             exchangeQueue.has_value() ? exchangeQueue->familyIndex
                 : VK_QUEUE_FAMILY_IGNORED));
 }
@@ -754,3 +760,24 @@ void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {
     const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
     this->swapchains.erase(swapchain);
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+bool Root::installSwapchainContextForTesting(VkSwapchainKHR swapchain,
+        std::shared_ptr<Swapchain> context) {
+    if (swapchain == VK_NULL_HANDLE || !context)
+        return false;
+    const std::scoped_lock<std::mutex> lock(this->swapchainMutex);
+    return this->swapchains.emplace(swapchain, std::move(context)).second;
+}
+
+void Root::setProfileForTesting(ls::GameConf profile) {
+    const std::scoped_lock lock(this->configMutex);
+    static_cast<void>(this->configState.select(
+        std::move(profile), ls::GlobalConf{}));
+}
+
+size_t Root::swapchainContextCountForTesting() {
+    const std::scoped_lock lock(this->swapchainMutex);
+    return this->swapchains.size();
+}
+#endif

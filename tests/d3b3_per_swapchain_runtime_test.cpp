@@ -122,20 +122,15 @@ int main() {
     Fixture fixture;
     D3B3PerSwapchainRuntimeFactory factory;
     size_t bindings{};
+    auto resources = std::make_shared<D3B3ProductionResourceState>();
     const D3B3PerSwapchainRuntimeAssembly assembly{
-        .bindFiniteOperations = [&](D3B3ProductionCoreOwner& core,
+        .bindAsyncFiniteOperations = [&](D3B3ProductionCoreOwner& core,
                 const D3B3PerSwapchainRuntimeDescriptor&) {
             assert(core.structurallyReady());
             ++bindings;
-            return inertOperations();
-        },
-        .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
-            return [] { return true; };
-        },
-        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
-                const D3B3PerSwapchainRuntimeDescriptor&) {
             return inertAsyncOperations();
-        }};
+        },
+        .resourceState = resources};
 
     auto first = factory.create(fixture.descriptor(0x100, 1), assembly);
     auto second = factory.create(fixture.descriptor(0x200, 1), assembly);
@@ -154,17 +149,11 @@ int main() {
 
     // Failed local construction cannot replace or publish an entry.
     const D3B3PerSwapchainRuntimeAssembly failing{
-        .bindFiniteOperations = [](D3B3ProductionCoreOwner&,
-                const D3B3PerSwapchainRuntimeDescriptor&) -> D3B3FiniteProductionOperations {
+        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
+                const D3B3PerSwapchainRuntimeDescriptor&) -> D3B3AsyncFiniteOperations {
             throw std::runtime_error("injected assembly failure");
         },
-        .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
-            return [] { return true; };
-        },
-        .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
-                const D3B3PerSwapchainRuntimeDescriptor&) {
-            return inertAsyncOperations();
-        }};
+        .resourceState = resources};
     try {
         (void)factory.recreate(fixture.descriptor(0x200, 3), failing);
         assert(false);
@@ -184,16 +173,15 @@ int main() {
     assert(factory.find(handle(0x200)) == replacement);
 
     D3B3PerSwapchainRuntimeFactory activeFactory;
+    auto activeResources = std::make_shared<D3B3ProductionResourceState>();
+    auto activeToken = activeResources->acquire(
+        D3B3ProductionInputDomain::FRAME_TRANSPORT, 0x300, 1, 1);
     const D3B3PerSwapchainRuntimeAssembly active{
-        .bindFiniteOperations = [](D3B3ProductionCoreOwner&,
-                const D3B3PerSwapchainRuntimeDescriptor&) { return inertOperations(); },
-        .bindRetirementReady = [](D3B3ProductionCoreOwner&) {
-            return [] { return false; };
-        },
         .bindAsyncFiniteOperations = [](D3B3ProductionCoreOwner&,
                 const D3B3PerSwapchainRuntimeDescriptor&) {
             return inertAsyncOperations();
-        }};
+        },
+        .resourceState = activeResources};
     auto pending = activeFactory.create(fixture.descriptor(0x300, 1), active);
     assert(!activeFactory.destroy(handle(0x300)));
     try {

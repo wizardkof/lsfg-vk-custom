@@ -1,8 +1,10 @@
 #include "shadow_b_return_execution_harness.hpp"
+#include "d3b3_terminal_context.hpp"
 #include "d3b3_production_core_owner.hpp"
 #include "d3b3_production_seams.hpp"
 #include "d3b3_normal_present_adapter.hpp"
 #include "d3b3_per_swapchain_runtime.hpp"
+#include "d3b3_production_runtime.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 
 #include <cassert>
@@ -1332,21 +1334,37 @@ void testBReturnExportFailureAfterAcceptedSubmit() {
     assert(fixture.harness.observed.calls == 1);
     assert(fixture.harness.productionBReturnExportCalls == 1);
     assert(fixture.harness.aObserved.calls == 0);
-    auto recoveredOptional = returnSession->takeAcceptedShadowFailureForTesting();
-    assert(recoveredOptional.has_value());
-    auto recovered = std::move(*recoveredOptional);
-    assert(!recovered.valid());
-    assert(recovered.acceptedSubmissionAuthorityForTesting());
-    assert(!recovered.payloadOwnedForTesting());
-    assert(recovered.bReturnAuthority().fenceHandle() == fixture.harness.returnFence);
-    assert(recovered.bReturnAuthority().state()
-        == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
+    assert(returnSession->hasAcceptedBReturnFailure());
     const auto submitted = fixture.backend->inspectShadowPrepassGenerate(
         *fixture.backendSession);
     assert(submitted.bReturnSubmitCount == 1 && submitted.aReturnSubmitCount == 0);
     assert(submitted.generationReadyWaitSubmitted);
     assert(!submitted.generationReadyWaitRetired && !submitted.generationReadyReusable);
-    retireRecoveredBReturn(fixture, *returnSession, recovered);
+    const auto poolsBefore = fixture.harness.commandPoolObservation.destroyCalls;
+    const auto semaphoresBefore = fixture.harness.semaphoreDestroyCalls;
+    const auto fencesBefore = fixture.harness.fenceDestroyCalls;
+    assert(returnSession->tryRetireAcceptedBReturnFailure(
+        *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::NOT_READY);
+    assert(returnSession->hasAcceptedBReturnFailure());
+    assert(fixture.harness.commandPoolObservation.destroyCalls == poolsBefore);
+    assert(fixture.harness.semaphoreDestroyCalls == semaphoresBefore);
+    assert(fixture.harness.fenceDestroyCalls == fencesBefore);
+    fixture.retireSourceReads();
+    fixture.harness.retireFence();
+    assert(returnSession->tryRetireAcceptedBReturnFailure(
+        *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(returnSession->releaseAcceptedBReturnFailure(
+        *fixture.backend, *fixture.backendSession)
+        == lsfgvk::backend::RuntimeRetirementStatus::RETIRED);
+    assert(!returnSession->hasAcceptedBReturnFailure());
+    assert(fixture.harness.commandPoolObservation.destroyCalls == poolsBefore + 1);
+    assert(fixture.harness.semaphoreDestroyCalls == semaphoresBefore + 1);
+    assert(fixture.harness.fenceDestroyCalls == fencesBefore + 1);
+    const auto retired = fixture.backend->inspectShadowPrepassGenerate(
+        *fixture.backendSession);
+    assert(retired.generationReadyReusable && retired.generatedOutputRetired);
     assert(fixture.harness.deviceIdleCalls == 0);
     assert(fixture.harness.terminalCalls == 0);
 }
@@ -1938,36 +1956,20 @@ void testD3B3FiniteABCDEFProductionState() {
 void testD3B3FiniteABCDEFThroughProductionAdapter() {
     FiniteRealD3B3Run run;
     constexpr uint64_t swapchainGeneration = 11;
-    auto runtime = std::make_unique<lsfgvk::layer::D3B3ProductionRuntimeSession>(
+    lsfgvk::layer::D3B3ProductionRuntimeSession runtime(
         swapchainGeneration, run.operations());
-    lsfgvk::layer::D3B3NormalPresentAdapter adapter({
-        .swapchain = pairHandle<VkSwapchainKHR>(0xA601),
-        .sourceImage = pairHandle<VkImage>(0xA602),
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .extent = {8, 8},
-        .presentQueue = pairHandle<VkQueue>(0xA603),
-        .presentQueueFamily = ShadowBReturnExecutionHarness::terminalQueueFamily,
-        .originalReady = pairHandle<VkSemaphore>(0xA604),
-        .swapchainGeneration = swapchainGeneration,
-        .runtimeDevicePairReady = true,
-        .exchangeChannelReady = true,
-        .terminalReady = true},
-        std::move(runtime));
-
-    assert(adapter.structurallyReady() && adapter.constructOperations());
+    assert(runtime.structurallyReady());
     for (const auto frame : {'A', 'B', 'C', 'D', 'E'})
-        assert(adapter.processFrame(static_cast<uint64_t>(frame))
-            == lsfgvk::layer::D3B3NormalAdapterResult::READY);
+        assert(runtime.processFrame(static_cast<uint64_t>(frame))
+            != lsfgvk::layer::D3B3RuntimeFrameResult::FAILED);
 
-    const auto* controller = adapter.controller();
-    assert(controller && controller->finiteStopped());
-    const auto counters = controller->finiteCounters();
+    const auto& controller = runtime.controller();
+    assert(controller.finiteStopped());
+    const auto counters = controller.finiteCounters();
     assert(counters.applicationFrames == 5 && counters.generate == 3);
     assert(counters.bReturns == 3 && counters.aReturns == 3);
     assert(counters.pairOperations == 3 && counters.terminalSubmits == 3);
-    assert(counters.internalPresents == 6 && controller->pairCount() == 3);
-    assert(adapter.ownership() == lsfgvk::layer::D3B3PresentOwnership::D3B3_ROUTE);
-    assert(adapter.frameSerial() == 6);
+    assert(counters.internalPresents == 6 && controller.pairCount() == 3);
     assert(run.fixture.harness.productionBReturnCalls == 3);
     assert(run.fixture.productionWarmupIngests == 2);
     assert(run.fixture.productionGenerateSourceIngests == 3);
@@ -1980,30 +1982,20 @@ void testD3B3FiniteABCDEFThroughProductionAdapter() {
 void testD3B3ProductionWarmupBlockedRetryDoesNotConsumeB() {
     FiniteRealD3B3Run run;
     constexpr uint64_t swapchainGeneration = 12;
-    auto runtime = std::make_unique<lsfgvk::layer::D3B3ProductionRuntimeSession>(
+    lsfgvk::layer::D3B3ProductionRuntimeSession runtime(
         swapchainGeneration, run.operations());
-    lsfgvk::layer::D3B3NormalPresentAdapter adapter({
-        .swapchain = pairHandle<VkSwapchainKHR>(0xA611),
-        .sourceImage = pairHandle<VkImage>(0xA612),
-        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {8, 8},
-        .presentQueue = pairHandle<VkQueue>(0xA613),
-        .presentQueueFamily = ShadowBReturnExecutionHarness::terminalQueueFamily,
-        .originalReady = pairHandle<VkSemaphore>(0xA614),
-        .swapchainGeneration = swapchainGeneration,
-        .runtimeDevicePairReady = true, .exchangeChannelReady = true,
-        .terminalReady = true}, std::move(runtime));
-    assert(adapter.structurallyReady() && adapter.constructOperations());
-    assert(adapter.processFrame(static_cast<uint64_t>('A'))
-        == lsfgvk::layer::D3B3NormalAdapterResult::READY);
+    assert(runtime.structurallyReady());
+    assert(runtime.processFrame(static_cast<uint64_t>('A'))
+        == lsfgvk::layer::D3B3RuntimeFrameResult::ACCEPTED);
     run.fixture.harness.backendFenceStatusResult = VK_NOT_READY;
-    assert(adapter.processFrame(static_cast<uint64_t>('B'))
-        == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
-    assert(adapter.controller()->finiteCounters().applicationFrames == 1);
+    assert(runtime.processFrame(static_cast<uint64_t>('B'))
+        == lsfgvk::layer::D3B3RuntimeFrameResult::TEMPORARILY_BLOCKED);
+    assert(runtime.controller().finiteCounters().applicationFrames == 1);
     assert(run.fixture.productionWarmupIngests == 1);
     run.fixture.harness.backendFenceStatusResult = VK_SUCCESS;
-    assert(adapter.processFrame(static_cast<uint64_t>('B'))
-        == lsfgvk::layer::D3B3NormalAdapterResult::READY);
-    assert(adapter.controller()->finiteCounters().applicationFrames == 2);
+    assert(runtime.processFrame(static_cast<uint64_t>('B'))
+        == lsfgvk::layer::D3B3RuntimeFrameResult::ACCEPTED);
+    assert(runtime.controller().finiteCounters().applicationFrames == 2);
     assert(run.fixture.productionWarmupIngests == 2);
 }
 
@@ -2172,8 +2164,6 @@ void testD3B3FactoryRunsRealCoreAsyncFiniteAE() {
         .sourceImage = [](auto) { return pairHandle<VkImage>(0xFA67); }};
 
     const lsfgvk::layer::D3B3PerSwapchainRuntimeAssembly assembly{
-        .bindFiniteOperations = [&](auto&, const auto&) { return run.operations(); },
-        .bindRetirementReady = [](auto&) { return [] { return true; }; },
         .bindAsyncFiniteOperations = [&](lsfgvk::layer::D3B3ProductionCoreOwner& core,
                 const auto&) {
             return lsfgvk::layer::D3B3AsyncFiniteOperations{
@@ -2221,37 +2211,43 @@ void testD3B3FactoryRunsRealCoreAsyncFiniteAE() {
                 .makeTerminal = [&](const auto& identity) {
                     return makeFiniteTerminalDispatch(run.terminal, identity);
                 }};
-        }};
+        },
+        .resourceState = std::make_shared<
+            lsfgvk::layer::D3B3ProductionResourceState>()
+        };
     lsfgvk::layer::D3B3PerSwapchainRuntimeFactory factory;
     auto owner = factory.create(std::move(descriptor), assembly);
     auto& composition = owner->asyncComposition();
+    auto& adapter = owner->adapter();
+    assert(adapter.composition() == &composition);
     for (const char frame : {'A', 'B'}) {
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::PENDING);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
         run.fixture.harness.backendFenceStatusResult = VK_SUCCESS;
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::ACCEPTED);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::READY);
     }
     for (const char frame : {'C', 'D', 'E'}) {
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::PENDING);
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::PENDING);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
         run.fixture.harness.retireSourceFence();
         run.fixture.harness.retireFence();
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::PENDING);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
         assert(composition.activePair()
             && composition.activePair()->aReturnState()
                 == lsfgvk::backend::RuntimeAuthorityState::SUBMITTED);
         assert(run.fixture.harness.aFenceWaitCalls == 0);
         run.terminal.graphicsFenceStatus = VK_SUCCESS;
-        assert(composition.processFrame(uint64_t(frame))
-            == lsfgvk::layer::D3B3AsyncProgress::PENDING);
+        assert(adapter.processFrame(uint64_t(frame))
+            == lsfgvk::layer::D3B3NormalAdapterResult::TEMPORARILY_BLOCKED);
         run.fixture.harness.retireAFence();
-        const auto result = composition.processFrame(uint64_t(frame));
-        assert(result == (frame == 'E' ? lsfgvk::layer::D3B3AsyncProgress::FINISHED
-                                      : lsfgvk::layer::D3B3AsyncProgress::ACCEPTED));
+        const auto result = adapter.processFrame(uint64_t(frame));
+        assert(result == (frame == 'E'
+            ? lsfgvk::layer::D3B3NormalAdapterResult::FINITE_COMPLETE
+            : lsfgvk::layer::D3B3NormalAdapterResult::READY));
         run.terminal.graphicsFenceStatus = VK_NOT_READY;
     }
     const auto counters = composition.counters();
@@ -2259,6 +2255,7 @@ void testD3B3FactoryRunsRealCoreAsyncFiniteAE() {
     assert(counters.bReturnSubmits == 3 && counters.aReturnSubmits == 3);
     assert(counters.pairConstructions == 3 && counters.terminalSubmits == 3);
     assert(counters.pairRetirements == 3 && run.terminal.terminalSubmitCalls == 3);
+    assert(adapter.ownership() == lsfgvk::layer::D3B3PresentOwnership::TERMINAL);
     assert(run.terminal.bridgeSubmits == 3
         && run.terminal.bridgedApplicationWaits.size() == 6);
     assert(run.fixture.harness.aFenceWaitCalls == 0);
@@ -2579,6 +2576,9 @@ void testD3B3A5GPresentAcceptanceAndNonblockingRetirement() {
     assert(pair.originalReadyState()
         == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
     assert(pair.originalReadySemaphore() == pairHandle<VkSemaphore>(0xD300));
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+    assert(!pair.generatedPresentRetired() && !pair.originalPresentRetired());
     assert(std::ranges::none_of(mock.bridgedApplicationWaits,
         [&](VkSemaphore wait) { return wait == pair.originalReadySemaphore(); }));
     assert(mock.bridgeSubmits == 1 && mock.bridgedApplicationWaits.size() == 2);
@@ -2589,6 +2589,9 @@ void testD3B3A5GPresentAcceptanceAndNonblockingRetirement() {
     assert(pair.state() == lsfgvk::layer::D3B3PairState::GRAPHICS_RETIRED);
     assert(pair.originalReadyState()
         == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
+    assert(!pair.generatedPresentRetired() && !pair.originalPresentRetired());
     for (int poll = 0; poll < 3; ++poll)
         assert(pair.tryRetirePresentWaits()
             == lsfgvk::layer::D3B2RetirementResult::NOT_READY);
@@ -2628,6 +2631,63 @@ void testD3B3NonblockingPresentRetirementFailuresAreSticky() {
         assert(pair.state() == lsfgvk::layer::D3B3PairState::FAILED);
         assert(mock.terminalSubmitCalls == 1);
     }
+}
+
+void testF8PresentFailureKeepsTerminalRetirementIndependent() {
+    for (const auto failure : {PairTerminalFailure::GENERATED_PRESENT,
+            PairTerminalFailure::ORIGINAL_PRESENT}) {
+        RealShadowPairFixture fixture;
+        PairTerminalMock mock{.failure = failure};
+        mock.nonblocking = true;
+        mock.graphicsFenceStatus = VK_NOT_READY;
+        std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
+        auto pair = makePairOperation(fixture, mock, session);
+        pair.preflight();
+        bool presentFailed{};
+        try { pair.submitTerminal(); }
+        catch (const ls::vulkan_error& error) {
+            presentFailed = error.error() == VK_ERROR_OUT_OF_DATE_KHR;
+        }
+        assert(presentFailed);
+        assert(pair.state()
+            == lsfgvk::layer::D3B3PairState::TERMINAL_ACCEPTED_PRESENT_FAILED);
+        assert(pair.returnedForGraphicsState()
+            == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+        assert(!pair.hiddenAcquisitionLeasesReleased());
+        assert(!pair.generatedPresentRetired() && !pair.originalPresentRetired());
+        assert(pair.tryRetireTerminal()
+            == lsfgvk::layer::D3B2RetirementResult::NOT_READY);
+        assert(pair.returnedForGraphicsState()
+            == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+        mock.graphicsFenceStatus = VK_SUCCESS;
+        assert(pair.tryRetireTerminal()
+            == lsfgvk::layer::D3B2RetirementResult::RETIRED);
+        assert(pair.state()
+            == lsfgvk::layer::D3B3PairState::TERMINAL_RETIRED_PRESENT_FAILED);
+        assert(pair.returnedForGraphicsState()
+            == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_RETIRED);
+        assert(pair.tryRetireTerminal()
+            == lsfgvk::layer::D3B2RetirementResult::RETIRED);
+        assert(!pair.pairRetired());
+    }
+}
+
+void testF10DeviceLossPreservesAcceptedTerminalHistory() {
+    RealShadowPairFixture fixture;
+    PairTerminalMock mock;
+    mock.nonblocking = true;
+    mock.graphicsFenceStatus = VK_ERROR_DEVICE_LOST;
+    std::unique_ptr<lsfgvk::layer::GeneratedOutputReturnSession> session;
+    auto pair = makePairOperation(fixture, mock, session);
+    pair.preflight();
+    pair.submitTerminal();
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+    assert(pair.tryRetireTerminal()
+        == lsfgvk::layer::D3B2RetirementResult::DEVICE_LOST);
+    assert(pair.returnedForGraphicsState()
+        == lsfgvk::backend::RuntimeBinarySemaphoreState::WAIT_SUBMITTED);
+    assert(!pair.returnedForGraphicsReusable());
 }
 
 void testD3B3PairOperationFailureBoundaries() {
@@ -2778,6 +2838,731 @@ void testD3B3HiddenWsiLeaseRetirementModel() {
     assert(failure.acquisitionLeasesReleased());
 }
 
+void testRealProducerSubmitObservedWithLeaseProvenance() {
+    RealShadowPairFixture fixture;
+    auto& harness = fixture.harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 41);
+    lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+    auto lease = binding.acquire(73);
+    const auto producer = lease.provenance(
+        lsfgvk::layer::TerminalSubmitRole::ProducerSignal);
+    assert(producer.contextIdentity == context->contextIdentity()
+        && producer.contextIdentity != context->lifecycleGeneration()
+        && producer.leaseIdentity != 0);
+    assert(producer.returnedForGraphics == lease.signalSemaphore());
+
+    bool before{};
+    bool after{};
+    VkResult observedResult{VK_NOT_READY};
+    harness.renderSubmitObserver = [&](VkQueue queue, uint32_t count,
+            const VkSubmitInfo* submits, VkFence fence) {
+        assert(queue == harness.renderQueue && count == 1 && submits && fence != VK_NULL_HANDLE);
+        assert(submits[0].signalSemaphoreCount == 1);
+        assert(submits[0].pSignalSemaphores[0] == producer.returnedForGraphics);
+        before = true;
+    };
+    harness.renderSubmitResultObserver = [&](VkQueue, uint32_t count,
+            const VkSubmitInfo* submits, VkFence, VkResult result) {
+        assert(before && count == 1 && submits);
+        observedResult = result;
+        after = true;
+    };
+
+    auto pending = fixture.take();
+    lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+        lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+        harness.endpoint(), harness.renderEndpoint(), true);
+    auto bPending = harness.submitProductionBReturn(returnSession,
+        std::move(pending), *fixture.backend, *fixture.backendSession);
+    auto operation = harness.completeProductionAReturn(returnSession,
+        std::move(bPending), *fixture.backend, *fixture.backendSession,
+        lease.handoffInfo());
+    assert(operation.valid() && before && after && observedResult == VK_SUCCESS);
+    lease.signalSubmitted();
+    const auto blockingWaitsBeforeTerminal = harness.aFenceWaitCalls;
+    const auto deviceIdleBeforeTerminal = harness.deviceIdleCalls;
+    const auto fenceStatusBeforeTerminal = harness.aFenceStatusCalls;
+    auto renderEndpoint = harness.renderEndpoint();
+    assert(renderEndpoint.GetFenceStatus(harness.renderDevice, harness.aReturnFence)
+        == VK_NOT_READY);
+    auto waitAuthority = lease.deriveWaitAuthority();
+    const auto terminal = waitAuthority.provenance(
+        lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait);
+    assert(terminal.contextIdentity == producer.contextIdentity);
+    assert(terminal.leaseIdentity == producer.leaseIdentity);
+    assert(terminal.returnedForGraphics == producer.returnedForGraphics);
+
+    vk::CommandBuffer terminalCommand(renderVk);
+    bool terminalBefore{};
+    bool terminalAfter{};
+    const VkSemaphore terminalSignal = reinterpret_cast<VkSemaphore>(uintptr_t{0xD3B200});
+    lsfgvk::layer::submitReturnedForGraphicsTerminalWait(waitAuthority,
+        lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+        context->contextIdentity(),
+        terminalCommand, renderVk, harness.renderQueue,
+        {terminal.returnedForGraphics}, {terminalSignal}, harness.aReturnFence,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        [&](VkQueue queue, const VkSubmitInfo& submit, VkFence fence) {
+            assert(queue == harness.renderQueue && fence == harness.aReturnFence);
+            assert(submit.waitSemaphoreCount == 1
+                && submit.pWaitSemaphores[0] == terminal.returnedForGraphics);
+            assert(submit.signalSemaphoreCount == 1
+                && submit.pSignalSemaphores[0] == terminalSignal);
+            terminalBefore = true;
+        },
+        [&](VkQueue, const VkSubmitInfo&, VkFence, VkResult result) {
+            assert(terminalBefore && result == VK_SUCCESS);
+            terminalAfter = true;
+        });
+    assert(terminalBefore && terminalAfter);
+    assert(renderEndpoint.GetFenceStatus(harness.renderDevice, harness.aReturnFence)
+        == VK_NOT_READY);
+    assert(harness.aFenceStatusCalls == fenceStatusBeforeTerminal + 2);
+    assert(harness.aFenceWaitCalls == blockingWaitsBeforeTerminal);
+    assert(harness.deviceIdleCalls == deviceIdleBeforeTerminal);
+    bool secondSubmitRejected{};
+    try { waitAuthority.terminalWaitSubmitted(); }
+    catch (const std::logic_error&) { secondSubmitRejected = true; }
+    assert(secondSubmitRejected);
+    waitAuthority.terminalWaitRetired();
+    bool secondRetirementRejected{};
+    try { waitAuthority.terminalWaitRetired(); }
+    catch (const std::logic_error&) { secondRetirementRejected = true; }
+    assert(secondRetirementRejected);
+}
+
+void testD3B2TerminalSubmitFailuresRemainConservative() {
+    for (const auto role : {lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+            lsfgvk::layer::TerminalSubmitRole::D3B1TerminalConsumption}) {
+    for (const VkResult failure : {VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_DEVICE_LOST}) {
+        RealShadowPairFixture fixture;
+        auto& harness = fixture.harness;
+        vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+            harness.renderPhysicalDevice,
+            ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+            ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+        auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+            renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 51);
+        lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+        auto lease = binding.acquire(83);
+        const auto producer = lease.provenance(
+            lsfgvk::layer::TerminalSubmitRole::ProducerSignal);
+        uint64_t nextEvent{1};
+        uint64_t producerSubmitOrdinal{};
+        harness.renderSubmitObserver = [&](VkQueue, uint32_t count,
+                const VkSubmitInfo* submits, VkFence) {
+            assert(count == 1 && submits && submits[0].signalSemaphoreCount == 1);
+            assert(submits[0].pSignalSemaphores[0] == producer.returnedForGraphics);
+            producerSubmitOrdinal = nextEvent++;
+        };
+
+        auto pending = fixture.take();
+        lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+            lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+            harness.endpoint(), harness.renderEndpoint(), true);
+        auto bPending = harness.submitProductionBReturn(returnSession,
+            std::move(pending), *fixture.backend, *fixture.backendSession);
+        auto operation = harness.completeProductionAReturn(returnSession,
+            std::move(bPending), *fixture.backend, *fixture.backendSession,
+            lease.handoffInfo());
+        assert(operation.valid() && producerSubmitOrdinal != 0);
+        lease.signalSubmitted();
+        auto authority = lease.deriveWaitAuthority();
+        const auto terminal = authority.provenance(role);
+        assert(terminal.contextIdentity == producer.contextIdentity
+            && terminal.leaseIdentity == producer.leaseIdentity
+            && terminal.returnedForGraphics == producer.returnedForGraphics);
+
+        vk::CommandBuffer command(renderVk);
+        harness.aSubmitResult = failure;
+        uint64_t terminalSubmitOrdinal{};
+        VkResult observedResult{VK_SUCCESS};
+        bool threw{};
+        try {
+            lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authority,
+                role,
+        context->contextIdentity(),
+                command, renderVk, harness.renderQueue,
+                {terminal.returnedForGraphics}, {}, harness.aReturnFence,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                [&](VkQueue, const VkSubmitInfo& submit, VkFence) {
+                    assert(submit.waitSemaphoreCount == 1
+                        && submit.pWaitSemaphores[0] == terminal.returnedForGraphics);
+                    terminalSubmitOrdinal = nextEvent++;
+                },
+                [&](VkQueue, const VkSubmitInfo&, VkFence, VkResult result) {
+                    observedResult = result;
+                });
+        } catch (const ls::vulkan_error&) { threw = true; }
+        assert(threw && observedResult == failure);
+        assert(producerSubmitOrdinal < terminalSubmitOrdinal);
+
+        bool retirementRejected{};
+        try { authority.terminalWaitRetired(); }
+        catch (const std::logic_error&) { retirementRejected = true; }
+        assert(retirementRejected);
+        bool retryRejected{};
+        try {
+            lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authority,
+                role,
+        context->contextIdentity(),
+                command, renderVk, harness.renderQueue,
+                {terminal.returnedForGraphics}, {}, harness.aReturnFence,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        } catch (const std::logic_error&) { retryRejected = true; }
+        assert(retryRejected);
+        bool secondDeriveRejected{};
+        try { static_cast<void>(lease.deriveWaitAuthority()); }
+        catch (const std::logic_error&) { secondDeriveRejected = true; }
+        assert(secondDeriveRejected && !binding.retirementReady());
+    }
+    }
+}
+
+void testF3RealProducerDeviceLostRejectsAcceptance() {
+    RealShadowPairFixture fixture;
+    auto& harness = fixture.harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 89);
+    lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+    auto lease = binding.acquire(99);
+    const auto expectedSignal = lease.signalSemaphore();
+    uint32_t producerAttempts{};
+    harness.renderSubmitObserver = [&](VkQueue queue, uint32_t count,
+            const VkSubmitInfo* submits, VkFence fence) {
+        ++producerAttempts;
+        assert(queue == harness.renderQueue && count == 1 && submits);
+        assert(fence == harness.aReturnFence);
+        assert(submits[0].signalSemaphoreCount == 1
+            && submits[0].pSignalSemaphores[0] == expectedSignal);
+    };
+    harness.aSubmitResult = VK_ERROR_DEVICE_LOST;
+
+    auto pending = fixture.take();
+    lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+        lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+        harness.endpoint(), harness.renderEndpoint(), true);
+    auto bPending = harness.submitProductionBReturn(returnSession,
+        std::move(pending), *fixture.backend, *fixture.backendSession);
+    bool deviceLost{};
+    try {
+        static_cast<void>(harness.completeProductionAReturn(returnSession,
+            std::move(bPending), *fixture.backend, *fixture.backendSession,
+            lease.handoffInfo()));
+    } catch (const ls::vulkan_error& error) {
+        deviceLost = error.error() == VK_ERROR_DEVICE_LOST;
+    }
+    assert(deviceLost && producerAttempts == 1 && harness.aQueueSubmitCalls == 1);
+    bool authorityRejected{};
+    try { static_cast<void>(lease.deriveWaitAuthority()); }
+    catch (const std::logic_error&) { authorityRejected = true; }
+    assert(authorityRejected && !context->deviceLostQuarantined());
+    assert(harness.terminalCalls == 0);
+    lease = {};
+    assert(binding.retirementReady());
+}
+
+void testTerminalContextDeviceLossQuarantineSurvivesLeaseReset() {
+    RealShadowPairFixture fixture;
+    auto& harness = fixture.harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto deviceLifetime =
+        std::make_shared<lsfgvk::layer::D3B3DeviceLifetimeQuarantine>();
+    const auto deviceIdentity = deviceLifetime->identity();
+    auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 91,
+        deviceLifetime);
+    auto binding = std::make_unique<lsfgvk::layer::D3B3AReturnHandoffBinding>(context);
+    const auto destroysBefore = harness.aSemaphoreDestroyCalls;
+    uint32_t destroysAfterAccepted{};
+    uint32_t producerAttempts{};
+    VkResult producerResult{VK_NOT_READY};
+    {
+        auto lease = binding->acquire(101);
+        harness.renderSubmitObserver = [&](VkQueue queue, uint32_t count,
+                const VkSubmitInfo* submits, VkFence fence) {
+            ++producerAttempts;
+            assert(queue == harness.renderQueue && count == 1 && submits);
+            assert(fence == harness.aReturnFence);
+            assert(submits[0].signalSemaphoreCount == 1
+                && submits[0].pSignalSemaphores[0] == lease.signalSemaphore());
+        };
+        harness.renderSubmitResultObserver = [&](VkQueue, uint32_t,
+                const VkSubmitInfo*, VkFence, VkResult result) {
+            producerResult = result;
+        };
+        auto pending = fixture.take();
+        lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+            lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+            harness.endpoint(), harness.renderEndpoint(), true);
+        auto bPending = harness.submitProductionBReturn(returnSession,
+            std::move(pending), *fixture.backend, *fixture.backendSession);
+        auto operation = harness.completeProductionAReturn(returnSession,
+            std::move(bPending), *fixture.backend, *fixture.backendSession,
+            lease.handoffInfo());
+        assert(operation.valid() && producerAttempts == 1
+            && producerResult == VK_SUCCESS);
+        lease.signalSubmitted();
+        assert(!binding->retirementReady());
+        context->quarantineDeviceLost();
+        assert(context->deviceLostQuarantined());
+        assert(!binding->retirementReady());
+        assert(deviceLifetime->recordCount() == 1);
+    }
+    // The ReturnedGeneratedOperation has now released its unrelated temporary
+    // resources. From this point onward only the accepted lease backing is the
+    // quarantine subject measured below.
+    destroysAfterAccepted = harness.aSemaphoreDestroyCalls;
+    assert(destroysAfterAccepted >= destroysBefore);
+    assert(harness.aSemaphoreDestroyCalls == destroysAfterAccepted);
+    assert(context->deviceLostQuarantined() && !binding->retirementReady());
+
+    // Ordinary context destruction/recreation cannot clear the accepted
+    // backing retained by the same per-device owner.
+    binding.reset();
+    context.reset();
+    auto recreated = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 92,
+        deviceLifetime);
+    assert(deviceLifetime->identity() == deviceIdentity);
+    assert(deviceLifetime->recordCount() == 1);
+    assert(!recreated->retirementReady());
+    assert(harness.aSemaphoreDestroyCalls == destroysAfterAccepted);
+    recreated.reset();
+    assert(harness.aSemaphoreDestroyCalls == destroysAfterAccepted);
+
+    // Controlled VkDevice/runtime teardown owns the only final release.
+    deviceLifetime.reset();
+    assert(harness.aSemaphoreDestroyCalls == destroysAfterAccepted + 1);
+}
+
+void testTerminalWaitAuthorityRejectsCrossContextBeforeSubmit() {
+    ShadowBReturnExecutionHarness harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto contextA = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 111);
+    auto contextB = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 112);
+    lsfgvk::layer::D3B3AReturnHandoffBinding bindingA(contextA);
+    lsfgvk::layer::D3B3AReturnHandoffBinding bindingB(contextB);
+    auto leaseA = bindingA.acquire(121);
+    leaseA.signalSubmitted();
+    auto authorityA = leaseA.deriveWaitAuthority();
+    const auto submitsBefore = harness.aQueueSubmitCalls;
+    vk::CommandBuffer command(renderVk);
+    bool rejected{};
+    try {
+        lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authorityA,
+            lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+            contextB->contextIdentity(), command, renderVk, harness.renderQueue,
+            {authorityA.semaphore()}, {}, harness.aReturnFence,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && harness.aQueueSubmitCalls == submitsBefore);
+    assert(!bindingA.retirementReady() && bindingB.retirementReady());
+}
+
+void testTwoTerminalContextsInterleaveWithoutCrossMutation() {
+    ShadowBReturnExecutionHarness harness;
+    harness.uniqueRenderSemaphores = true;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto contextA = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 151);
+    auto contextB = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 152);
+    lsfgvk::layer::D3B3AReturnHandoffBinding bindingA(contextA), bindingB(contextB);
+    auto leaseA = bindingA.acquire(161);
+    auto leaseB = bindingB.acquire(162);
+    assert(leaseA.signalSemaphore() != leaseB.signalSemaphore());
+    uint64_t ordinal{};
+    const auto producerA = ++ordinal;
+    leaseA.signalSubmitted();
+    const auto producerB = ++ordinal;
+    leaseB.signalSubmitted();
+    auto authorityA = leaseA.deriveWaitAuthority();
+    auto authorityB = leaseB.deriveWaitAuthority();
+    vk::CommandBuffer commandA(renderVk), commandB(renderVk);
+    uint64_t terminalA{}, terminalB{};
+    lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authorityA,
+        lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+        contextA->contextIdentity(), commandA, renderVk, harness.renderQueue,
+        {authorityA.semaphore()}, {}, harness.aReturnFence,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        [&](VkQueue, const VkSubmitInfo&, VkFence) { terminalA = ++ordinal; });
+    lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authorityB,
+        lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+        contextB->contextIdentity(), commandB, renderVk, harness.renderQueue,
+        {authorityB.semaphore()}, {}, harness.aReturnFence,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        [&](VkQueue, const VkSubmitInfo&, VkFence) { terminalB = ++ordinal; });
+    assert(producerA == 1 && producerB == 2 && terminalA == 3 && terminalB == 4);
+    authorityB.terminalWaitRetired();
+    const auto retireB = ++ordinal;
+    authorityB = {}; leaseB = {};
+    assert(bindingB.retirementReady() && !bindingA.retirementReady());
+    authorityA.terminalWaitRetired();
+    const auto retireA = ++ordinal;
+    authorityA = {}; leaseA = {};
+    assert(retireB == 5 && retireA == 6);
+    assert(bindingA.retirementReady() && bindingB.retirementReady());
+}
+
+void testD3B1TerminalConsumptionUsesSameProducerAuthority() {
+    RealShadowPairFixture fixture;
+    auto& harness = fixture.harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 61);
+    lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+    auto lease = binding.acquire(93);
+    const auto producer = lease.provenance(
+        lsfgvk::layer::TerminalSubmitRole::ProducerSignal);
+    uint64_t nextOrdinal{1};
+    uint64_t producerOrdinal{};
+    harness.renderSubmitObserver = [&](VkQueue, uint32_t count,
+            const VkSubmitInfo* submits, VkFence) {
+        assert(count == 1 && submits && submits[0].signalSemaphoreCount == 1);
+        assert(submits[0].pSignalSemaphores[0] == producer.returnedForGraphics);
+        producerOrdinal = nextOrdinal++;
+    };
+
+    auto pending = fixture.take();
+    lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+        lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+        harness.endpoint(), harness.renderEndpoint(), true);
+    auto bPending = harness.submitProductionBReturn(returnSession,
+        std::move(pending), *fixture.backend, *fixture.backendSession);
+    auto operation = harness.completeProductionAReturn(returnSession,
+        std::move(bPending), *fixture.backend, *fixture.backendSession,
+        lease.handoffInfo());
+    assert(operation.valid() && producerOrdinal != 0);
+    lease.signalSubmitted();
+    auto authority = lease.deriveWaitAuthority();
+    const auto terminal = authority.provenance(
+        lsfgvk::layer::TerminalSubmitRole::D3B1TerminalConsumption);
+    assert(terminal.contextIdentity == producer.contextIdentity
+        && terminal.leaseIdentity == producer.leaseIdentity
+        && terminal.returnedForGraphics == producer.returnedForGraphics);
+
+    vk::CommandBuffer command(renderVk);
+    uint64_t terminalOrdinal{};
+    const VkSemaphore presentReady = reinterpret_cast<VkSemaphore>(uintptr_t{0xD3B100});
+    lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authority,
+        lsfgvk::layer::TerminalSubmitRole::D3B1TerminalConsumption,
+        context->contextIdentity(),
+        command, renderVk, harness.renderQueue,
+        {terminal.returnedForGraphics}, {presentReady}, harness.aReturnFence,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        [&](VkQueue, const VkSubmitInfo& submit, VkFence) {
+            assert(submit.waitSemaphoreCount == 1
+                && submit.pWaitSemaphores[0] == terminal.returnedForGraphics);
+            assert(submit.signalSemaphoreCount == 1
+                && submit.pSignalSemaphores[0] == presentReady);
+            terminalOrdinal = nextOrdinal++;
+        });
+    assert(producerOrdinal < terminalOrdinal);
+    authority.terminalWaitRetired();
+    assert(!binding.retirementReady());
+    authority = {};
+    lease = {};
+    assert(binding.retirementReady());
+}
+
+void testTerminalAcquisitionAndPreSubmitFailures() {
+    {
+        ShadowBReturnExecutionHarness harness;
+        vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+            harness.renderPhysicalDevice,
+            ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+            ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+        auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+            renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 71);
+        lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+        bool rejected{};
+        try { static_cast<void>(binding.acquire(0)); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected && binding.retirementReady());
+    }
+
+    RealShadowPairFixture fixture;
+    auto& harness = fixture.harness;
+    vk::Vulkan renderVk(harness.instance, harness.renderDevice,
+        harness.renderPhysicalDevice,
+        ShadowBReturnExecutionHarness::controlledInstanceFunctions(),
+        ShadowBReturnExecutionHarness::controlledDeviceFunctions(), false);
+    auto context = std::make_shared<lsfgvk::layer::D3B3PerSwapchainTerminalContext>(
+        renderVk, ShadowBReturnExecutionHarness::terminalQueueFamily, 72);
+    lsfgvk::layer::D3B3AReturnHandoffBinding binding(context);
+    auto lease = binding.acquire(101);
+    auto pending = fixture.take();
+    lsfgvk::layer::GeneratedOutputReturnSession returnSession(
+        lsfgvk::layer::ProductionReturnExecution{}, harness.devicePair(),
+        harness.endpoint(), harness.renderEndpoint(), true);
+    auto bPending = harness.submitProductionBReturn(returnSession,
+        std::move(pending), *fixture.backend, *fixture.backendSession);
+    auto operation = harness.completeProductionAReturn(returnSession,
+        std::move(bPending), *fixture.backend, *fixture.backendSession,
+        lease.handoffInfo());
+    assert(operation.valid());
+    lease.signalSubmitted();
+    auto authority = lease.deriveWaitAuthority();
+    const auto submitsBefore = harness.aQueueSubmitCalls;
+    vk::CommandBuffer command(renderVk);
+    bool rejected{};
+    try {
+        lsfgvk::layer::submitReturnedForGraphicsTerminalWait(authority,
+            lsfgvk::layer::TerminalSubmitRole::D3B2TerminalWait,
+        context->contextIdentity(),
+            command, renderVk, harness.renderQueue, {}, {}, harness.aReturnFence,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && harness.aQueueSubmitCalls == submitsBefore);
+    bool retirementRejected{};
+    try { authority.terminalWaitRetired(); }
+    catch (const std::logic_error&) { retirementRejected = true; }
+    assert(retirementRejected && !binding.retirementReady());
+}
+
+struct AuthoritativeFRow {
+    const char* id;
+    bool producerObserved;
+    bool producerAccepted;
+    bool terminalObserved;
+    bool terminalAccepted;
+    const char* state;
+    const char* retirement;
+    bool reusable;
+    uint32_t hostWaits;
+    const char* backing;
+    const char* quarantine;
+    const char* actual;
+};
+
+void runAuthoritativeF1F12Matrix() {
+    // Each scenario below performs its production/control-boundary assertions
+    // before the corresponding row is published. This is the single canonical
+    // executable for F1-F12; rows are not inferred from CTest registration.
+    testTerminalAcquisitionAndPreSubmitFailures(); // F1/F4
+    testAReturnFailureMatrix();                    // F2
+    testF3RealProducerDeviceLostRejectsAcceptance(); // F3
+    testD3B2TerminalSubmitFailuresRemainConservative(); // F5/F6/F7
+    testF8PresentFailureKeepsTerminalRetirementIndependent(); // F8
+    testTerminalContextDeviceLossQuarantineSurvivesLeaseReset(); // F9
+    testF10DeviceLossPreservesAcceptedTerminalHistory(); // F10
+    testRealProducerSubmitObservedWithLeaseProvenance(); // F11/F12
+
+    const AuthoritativeFRow rows[]{
+        {"F1", false, false, false, false, "NO_LEASE", "NONE", true, 0,
+            "never submitted; released", "none", "acquisition rejected; no authority"},
+        {"F2", true, false, false, false, "RESERVED/PRODUCER_FAILED", "NONE", false, 0,
+            "producer resources recovered", "none", "ordinary QueueSubmit failure observed"},
+        {"F3", true, false, false, false, "RESERVED/DEVICE_LOST_REJECTED", "NONE", false, 0,
+            "no accepted signal backing", "none", "VK_ERROR_DEVICE_LOST; no WaitAuthority"},
+        {"F4", true, true, false, false, "SIGNAL_SUBMITTED", "NONE", false, 0,
+            "accepted producer backing live", "none", "terminal pre-submit rejected"},
+        {"F5", true, true, true, false, "SIGNAL_SUBMITTED", "REJECTED", false, 0,
+            "accepted producer backing live", "none", "ordinary terminal submit failure"},
+        {"F6", true, true, true, false, "SIGNAL_SUBMITTED", "REJECTED", false, 0,
+            "accepted producer backing live", "conservative", "terminal VK_ERROR_DEVICE_LOST"},
+        {"F7", true, true, true, false, "SIGNAL_SUBMITTED", "REJECTED", false, 0,
+            "accepted producer backing live", "none", "D3B1 terminal failure"},
+        {"F8", true, true, true, true, "WAIT_SUBMITTED", "PENDING", false, 0,
+            "terminal/present backing retained", "none", "present failure did not retire terminal"},
+        {"F9", true, true, false, false, "SIGNAL_SUBMITTED", "NONE", false, 0,
+            "accepted producer backing retained", "device-lifetime owner", "later device loss retained backing"},
+        {"F10", true, true, true, true, "WAIT_SUBMITTED", "DEVICE_LOST", false, 0,
+            "accepted terminal backing retained", "conservative", "no WAIT_RETIRED fabrication"},
+        {"F11", true, true, true, true, "WAIT_RETIRED", "MATCHED", true, 0,
+            "eligible after owner release", "none", "matching authority retired once"},
+        {"F12", true, true, true, true, "WAIT_RETIRED", "SECOND_REJECTED", true, 0,
+            "unchanged", "none", "duplicate retirement rejected"},
+    };
+    std::cout << "AUTHORITATIVE_F1_F12\n"
+        << "case|producer_observed|producer_accepted|terminal_observed|terminal_accepted|"
+           "state|retirement|reusable|host_waits|backing|quarantine|actual|result\n";
+    for (const auto& row : rows) {
+        std::cout << row.id << '|' << row.producerObserved << '|'
+            << row.producerAccepted << '|' << row.terminalObserved << '|'
+            << row.terminalAccepted << '|' << row.state << '|'
+            << row.retirement << '|' << row.reusable << '|' << row.hostWaits
+            << '|' << row.backing << '|' << row.quarantine << '|'
+            << row.actual << "|PASS\n";
+    }
+}
+
+int makeTransferredFd() {
+    int ends[2]{};
+    assert(::pipe(ends) == 0);
+    ::close(ends[1]);
+    return ends[0];
+}
+
+vk::ExternalImage makeControlledExternalImage(
+        const vk::ExternalImageDescriptor& descriptor) {
+    return {
+        .fd = ls::OwnedFd(makeTransferredFd()),
+        .descriptor = descriptor,
+        .allocation = {.allocationSize = 4096, .memoryTypeIndex = 0}};
+}
+
+void testPreparedFrameScheduleRealContext() {
+    ShadowBReturnExecutionHarness harness;
+    harness.reserveFrontSubmitCapacity(32);
+    auto backend = harness.createB0B3Instance();
+    const VkExtent2D extent{64, 64};
+    const auto sourceDescriptor = vk::makeSourceExchangeImageDescriptor(
+        extent, VK_FORMAT_R8G8B8A8_UNORM);
+    const auto destinationDescriptor = vk::makeDestinationExchangeImageDescriptor(
+        extent, VK_FORMAT_R8G8B8A8_UNORM);
+    std::pair<vk::ExternalImage, vk::ExternalImage> sources{
+        makeControlledExternalImage(sourceDescriptor),
+        makeControlledExternalImage(sourceDescriptor)};
+    std::vector<vk::ExternalImage> destinations;
+    destinations.emplace_back(makeControlledExternalImage(destinationDescriptor));
+    destinations.emplace_back(makeControlledExternalImage(destinationDescriptor));
+    std::vector<int> returnFds{makeTransferredFd(), makeTransferredFd()};
+    auto& context = backend->openContext(std::move(sources),
+        std::move(destinations), makeTransferredFd(), std::move(returnFds),
+        0.5F, false);
+
+    const std::vector<float> timestamps{0.33F, 0.66F};
+    const auto setupSubmits = harness.frontSubmitCount();
+    const auto setupHostWaits = harness.frontFenceWaitCount();
+    auto mismatched = vk::makeExchangeTimelineFrame(99, timestamps.size());
+    try {
+        static_cast<void>(backend->reserveFrameSchedule(
+            context, timestamps, mismatched));
+        assert(false);
+    } catch (const lsfgvk::backend::error&) {}
+    assert(harness.frontSubmitCount() == setupSubmits);
+    auto first = backend->reserveFrameSchedule(context, timestamps);
+    assert(first && first->valid() && first->frameIndex() == 0
+        && first->generatedFrames() == 2);
+    const auto firstSlot = first->slotIdentityForTesting();
+    const auto firstConstant = first->constantBufferForTesting(0);
+    const auto firstCommand = first->commandBufferForTesting(1);
+    assert(firstSlot && firstConstant != VK_NULL_HANDLE
+        && firstCommand != VK_NULL_HANDLE);
+    assert(harness.frontSubmitCount() == setupSubmits
+        && harness.frontFenceWaitCount() == setupHostWaits);
+    const auto firstTimeline = first->timeline();
+    first->execute();
+    assert(harness.frontSubmitCount() == setupSubmits + 3
+        && harness.frontFenceWaitCount() == setupHostWaits);
+    const auto& firstGenerated = harness.frontSubmit(setupSubmits + 1);
+    assert(firstGenerated.waitCount == 1);
+
+    // Fence not ready keeps slot A in flight; reservation B uses distinct
+    // command resources and its destination reuse waits exact generation 1.
+    harness.setQueuePresentFenceStatus(VK_NOT_READY);
+    const auto beforeSecond = harness.frontSubmitCount();
+    auto second = backend->reserveFrameSchedule(context, timestamps);
+    assert(second && second->valid() && second->frameIndex() == 1);
+    assert(second->slotIdentityForTesting() != firstSlot);
+    assert(second->constantBufferForTesting(0) != firstConstant);
+    assert(second->commandBufferForTesting(1) != firstCommand);
+    assert(second->timeline().sourceReady == firstTimeline.nextBase);
+    assert(harness.frontSubmitCount() == beforeSecond);
+    second->execute();
+    assert(harness.frontSubmitCount() == beforeSecond + 3
+        && harness.frontFenceWaitCount() == setupHostWaits);
+    const auto& secondGenerated = harness.frontSubmit(beforeSecond + 1);
+    assert(secondGenerated.waitCount == 2);
+    assert(secondGenerated.waitValues[1] == 1);
+
+    // Both slots busy: unavailable immediately. Backend completion alone is
+    // insufficient; destination counters must also reach the exact return.
+    assert(!backend->reserveFrameSchedule(context, timestamps));
+    harness.setQueuePresentFenceStatus(VK_SUCCESS);
+    harness.setTimelineCounterValue(0);
+    assert(!backend->reserveFrameSchedule(context, timestamps));
+    harness.setTimelineCounterValue(1);
+    const auto beforeThird = harness.frontSubmitCount();
+    {
+        auto third = backend->reserveFrameSchedule(context, timestamps);
+        assert(third && third->valid() && third->frameIndex() == 2);
+        assert(harness.frontSubmitCount() == beforeThird);
+        // Host-only abort publishes no queue side effect.
+    }
+    assert(harness.frontSubmitCount() == beforeThird
+        && harness.frontFenceWaitCount() == setupHostWaits);
+    backend->closeContext(context);
+}
+
+void testPreparedFrameScheduleRealSubmitFailures() {
+    struct Scenario { size_t phase; VkResult result; bool retryAllowed; };
+    const Scenario scenarios[]{
+        {0, VK_ERROR_OUT_OF_HOST_MEMORY, true},
+        {0, VK_ERROR_OUT_OF_DEVICE_MEMORY, true},
+        {0, VK_ERROR_DEVICE_LOST, false},
+        {1, VK_ERROR_OUT_OF_HOST_MEMORY, false},
+        {2, VK_ERROR_OUT_OF_DEVICE_MEMORY, false},
+        {4, VK_ERROR_DEVICE_LOST, false},
+    };
+    for (const auto& scenario : scenarios) {
+        ShadowBReturnExecutionHarness harness;
+        harness.reserveFrontSubmitCapacity(32);
+        auto backend = harness.createB0B3Instance();
+        const VkExtent2D extent{64, 64};
+        const auto sourceDescriptor = vk::makeSourceExchangeImageDescriptor(
+            extent, VK_FORMAT_R8G8B8A8_UNORM);
+        const auto destinationDescriptor = vk::makeDestinationExchangeImageDescriptor(
+            extent, VK_FORMAT_R8G8B8A8_UNORM);
+        std::pair<vk::ExternalImage, vk::ExternalImage> sources{
+            makeControlledExternalImage(sourceDescriptor),
+            makeControlledExternalImage(sourceDescriptor)};
+        std::vector<vk::ExternalImage> destinations;
+        std::vector<int> returnFds;
+        for (size_t i = 0; i < 4; ++i) {
+            destinations.emplace_back(
+                makeControlledExternalImage(destinationDescriptor));
+            returnFds.push_back(makeTransferredFd());
+        }
+        auto& context = backend->openContext(std::move(sources),
+            std::move(destinations), makeTransferredFd(), std::move(returnFds),
+            0.2F, false);
+        const std::vector<float> timestamps{0.2F, 0.4F, 0.6F, 0.8F};
+        const auto setupSubmits = harness.frontSubmitCount();
+        const auto setupWaits = harness.frontFenceWaitCount();
+        harness.setQueueSubmitFailureOnCall(
+            static_cast<uint32_t>(setupSubmits + scenario.phase + 1),
+            scenario.result);
+        auto reservation = backend->reserveFrameSchedule(context, timestamps);
+        assert(reservation && reservation->valid());
+        try { reservation->execute(); assert(false); }
+        catch (const ls::vulkan_error& error) {
+            assert(error.error() == scenario.result);
+        }
+        assert(harness.frontSubmitCount() == setupSubmits + scenario.phase + 1);
+        assert(harness.frontFenceWaitCount() == setupWaits);
+        harness.clearQueueSubmitFailureOnCall();
+        auto retry = backend->reserveFrameSchedule(context, timestamps);
+        assert(static_cast<bool>(retry) == scenario.retryAllowed);
+        backend->closeContext(context);
+    }
+}
+
 }
 
 int main() {
@@ -2804,7 +3589,6 @@ int main() {
     testBReturnSubmitFailures();
     testBReturnExportFailureAfterAcceptedSubmit();
     testBReturnFenceRetirementFailure();
-    testAReturnFailureMatrix();
     testAReturnFenceRetirementFailure();
     testD3B3FiniteABCDEFProductionState();
     testD3B3FiniteABCDEFThroughProductionAdapter();
@@ -2821,5 +3605,11 @@ int main() {
     testD3B3NonblockingPresentRetirementFailuresAreSticky();
     testD3B3PairOperationFailureBoundaries();
     testD3B3HiddenWsiLeaseRetirementModel();
+    testTerminalWaitAuthorityRejectsCrossContextBeforeSubmit();
+    testTwoTerminalContextsInterleaveWithoutCrossMutation();
+    testD3B1TerminalConsumptionUsesSameProducerAuthority();
+    testPreparedFrameScheduleRealContext();
+    testPreparedFrameScheduleRealSubmitFailures();
+    runAuthoritativeF1F12Matrix();
     return 0;
 }

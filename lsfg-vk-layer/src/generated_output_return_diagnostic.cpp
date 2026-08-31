@@ -257,12 +257,30 @@ void GeneratedOutputReturnSession::executeGpuChained(
         std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
     try {
         auto bPending = submitGeneratedBReturn(std::move(pending),
-            ReturnSubmissionFencePolicy::ACTIVE_COMPATIBLE, backend, backendSession);
-        completeGeneratedReturnOnA(std::move(bPending), backend, backendSession, handoff);
+            ReturnSubmissionFencePolicy::SHADOW_REAL, backend, backendSession);
+        try {
+            completeGeneratedReturnOnA(
+                std::move(bPending), backend, backendSession, handoff);
+        } catch (...) {
+            if (bPending.bReturn.valid() && !acceptedBReturnFailure)
+                acceptedBReturnFailure.emplace(std::move(bPending));
+            throw;
+        }
+        if (bPending.bReturn.valid())
+            acceptedBReturnFailure.emplace(std::move(bPending));
     } catch (...) {
         chainedStates.fail();
         throw;
     }
+}
+
+void GeneratedOutputReturnSession::executeProductionGpuChained(
+        backend::RuntimeGenerateDiagnosticPending&& pending,
+        backend::Instance& backend, backend::RuntimeGenerateSession& backendSession,
+        std::optional<vk::RuntimeForeignImageHandoffInfo> handoff) {
+    if (acceptedBReturnFailure || aReadbackPending.valid() || delayedGeneration.valid())
+        throw std::logic_error("D3A2 production return session is already active");
+    executeGpuChained(std::move(pending), backend, backendSession, handoff);
 }
 
 RuntimeGeneratedBReturnPending GeneratedOutputReturnSession::submitGeneratedBReturn(
@@ -389,7 +407,7 @@ RuntimeGeneratedBReturnPending GeneratedOutputReturnSession::submitGeneratedBRet
             sync = vk::exportSyncFd(generationEndpoint.semaphoreDevice, exportSemaphore);
         } catch (...) {
             if (shadowPolicy && authority.valid()) {
-                acceptedShadowFailure.emplace(RuntimeGeneratedBReturnPending(
+                acceptedBReturnFailure.emplace(RuntimeGeneratedBReturnPending(
                     std::move(pending), vk::SyncFdPayload{},
                     std::move(authority), std::move(fenceOwner),
                     std::move(returnResources)));
@@ -527,7 +545,7 @@ GeneratedOutputReturnSession::submitProductionBReturn(
         return submitGeneratedBReturn(std::move(pending),
             ReturnSubmissionFencePolicy::SHADOW_REAL, backend, backendSession);
     } catch (...) {
-        if (!acceptedShadowFailure) chainedStates.fail();
+        if (!acceptedBReturnFailure) chainedStates.fail();
         throw;
     }
 }
@@ -545,7 +563,7 @@ GeneratedOutputReturnSession::completeProductionGeneratedReturnOnA(
     try {
         completeGeneratedReturnOnA(std::move(bPending), backend, backendSession, handoff);
     } catch (...) {
-        if (bPending.bReturn.valid()) acceptedShadowFailure.emplace(std::move(bPending));
+        if (bPending.bReturn.valid()) acceptedBReturnFailure.emplace(std::move(bPending));
         throw;
     }
     if (!aReadbackPending.valid() || !delayedGeneration.valid()
@@ -580,7 +598,8 @@ GeneratedOutputReturnSession::tryRetireProductionBReturn(
     auto& authority = pending.bReturn;
     if (authority.state() == backend::RuntimeAuthorityState::RETIRED)
         return backend::RuntimeRetirementStatus::RETIRED;
-    if (!pending.valid() || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
+    if (!backend::validTemporalPair(pending.identity())
+            || authority.state() != backend::RuntimeAuthorityState::SUBMITTED
             || authority.epoch() != generation || !generationEndpoint.GetFenceStatus)
         throw std::logic_error("invalid production pending B-return retirement request");
     const auto result = generationEndpoint.GetFenceStatus(
@@ -665,6 +684,35 @@ void GeneratedOutputReturnSession::resetAfterProductionHandoff() {
     operationLifetime = std::make_shared<const uint8_t>(0);
 }
 
+lsfgvk::backend::RuntimeRetirementStatus
+GeneratedOutputReturnSession::tryRetireAcceptedBReturnFailure(
+        backend::Instance& backend, backend::RuntimeGenerateSession& backendSession) {
+    if (!acceptedBReturnFailure)
+        throw std::logic_error("no accepted B-return failure authority");
+    return tryRetireProductionBReturn(
+        *acceptedBReturnFailure, backend, backendSession);
+}
+
+lsfgvk::backend::RuntimeRetirementStatus
+GeneratedOutputReturnSession::releaseAcceptedBReturnFailure(
+        backend::Instance& backend, backend::RuntimeGenerateSession& backendSession) {
+    if (!acceptedBReturnFailure
+            || acceptedBReturnFailure->bReturn.state()
+                != backend::RuntimeAuthorityState::RETIRED
+            || !acceptedBReturnFailure->pending.valid())
+        return backend::RuntimeRetirementStatus::NOT_READY;
+    const auto generation = acceptedBReturnFailure->pending.identity();
+    auto generatedAuthority =
+        acceptedBReturnFailure->pending.operationRetirementAuthority();
+    static_cast<void>(backend.completeRuntimeGenerateDiagnostic(
+        backendSession, std::move(acceptedBReturnFailure->pending)));
+    backend.retireRuntimeGenerateOperation(
+        backendSession, std::move(generatedAuthority));
+    backend.releaseRuntimeGenerationReady(backendSession, generation);
+    acceptedBReturnFailure.reset();
+    return backend::RuntimeRetirementStatus::RETIRED;
+}
+
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
 lsfgvk::backend::ReturnedGeneratedOperation
 GeneratedOutputReturnSession::completeShadowGeneratedReturnOnAForTesting(
@@ -725,10 +773,10 @@ void GeneratedOutputReturnSession::retireShadowAReturnForTesting(
 
 std::optional<RuntimeGeneratedBReturnPending>
 GeneratedOutputReturnSession::takeAcceptedShadowFailureForTesting() {
-    if (!acceptedShadowFailure)
+    if (!acceptedBReturnFailure)
         throw std::logic_error("no accepted shadow B-return failure authority");
-    auto result = std::move(acceptedShadowFailure);
-    acceptedShadowFailure.reset();
+    auto result = std::move(acceptedBReturnFailure);
+    acceptedBReturnFailure.reset();
     return result;
 }
 

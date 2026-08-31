@@ -73,10 +73,26 @@ namespace lsfgvk::layer {
             const std::vector<VkPipelineStageFlags>&, VkSemaphore, VkFence,
             uint32_t)> submitAndPresent;
         std::function<bool()> waitRenderFence;
+        std::function<VkResult()> tryRetireRenderFence;
         std::function<bool()> completeDiagnostics;
         std::function<void()> retire;
         std::function<void()> emitMarker;
     };
 
     VkResult executeD3B1PresentPath(D3B1PresentPath&);
+
+    struct D3B1PendingPresent {
+        VkResult presentResult{VK_SUCCESS};
+        bool submitAccepted{};
+        bool completed{};
+    };
+
+    enum class D3B1RetirementResult : uint8_t {
+        RETIRED, NOT_READY, DEVICE_LOST, FAILED
+    };
+
+    [[nodiscard]] VkResult submitD3B1PresentNonblocking(
+        D3B1PresentPath&, D3B1PendingPresent&);
+    [[nodiscard]] D3B1RetirementResult tryRetireD3B1Present(
+        D3B1PresentPath&, D3B1PendingPresent&);
 }

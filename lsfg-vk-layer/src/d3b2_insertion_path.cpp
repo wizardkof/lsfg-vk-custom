@@ -212,9 +212,11 @@ VkResult submitD3B2InsertionNonblocking(
 D3B2RetirementResult tryRetireD3B2Insertion(
         D3B2InsertionPath& path, D3B2PendingInsertion& pending) {
     if (!path.state || !pending.submitAccepted || pending.completed
-            || *path.state != D3B2InsertionState::ORIGINAL_PRESENTED
+            || (*path.state != D3B2InsertionState::ORIGINAL_PRESENTED
+                && *path.state != D3B2InsertionState::FAILED)
             || !path.tryRetireGraphicsFence)
         return D3B2RetirementResult::FAILED;
+    const bool presentFailure = *path.state == D3B2InsertionState::FAILED;
     VkResult status{};
     try { status = path.tryRetireGraphicsFence(); }
     catch (...) { *path.state = D3B2InsertionState::FAILED; return D3B2RetirementResult::FAILED; }
@@ -230,6 +232,10 @@ D3B2RetirementResult tryRetireD3B2Insertion(
     }
     try {
         if (path.onGraphicsFenceRetired) path.onGraphicsFenceRetired();
+        if (presentFailure) {
+            pending.completed = true;
+            return D3B2RetirementResult::RETIRED;
+        }
         *path.state = D3B2InsertionState::VALIDATING;
         if (!path.generatedIntegrity() || !path.originalIdentity())
             throw std::runtime_error("D3B2 terminal validation failed");

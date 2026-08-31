@@ -13,9 +13,12 @@
 #include "lsfg-vk-common/vulkan/buffer.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
+#include "lsfg-vk-common/vulkan/destination_return_authority.hpp"
+#include "lsfg-vk-common/helpers/owned_fd.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
+#include "lsfg-vk-common/vulkan/prepared_frame_schedule_authority.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -273,6 +276,27 @@ namespace lsfgvk::backend {
 #endif
     };
 
+    struct GenerationPass {
+        std::vector<Gamma0> gamma0;
+        std::vector<Gamma1> gamma1;
+        std::vector<Delta0> delta0;
+        std::vector<Delta1> delta1;
+        ls::lazy<Generate> generate;
+    };
+
+    struct GenerationResourceSlot {
+        GenerationResourceSlot(const InstanceImpl& instance, VkExtent2D extent,
+            bool hdr, float flow, bool perf, size_t destinationCount);
+
+        std::unique_ptr<Ctx> ctx;
+        std::vector<GenerationPass> passes;
+        std::vector<vk::CommandBuffer> cmdbufs;
+        vk::Fence fence;
+        vk::GenerationSlotAuthority authority;
+        std::vector<uint64_t> requiredDestinationReturns;
+        size_t generatedFrames{};
+    };
+
     /// context class
     class ContextImpl {
     public:
@@ -281,6 +305,7 @@ namespace lsfgvk::backend {
         ContextImpl(const InstanceImpl& instance,
             std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
             std::vector<vk::ExternalImage> destImages, int syncFd,
+            std::vector<ls::OwnedFd> destinationReturnFds,
             VkExtent2D extent, bool hdr, float flow, bool perf);
 
         /// schedule frames
@@ -288,21 +313,26 @@ namespace lsfgvk::backend {
         void scheduleFrames();
         /// schedule zero or more frames at explicit interpolation timestamps
         void scheduleFrames(const std::vector<float>& timestamps);
+        [[nodiscard]] std::optional<PreparedFrameScheduleReservation>
+            reserveFrameSchedule(const std::vector<float>&,
+                std::optional<vk::ExchangeTimelineFrame>);
+        void executeReservation(PreparedFrameScheduleReservationState&);
+        void abortReservation(PreparedFrameScheduleReservationState&) noexcept;
     private:
-        void schedulePreparedFrames(size_t generatedFrames);
+        void recordReservation(GenerationResourceSlot&, size_t generatedFrames,
+            uint64_t reservedFidx, const vk::ExchangeTimelineFrame&);
+        [[nodiscard]] bool tryRetireSlot(GenerationResourceSlot&) noexcept;
 
         std::pair<vk::Image, vk::Image> sourceImages;
         std::vector<vk::Image> destImages;
         vk::Image blackImage;
 
         vk::TimelineSemaphore syncSemaphore; // imported
+        std::vector<vk::TimelineSemaphore> destinationReturnSemaphores; // imported
         vk::TimelineSemaphore prepassSemaphore;
         size_t idx{1};
         size_t fidx{0}; // real frame index
-        std::vector<bool> destinationFirstUse;
-
-        std::vector<vk::CommandBuffer> cmdbufs;
-        vk::Fence cmdbufFence;
+        std::vector<vk::DestinationReturnBackendState> destinationReturnStates;
 
         Ctx ctx;
 
@@ -311,15 +341,9 @@ namespace lsfgvk::backend {
         std::array<Alpha1, 7> alpha1;
         Beta0 beta0;
         Beta1 beta1;
-        struct Pass {
-            std::vector<Gamma0> gamma0;
-            std::vector<Gamma1> gamma1;
-
-            std::vector<Delta0> delta0;
-            std::vector<Delta1> delta1;
-            ls::lazy<Generate> generate;
-        };
-        std::vector<Pass> passes;
+        std::vector<std::unique_ptr<GenerationResourceSlot>> generationSlots;
+        bool reservationOutstanding{};
+        bool schedulePoisoned{};
     };
 
     class RuntimePrepassSessionImpl {
@@ -1004,7 +1028,15 @@ vk::RuntimeExchangeEndpoint Instance::runtimeExchangeEndpoint() const {
 Context& Instance::openContext(
         std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
         std::vector<vk::ExternalImage> destImages,
-        int syncFd, float flow, bool perf) {
+        int syncFd, std::vector<int> destinationReturnFds,
+        float flow, bool perf) {
+    // The API transfers ownership at entry. Keep every descriptor RAII-owned
+    // across validation and partial context construction.
+    std::vector<ls::OwnedFd> ownedDestinationReturnFds;
+    ownedDestinationReturnFds.reserve(destinationReturnFds.size());
+    for (const int fd : destinationReturnFds)
+        ownedDestinationReturnFds.emplace_back(fd);
+
     const auto& descriptor = sourceImages.first.descriptor;
     const VkExtent2D extent{ descriptor.extent.width, descriptor.extent.height };
     const auto expectedSource = vk::makeSourceExchangeImageDescriptor(
@@ -1019,6 +1051,9 @@ Context& Instance::openContext(
         if (!(image.descriptor == expectedDestination))
             throw backend::error("Destination exchange image descriptors do not match");
     }
+    if (!vk::destinationReturnCardinalityValid(
+            destImages.size(), destinationReturnFds.size()))
+        throw backend::error("Destination return semaphore count does not match images");
 
     const bool hdr = descriptor.format == VK_FORMAT_R16G16B16A16_SFLOAT;
     if (!hdr && descriptor.format != VK_FORMAT_R8G8B8A8_UNORM)
@@ -1026,8 +1061,20 @@ Context& Instance::openContext(
 
     return *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
         std::move(sourceImages), std::move(destImages), syncFd,
+        std::move(ownedDestinationReturnFds),
         extent, hdr, flow, perf
     )).get();
+}
+
+Context& Instance::openContext(
+        std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
+        std::vector<vk::ExternalImage> destImages,
+        int syncFd, float flow, bool perf) {
+    if (!destImages.empty())
+        throw backend::error(
+            "Destination return semaphores are required for generated destinations");
+    return this->openContext(std::move(sourceImages), std::move(destImages),
+        syncFd, {}, flow, perf);
 }
 
 namespace {
@@ -1138,6 +1185,23 @@ namespace {
             throw backend::error("Unable to import timeline semaphore", e);
         }
     }
+    std::vector<vk::TimelineSemaphore> importDestinationReturnSemaphores(
+            const vk::Vulkan& vk, std::vector<ls::OwnedFd>& fds) {
+        try {
+            std::vector<vk::TimelineSemaphore> semaphores;
+            semaphores.reserve(fds.size());
+            for (auto& fd : fds) {
+                semaphores.emplace_back(vk, 0, fd.get());
+                // A successful OPAQUE_FD import consumes this descriptor.
+                static_cast<void>(fd.release());
+            }
+            return semaphores;
+        } catch (const std::exception& e) {
+            // Successfully imported descriptors were consumed by Vulkan;
+            // every not-yet-imported descriptor remains RAII-owned by fds.
+            throw backend::error("Unable to import destination return semaphores", e);
+        }
+    }
     /// create prepass semaphores
     vk::TimelineSemaphore createPrepassSemaphore(const vk::Vulkan& vk) {
         try {
@@ -1201,6 +1265,15 @@ namespace {
         }
     }
 }
+
+GenerationResourceSlot::GenerationResourceSlot(const InstanceImpl& instance,
+        VkExtent2D extent, bool hdr, float flow, bool perf,
+        size_t destinationCount) :
+    ctx(std::make_unique<Ctx>(createCtx(
+        instance, extent, hdr, flow, perf, destinationCount))),
+    cmdbufs(createCommandBuffers(instance.getVulkan(), destinationCount + 1)),
+    fence(instance.getVulkan()),
+    requiredDestinationReturns(destinationCount) {}
 
 RuntimePrepassSessionImpl::RuntimePrepassSessionImpl(const InstanceImpl& instance,
         VkExtent2D extent, VkFormat transportFormat, uint64_t transportModifier,
@@ -2381,15 +2454,16 @@ void RuntimeGenerateSessionImpl::retireOperation(
 ContextImpl::ContextImpl(const InstanceImpl& instance,
             std::pair<vk::ExternalImage, vk::ExternalImage> externalSourceImages,
             std::vector<vk::ExternalImage> externalDestImages, int syncFd,
+            std::vector<ls::OwnedFd> destinationReturnFds,
             VkExtent2D extent, bool hdr, float flow, bool perf) :
         sourceImages(importImages(instance.getVulkan(), externalSourceImages)),
         destImages(importImages(instance.getVulkan(), externalDestImages)),
         blackImage(createBlackImage(instance.getVulkan())),
         syncSemaphore(importTimelineSemaphore(instance.getVulkan(), syncFd)),
+        destinationReturnSemaphores(importDestinationReturnSemaphores(
+            instance.getVulkan(), destinationReturnFds)),
         prepassSemaphore(createPrepassSemaphore(instance.getVulkan())),
-        destinationFirstUse(externalDestImages.size(), true),
-        cmdbufs(createCommandBuffers(instance.getVulkan(), externalDestImages.size() + 1)),
-        cmdbufFence(instance.getVulkan()),
+        destinationReturnStates(externalDestImages.size()),
         ctx(createCtx(instance, extent, hdr, flow, perf, externalDestImages.size())),
         mipmaps(ctx, sourceImages),
         alpha0{
@@ -2412,9 +2486,16 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
         },
         beta0(ctx, alpha1.at(0).getImages()),
         beta1(ctx, beta0.getImages()) {
-    // build main passes
-    for (size_t i = 0; i < destImages.size(); ++i) {
-        auto& pass = this->passes.emplace_back();
+    constexpr size_t GENERATION_SLOT_COUNT = 2;
+    this->generationSlots.reserve(GENERATION_SLOT_COUNT);
+    for (size_t slotIndex = 0; slotIndex < GENERATION_SLOT_COUNT; ++slotIndex) {
+        auto& slot = *this->generationSlots.emplace_back(
+            std::make_unique<GenerationResourceSlot>(instance, extent, hdr,
+                flow, perf, externalDestImages.size()));
+        slot.passes.reserve(destImages.size());
+        auto& slotCtx = *slot.ctx;
+        for (size_t i = 0; i < destImages.size(); ++i) {
+        auto& pass = slot.passes.emplace_back();
 
         pass.gamma0.reserve(7);
         pass.gamma1.reserve(7);
@@ -2422,21 +2503,21 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
         pass.delta1.reserve(3);
         for (size_t j = 0; j < 7; j++) {
             if (j == 0) { // first pass has no prior data
-                pass.gamma0.emplace_back(ctx, i,
+                pass.gamma0.emplace_back(slotCtx, i,
                     this->alpha1.at(6 - j).getImages(),
                     this->blackImage
                 );
-                pass.gamma1.emplace_back(ctx, i,
+                pass.gamma1.emplace_back(slotCtx, i,
                     pass.gamma0.at(j).getImages(),
                     this->blackImage,
                     this->beta1.getImages().at(5)
                 );
             } else { // other passes use prior data
-                pass.gamma0.emplace_back(ctx, i,
+                pass.gamma0.emplace_back(slotCtx, i,
                     this->alpha1.at(6 - j).getImages(),
                     pass.gamma1.at(j - 1).getImage()
                 );
-                pass.gamma1.emplace_back(ctx, i,
+                pass.gamma1.emplace_back(slotCtx, i,
                     pass.gamma0.at(j).getImages(),
                     pass.gamma1.at(j - 1).getImage(),
                     this->beta1.getImages().at(6 - j)
@@ -2444,12 +2525,12 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
             }
 
             if (j == 4) { // first special pass has no prior data
-                pass.delta0.emplace_back(ctx, i,
+                pass.delta0.emplace_back(slotCtx, i,
                     this->alpha1.at(6 - j).getImages(),
                     this->blackImage,
                     pass.gamma1.at(j - 1).getImage()
                 );
-                pass.delta1.emplace_back(ctx, i,
+                pass.delta1.emplace_back(slotCtx, i,
                     pass.delta0.at(j - 4).getImages0(),
                     pass.delta0.at(j - 4).getImages1(),
                     this->blackImage,
@@ -2457,12 +2538,12 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
                     this->blackImage
                 );
             } else if (j > 4) { // further passes do
-                pass.delta0.emplace_back(ctx, i,
+                pass.delta0.emplace_back(slotCtx, i,
                     this->alpha1.at(6 - j).getImages(),
                     pass.delta1.at(j - 5).getImage0(),
                     pass.gamma1.at(j - 1).getImage()
                 );
-                pass.delta1.emplace_back(ctx, i,
+                pass.delta1.emplace_back(slotCtx, i,
                     pass.delta0.at(j - 4).getImages0(),
                     pass.delta0.at(j - 4).getImages1(),
                     pass.delta1.at(j - 5).getImage0(),
@@ -2472,13 +2553,14 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
             }
         }
 
-        pass.generate.emplace(ctx, i,
+        pass.generate.emplace(slotCtx, i,
             this->sourceImages,
             pass.gamma1.at(6).getImage(),
             pass.delta1.at(2).getImage0(),
             pass.delta1.at(2).getImage1(),
             this->destImages.at(i)
         );
+        }
     }
 
     // initialize all images
@@ -2491,7 +2573,8 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
     }
     beta0.prepare(images);
     beta1.prepare(images);
-    for (const auto& pass : this->passes) {
+    for (const auto& slot : this->generationSlots) {
+    for (const auto& pass : slot->passes) {
         for (size_t i = 0; i < 7; ++i) {
             pass.gamma0.at(i).prepare(images);
             pass.gamma1.at(i).prepare(images);
@@ -2500,6 +2583,7 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
             pass.delta0.at(i - 4).prepare(images);
             pass.delta1.at(i - 4).prepare(images);
         }
+    }
     }
 
     std::vector<vk::Barrier> barriers{};
@@ -2526,6 +2610,114 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
     cmdbuf.insertBarriers(ctx.vk, barriers);
     cmdbuf.end(ctx.vk);
     cmdbuf.submit(ctx.vk); // wait for completion
+}
+
+struct lsfgvk::backend::PreparedFrameScheduleReservationState {
+    ContextImpl* owner{};
+    GenerationResourceSlot* slot{};
+    vk::ExchangeTimelineFrame timeline{};
+    uint64_t fidx{};
+    size_t generatedFrames{};
+    bool active{};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    void* testOwner{};
+    void (*testExecute)(void*){};
+    void (*testAbort)(void*){};
+#endif
+};
+
+PreparedFrameScheduleReservation::PreparedFrameScheduleReservation() noexcept = default;
+PreparedFrameScheduleReservation::PreparedFrameScheduleReservation(
+        std::unique_ptr<PreparedFrameScheduleReservationState> value) noexcept :
+    state(std::move(value)) {}
+PreparedFrameScheduleReservation::PreparedFrameScheduleReservation(
+    PreparedFrameScheduleReservation&&) noexcept = default;
+PreparedFrameScheduleReservation& PreparedFrameScheduleReservation::operator=(
+        PreparedFrameScheduleReservation&& other) noexcept {
+    if (this != &other) {
+        if (state && state->active) {
+            if (state->owner) state->owner->abortReservation(*state);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            else if (state->testAbort) {
+                state->testAbort(state->testOwner);
+                state->active = false;
+            }
+#endif
+        }
+        state = std::move(other.state);
+    }
+    return *this;
+}
+PreparedFrameScheduleReservation::~PreparedFrameScheduleReservation() {
+    if (state && state->active) {
+        if (state->owner) state->owner->abortReservation(*state);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        else if (state->testAbort) state->testAbort(state->testOwner);
+#endif
+    }
+}
+bool PreparedFrameScheduleReservation::valid() const noexcept {
+    return state && state->active;
+}
+vk::ExchangeTimelineFrame PreparedFrameScheduleReservation::timeline() const noexcept {
+    return state ? state->timeline : vk::ExchangeTimelineFrame{};
+}
+uint64_t PreparedFrameScheduleReservation::frameIndex() const noexcept {
+    return state ? state->fidx : 0;
+}
+size_t PreparedFrameScheduleReservation::generatedFrames() const noexcept {
+    return state ? state->generatedFrames : 0;
+}
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+uintptr_t PreparedFrameScheduleReservation::slotIdentityForTesting() const noexcept {
+    return state && state->slot ? reinterpret_cast<uintptr_t>(state->slot) : 0;
+}
+VkBuffer PreparedFrameScheduleReservation::constantBufferForTesting(
+        size_t index) const noexcept {
+    if (!state || !state->slot || index >= state->slot->ctx->constantBuffers.size())
+        return VK_NULL_HANDLE;
+    return state->slot->ctx->constantBuffers[index].handle();
+}
+VkCommandBuffer PreparedFrameScheduleReservation::commandBufferForTesting(
+        size_t index) const noexcept {
+    if (!state || !state->slot || index >= state->slot->cmdbufs.size())
+        return VK_NULL_HANDLE;
+    return state->slot->cmdbufs[index].handle();
+}
+#endif
+void PreparedFrameScheduleReservation::execute() {
+    if (!this->valid())
+        throw backend::error("invalid or already consumed frame schedule reservation");
+    if (state->owner) {
+        state->owner->executeReservation(*state);
+        return;
+    }
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    if (state->testExecute) {
+        state->testExecute(state->testOwner);
+        state->active = false;
+        return;
+    }
+#endif
+    throw backend::error("prepared frame schedule reservation has no executor");
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+PreparedFrameScheduleReservation PreparedFrameScheduleReservationTestAccess::make(
+        void* owner, void (*execute)(void*), void (*abort)(void*)) {
+    auto state = std::make_unique<PreparedFrameScheduleReservationState>();
+    state->testOwner = owner;
+    state->testExecute = execute;
+    state->testAbort = abort;
+    state->active = true;
+    return PreparedFrameScheduleReservation(std::move(state));
+}
+#endif
+
+std::optional<PreparedFrameScheduleReservation> Instance::reserveFrameSchedule(
+        Context& context, const std::vector<float>& timestamps,
+        std::optional<vk::ExchangeTimelineFrame> expectedTimeline) {
+    return context.reserveFrameSchedule(timestamps, expectedTimeline);
 }
 
 void Instance::scheduleFrames(
@@ -2579,24 +2771,29 @@ void Instance::scheduleFrames(Context& context) { // NOLINT (static)
 }
 
 void Context::scheduleFrames() {
-    if (this->fidx && !this->cmdbufFence.wait(this->ctx.vk))
-        throw backend::error("Timeout waiting for previous frame to complete");
-    this->cmdbufFence.reset(this->ctx.vk);
-    this->schedulePreparedFrames(this->destImages.size());
+    std::vector<float> timestamps;
+    timestamps.reserve(this->destImages.size());
+    for (size_t i = 0; i < this->destImages.size(); ++i)
+        timestamps.push_back(backend::getDefaultConstantBuffer(
+            i, this->destImages.size(), this->ctx.flow).timestamp);
+    auto reservation = this->reserveFrameSchedule(timestamps, std::nullopt);
+    if (!reservation)
+        throw backend::error("no prepared frame schedule slot is available");
+    reservation->execute();
 }
 
-void Context::schedulePreparedFrames(size_t generatedFrames) {
-    const auto timeline = vk::makeExchangeTimelineFrame(this->idx, generatedFrames);
-    const size_t currentSource = this->fidx % 2;
-    const size_t returnedSource = (this->fidx + 1) % 2;
+void Context::recordReservation(GenerationResourceSlot& slot,
+        size_t generatedFrames, uint64_t reservedFidx,
+        const vk::ExchangeTimelineFrame& timeline) {
+    const size_t currentSource = reservedFidx % 2;
+    const size_t returnedSource = (reservedFidx + 1) % 2;
     const uint32_t family = this->ctx.vk.get().queueFamilyIndex();
 
-    // schedule pre-pass
-    const auto& cmdbuf = this->cmdbufs.at(0);
+    const auto& cmdbuf = slot.cmdbufs.at(0);
     cmdbuf.begin(ctx.vk);
 
     std::vector<vk::Barrier> sourceAcquires;
-    if (this->fidx == 0) {
+    if (reservedFidx == 0) {
         sourceAcquires = {
             vk::sourceAcquireFromLayer(this->sourceImages.first.handle(), family),
             vk::sourceAcquireFromLayer(this->sourceImages.second.handle(), family)
@@ -2609,10 +2806,10 @@ void Context::schedulePreparedFrames(size_t generatedFrames) {
     cmdbuf.insertBarriers(ctx.vk, sourceAcquires,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-    this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
+    this->mipmaps.render(ctx.vk, cmdbuf, reservedFidx);
     for (size_t i = 0; i < 7; ++i) {
         this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
-        this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
+        this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, reservedFidx);
     }
     this->beta0.render(ctx.vk, cmdbuf, this->fidx);
     this->beta1.render(ctx.vk, cmdbuf);
@@ -2629,39 +2826,29 @@ void Context::schedulePreparedFrames(size_t generatedFrames) {
     }
 
     cmdbuf.end(ctx.vk);
-    if (generatedFrames == 0) {
-        cmdbuf.submit(this->ctx.vk,
-            {}, this->syncSemaphore.handle(), timeline.sourceReady,
-            {}, this->syncSemaphore.handle(), timeline.sourceReturn,
-            this->cmdbufFence.handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-    } else {
-        cmdbuf.submit(this->ctx.vk,
-            {}, this->syncSemaphore.handle(), timeline.sourceReady,
-            {}, this->prepassSemaphore.handle(), timeline.sourceReady,
-            VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-    }
 
     // schedule main passes
     for (size_t i = 0; i < generatedFrames; i++) {
-        const auto& cmdbuf = this->cmdbufs.at(i + 1);
+        const auto& cmdbuf = slot.cmdbufs.at(i + 1);
         cmdbuf.begin(ctx.vk);
 
-        const auto destinationAcquire = this->destinationFirstUse.at(i)
+        auto& destinationReturn = this->destinationReturnStates.at(i);
+        const auto destinationAcquire = destinationReturn.firstUse
             ? vk::destinationInitialAcquireFromLayer(this->destImages.at(i).handle(), family)
             : vk::destinationAcquireFromLayer(this->destImages.at(i).handle(), family);
         cmdbuf.insertBarriers(ctx.vk, { destinationAcquire },
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-        const auto& pass = this->passes.at(i);
+        const auto& pass = slot.passes.at(i);
         for (size_t j = 0; j < 7; j++) {
-            pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
+            pass.gamma0.at(j).render(ctx.vk, cmdbuf, reservedFidx);
             pass.gamma1.at(j).render(ctx.vk, cmdbuf);
 
             if (j < 4) continue;
-            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, this->fidx);
+            pass.delta0.at(j - 4).render(ctx.vk, cmdbuf, reservedFidx);
             pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
         }
-        pass.generate->render(ctx.vk, cmdbuf, this->fidx);
+        pass.generate->render(ctx.vk, cmdbuf, reservedFidx);
 
         std::vector<vk::Barrier> releases;
         if (i == generatedFrames - 1) {
@@ -2675,17 +2862,7 @@ void Context::schedulePreparedFrames(size_t generatedFrames) {
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
         cmdbuf.end(ctx.vk);
-        cmdbuf.submit(this->ctx.vk,
-            {}, this->prepassSemaphore.handle(), timeline.sourceReady,
-            {}, this->syncSemaphore.handle(), timeline.destinationReady(i),
-            i == generatedFrames - 1 ? this->cmdbufFence.handle() : VK_NULL_HANDLE,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
-        );
-        this->destinationFirstUse.at(i) = false;
     }
-
-    this->idx = timeline.nextBase;
-    this->fidx++;
 }
 
 void Context::scheduleFrames(const std::vector<float>& timestamps) {
@@ -2701,21 +2878,181 @@ void Context::scheduleFrames(const std::vector<float>& timestamps) {
         previous = timestamp;
     }
 
-    // Wait for the previous source-frame processing to complete before updating
-    // host-visible constant buffers that may still be referenced by the GPU.
-    if (this->fidx && !this->cmdbufFence.wait(this->ctx.vk))
-        throw backend::error("Timeout waiting for previous frame to complete");
-    this->cmdbufFence.reset(this->ctx.vk);
+    auto reservation = this->reserveFrameSchedule(timestamps, std::nullopt);
+    if (!reservation)
+        throw backend::error("no prepared frame schedule slot is available");
+    reservation->execute();
+}
 
-    for (size_t i = 0; i < timestamps.size(); ++i) {
-        auto constants = backend::getDefaultConstantBuffer(
-            i, timestamps.size(), this->ctx.flow);
-        constants.timestamp = timestamps.at(i);
-        this->ctx.constantBuffers.at(i).update(this->ctx.vk, constants);
+bool Context::tryRetireSlot(GenerationResourceSlot& slot) noexcept {
+    if (slot.authority.phase() == vk::GenerationSlotPhase::Available) return true;
+    if (slot.authority.phase() != vk::GenerationSlotPhase::InFlight
+            || !slot.authority.terminalSubmitted())
+        return false;
+    const auto fenceResult = this->ctx.vk.get().df().GetFenceStatus(
+        this->ctx.vk.get().dev(), slot.fence.handle());
+    if (fenceResult == VK_NOT_READY) return false;
+    if (fenceResult != VK_SUCCESS) {
+        slot.authority.submitFailed(fenceResult == VK_ERROR_DEVICE_LOST);
+        return false;
     }
+    const auto counter = this->ctx.vk.get().df().GetSemaphoreCounterValueKHR;
+    if (!counter) {
+        slot.authority.submitFailed(true);
+        return false;
+    }
+    for (size_t i = 0; i < slot.generatedFrames; ++i) {
+        uint64_t value{};
+        const auto result = counter(this->ctx.vk.get().dev(),
+            this->destinationReturnSemaphores.at(i).handle(), &value);
+        if (result == VK_ERROR_DEVICE_LOST) {
+            slot.authority.submitFailed(true);
+            return false;
+        }
+        if (result != VK_SUCCESS || value < slot.requiredDestinationReturns.at(i))
+            return false;
+    }
+    if (!slot.authority.retire(true, true)) return false;
+    slot.generatedFrames = 0;
+    return true;
+}
 
-    // The shared path keeps prepass/history processing active for g == 0.
-    this->schedulePreparedFrames(timestamps.size());
+std::optional<PreparedFrameScheduleReservation> Context::reserveFrameSchedule(
+        const std::vector<float>& timestamps,
+        std::optional<vk::ExchangeTimelineFrame> expectedTimeline) {
+    if (reservationOutstanding)
+        return std::nullopt;
+    if (schedulePoisoned)
+        return std::nullopt;
+    if (timestamps.size() > this->destImages.size())
+        throw backend::error("requested more generated frames than the context capacity");
+    float previous = 0.0F;
+    for (const float timestamp : timestamps) {
+        if (!(timestamp > 0.0F && timestamp < 1.0F) || timestamp <= previous)
+            throw backend::error("invalid frame generation timestamps");
+        previous = timestamp;
+    }
+    const auto timeline = vk::makeExchangeTimelineFrame(this->idx, timestamps.size());
+    if (expectedTimeline && (expectedTimeline->sourceReady != timeline.sourceReady
+            || expectedTimeline->sourceReturn != timeline.sourceReturn
+            || expectedTimeline->nextBase != timeline.nextBase
+            || expectedTimeline->generatedFrames != timeline.generatedFrames))
+        throw backend::error("prepared frame schedule timeline identity mismatch");
+
+    GenerationResourceSlot* selected{};
+    for (auto& slot : generationSlots) {
+        static_cast<void>(tryRetireSlot(*slot));
+        if (slot->authority.phase() == vk::GenerationSlotPhase::Available) {
+            selected = slot.get();
+            break;
+        }
+    }
+    if (!selected) return std::nullopt;
+
+    selected->fence.reset(this->ctx.vk);
+    if (!selected->authority.reserve())
+        return std::nullopt;
+    selected->generatedFrames = timestamps.size();
+    std::ranges::fill(selected->requiredDestinationReturns, 0);
+    try {
+        for (size_t i = 0; i < timestamps.size(); ++i) {
+            auto constants = backend::getDefaultConstantBuffer(
+                i, timestamps.size(), this->ctx.flow);
+            constants.timestamp = timestamps.at(i);
+            selected->ctx->constantBuffers.at(i).update(this->ctx.vk, constants);
+        }
+        this->recordReservation(*selected, timestamps.size(), this->fidx, timeline);
+        auto state = std::make_unique<PreparedFrameScheduleReservationState>();
+        state->owner = this;
+        state->slot = selected;
+        state->timeline = timeline;
+        state->fidx = this->fidx;
+        state->generatedFrames = timestamps.size();
+        state->active = true;
+        reservationOutstanding = true;
+        return PreparedFrameScheduleReservation(std::move(state));
+    } catch (...) {
+        selected->authority.abort();
+        throw;
+    }
+}
+
+void Context::abortReservation(PreparedFrameScheduleReservationState& reservation) noexcept {
+    if (!reservation.active || reservation.owner != this || !reservation.slot)
+        return;
+    reservation.slot->authority.abort();
+    reservation.active = false;
+    reservationOutstanding = false;
+}
+
+void Context::executeReservation(PreparedFrameScheduleReservationState& reservation) {
+    if (!reservation.active || reservation.owner != this || !reservation.slot
+            || reservation.slot->authority.phase() != vk::GenerationSlotPhase::Reserved)
+        throw backend::error("invalid prepared frame schedule execution authority");
+    auto& slot = *reservation.slot;
+    bool accepted{};
+    try {
+        vk::executePreparedFrameSchedule(reservation.generatedFrames,
+            [&](vk::PreparedFrameSubmitPhase phase) {
+                if (phase.index == 0) {
+                    std::array<vk::TimelineWait, 1> waits{
+                        vk::TimelineWait{this->syncSemaphore.handle(),
+                            reservation.timeline.sourceReady,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT}};
+                    std::array<vk::TimelineSignal, 1> signals{
+                        vk::TimelineSignal{
+                            reservation.generatedFrames == 0
+                                ? this->syncSemaphore.handle()
+                                : this->prepassSemaphore.handle(),
+                            reservation.generatedFrames == 0
+                                ? reservation.timeline.sourceReturn
+                                : reservation.timeline.sourceReady}};
+                    const vk::CommandBufferSubmit submission{
+                        .timelineWaits = waits, .timelineSignals = signals};
+                    slot.cmdbufs.at(0).submit(this->ctx.vk, submission,
+                        phase.terminal ? slot.fence.handle() : VK_NULL_HANDLE);
+                    return;
+                }
+                const size_t i = phase.index - 1;
+                const auto& destinationReturn = this->destinationReturnStates.at(i);
+                vk::BackendDestinationSubmitStorage storage;
+                vk::prepareBackendDestinationSubmit(
+                    this->prepassSemaphore.handle(), reservation.timeline.sourceReady,
+                    this->destinationReturnSemaphores.at(i).handle(), destinationReturn,
+                    this->syncSemaphore.handle(), reservation.timeline.destinationReady(i),
+                    storage);
+                slot.cmdbufs.at(phase.index).submit(this->ctx.vk, storage.submission,
+                    phase.terminal ? slot.fence.handle() : VK_NULL_HANDLE);
+            },
+            [&](vk::PreparedFrameSubmitPhase phase) noexcept {
+                accepted = true;
+                slot.authority.submitAccepted(phase.terminal);
+                if (phase.index == 0) {
+                    this->idx = reservation.timeline.nextBase;
+                    ++this->fidx;
+                    return;
+                }
+                const size_t i = phase.index - 1;
+                auto& destinationReturn = this->destinationReturnStates.at(i);
+                slot.requiredDestinationReturns.at(i) =
+                    destinationReturn.pendingWriteGeneration();
+                destinationReturn.backendWriteAccepted();
+            });
+        reservation.active = false;
+        reservationOutstanding = false;
+    } catch (const ls::vulkan_error& e) {
+        schedulePoisoned = vk::applyPreparedFrameSubmitFailure(
+            slot.authority, accepted, e.error());
+        reservation.active = false;
+        reservationOutstanding = false;
+        throw;
+    } catch (...) {
+        slot.authority.submitFailed(false);
+        schedulePoisoned = accepted;
+        reservation.active = false;
+        reservationOutstanding = false;
+        throw;
+    }
 }
 
 void Instance::closeContext(const Context& context) {
@@ -2727,9 +3064,11 @@ void Instance::closeContext(const Context& context) {
         throw backend::error("attempted to close unknown context",
             std::runtime_error("no such context"));
 
-    const auto& vk = this->m_impl->getVulkan();
-    vk.df().DeviceWaitIdle(vk.dev());
-
+    // Do not block or fabricate a clean return while a destination may still
+    // be owned by A. Retain images and imported return timelines under the
+    // backend device lifetime; a replacement context gets fresh semaphores and
+    // generation state, so handle reuse cannot authorize it.
+    this->m_retiredContexts.emplace_back(std::move(*it));
     this->m_contexts.erase(it);
 }
 

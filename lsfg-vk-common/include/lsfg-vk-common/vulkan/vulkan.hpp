@@ -33,6 +33,8 @@ namespace vk {
         PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
             GetPhysicalDeviceExternalSemaphoreProperties;
         PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalFenceProperties
+            GetPhysicalDeviceExternalFenceProperties;
     };
 
     /// vulkan instance function pointers
@@ -48,6 +50,10 @@ namespace vk {
         PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
         PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
         PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
+            GetPhysicalDeviceExternalSemaphoreProperties;
+        PFN_vkGetPhysicalDeviceExternalFenceProperties
+            GetPhysicalDeviceExternalFenceProperties;
 
         // extension functions
         PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
@@ -95,6 +101,7 @@ namespace vk {
         PFN_vkCmdFillBuffer CmdFillBuffer;
         PFN_vkCmdCopyBuffer CmdCopyBuffer;
         PFN_vkCmdBlitImage CmdBlitImage;
+        PFN_vkCmdCopyImage CmdCopyImage;
         PFN_vkCmdClearColorImage CmdClearColorImage;
         PFN_vkCmdBindPipeline CmdBindPipeline;
         PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
@@ -108,6 +115,8 @@ namespace vk {
         PFN_vkCreateFence CreateFence;
         PFN_vkDestroyFence DestroyFence;
         PFN_vkGetFenceStatus GetFenceStatus;
+        PFN_vkGetFenceFdKHR GetFenceFdKHR;
+        PFN_vkImportFenceFdKHR ImportFenceFdKHR;
         PFN_vkResetFences ResetFences;
         PFN_vkWaitForFences WaitForFences;
         PFN_vkCreateImage CreateImage;
@@ -136,6 +145,7 @@ namespace vk {
         // extension functions
         PFN_vkSignalSemaphoreKHR SignalSemaphoreKHR;
         PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
+        PFN_vkGetSemaphoreCounterValueKHR GetSemaphoreCounterValueKHR;
         PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
         PFN_vkImportSemaphoreFdKHR ImportSemaphoreFdKHR;
         PFN_vkGetSemaphoreFdKHR GetSemaphoreFdKHR;

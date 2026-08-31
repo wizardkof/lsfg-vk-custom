@@ -65,7 +65,7 @@ namespace lsfgvk::layer {
         RuntimeGeneratedBReturnPending& operator=(RuntimeGeneratedBReturnPending&&) noexcept = default;
         [[nodiscard]] bool valid() const noexcept { return bToAPayload.valid() && pending.valid(); }
         [[nodiscard]] backend::RuntimeTemporalPairIdentity identity() const noexcept {
-            return pending.temporalPair();
+            return pairIdentity;
         }
         [[nodiscard]] const vk::SyncFdPayload& payload() const noexcept { return bToAPayload; }
         [[nodiscard]] const backend::RuntimeSubmissionRetirement& bReturnAuthority() const noexcept {
@@ -94,12 +94,13 @@ namespace lsfgvk::layer {
                 std::shared_ptr<void> resources = {}) :
             pending(std::move(value)), bToAPayload(std::move(exported)),
             bReturn(std::move(authority)), fenceOwner(std::move(fence)),
-            returnResources(std::move(resources)) {}
+            returnResources(std::move(resources)), pairIdentity(pending.temporalPair()) {}
         backend::RuntimeGenerateDiagnosticPending pending;
         vk::SyncFdPayload bToAPayload;
         backend::RuntimeSubmissionRetirement bReturn;
         std::shared_ptr<VkFence> fenceOwner;
         std::shared_ptr<void> returnResources;
+        backend::RuntimeTemporalPairIdentity pairIdentity{};
     };
 
     enum class GeneratedOutputCleanupState { NO_SUBMIT, B_SUBMITTED, A_SUBMITTED, A_COMPLETED };
@@ -206,6 +207,19 @@ namespace lsfgvk::layer {
         [[nodiscard]] backend::RuntimeRetirementStatus
             releaseProductionGeneratedOutput(backend::ReturnedGeneratedOperation&,
                 backend::Instance&, backend::RuntimeGenerateSession&);
+        void executeProductionGpuChained(
+            backend::RuntimeGenerateDiagnosticPending&&, backend::Instance&,
+            backend::RuntimeGenerateSession&,
+            std::optional<vk::RuntimeForeignImageHandoffInfo> = std::nullopt);
+        [[nodiscard]] bool hasAcceptedBReturnFailure() const noexcept {
+            return acceptedBReturnFailure.has_value();
+        }
+        [[nodiscard]] backend::RuntimeRetirementStatus
+            tryRetireAcceptedBReturnFailure(backend::Instance&,
+                backend::RuntimeGenerateSession&);
+        [[nodiscard]] backend::RuntimeRetirementStatus
+            releaseAcceptedBReturnFailure(backend::Instance&,
+                backend::RuntimeGenerateSession&);
         void resetAfterProductionHandoff();
 #ifdef LSFGVK_TESTING_SHADOW_SPLIT
         [[nodiscard]] RuntimeGeneratedBReturnPending submitShadowBReturnForTesting(
@@ -267,7 +281,7 @@ namespace lsfgvk::layer {
         backend::Instance* delayedBackend{};
         backend::RuntimeGenerateSession* delayedBackendSession{};
         GeneratedOutputIntegrity expected{};
-        std::optional<RuntimeGeneratedBReturnPending> acceptedShadowFailure;
+        std::optional<RuntimeGeneratedBReturnPending> acceptedBReturnFailure;
         std::shared_ptr<const uint8_t> operationLifetime{std::make_shared<const uint8_t>(0)};
     };
 }

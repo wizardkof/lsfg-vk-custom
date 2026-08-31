@@ -21,7 +21,11 @@ namespace lsfgvk::layer {
         VkSwapchainCreateFlagsKHR unsupportedSwapchainFlags{};
         VkExtent2D extent{};
         VkFormat format{VK_FORMAT_UNDEFINED};
+        uint32_t arrayLayers{1};
+        VkImageUsageFlags2KHR effectiveUsage{};
         VkImageUsageFlags usage{};
+        bool usageFitsLegacy{true};
+        bool hasRequiredTransferUsage{};
         VkSharingMode sharingMode{VK_SHARING_MODE_EXCLUSIVE};
         std::vector<uint32_t> queueFamilyIndices;
         bool hasFormatList{};
@@ -38,6 +42,7 @@ namespace lsfgvk::layer {
         [[nodiscard]] vk::ImageCreateOptions imageOptions(const void* pNext = nullptr) const {
             return vk::ImageCreateOptions {
                 .flags = this->imageFlags,
+                .arrayLayers = this->arrayLayers,
                 .sharingMode = this->sharingMode,
                 .queueFamilyIndices = std::span<const uint32_t>(this->queueFamilyIndices),
                 .pNext = pNext
@@ -45,7 +50,14 @@ namespace lsfgvk::layer {
         }
 
         [[nodiscard]] bool supported() const {
-            return this->unsupportedSwapchainFlags == 0;
+            // The current FG exchange images are structurally single-layer.
+            // Preserve the real descriptor above, but keep multilayer
+            // swapchains on the logical pass-through path until both sides of
+            // the exchange can preserve every layer.
+            return this->arrayLayers == 1
+                && this->unsupportedSwapchainFlags == 0
+                && this->usageFitsLegacy
+                && this->hasRequiredTransferUsage;
         }
     };
 
@@ -56,5 +68,8 @@ namespace lsfgvk::layer {
     /// unsupported so runtime integration can fall back safely.
     [[nodiscard]] VirtualSwapchainImageSpec
     makeVirtualSwapchainImageSpec(const VkSwapchainCreateInfoKHR& info);
+
+    [[nodiscard]] VkImageUsageFlags2KHR
+    effectiveSwapchainImageUsage(const VkSwapchainCreateInfoKHR& info) noexcept;
 
 }

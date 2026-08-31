@@ -5,6 +5,7 @@
 #include "external_buffer_transport.hpp"
 #include "external_semaphore_sync.hpp"
 #include "runtime_device_pair.hpp"
+#include "queue_submit.hpp"
 #include "external_memory_import.hpp"
 
 #include <cstdint>
@@ -224,6 +225,8 @@ namespace vk {
         // Kept at the end to preserve source compatibility for existing
         // aggregate initializers.  Required by reusable observation commands.
         PFN_vkResetCommandBuffer ResetCommandBuffer{};
+        QueueSubmitObserver submitObserver{};
+        QueueSubmitResultObserver submitResultObserver{};
     };
 
     struct RuntimeExchangeChannelInfo {

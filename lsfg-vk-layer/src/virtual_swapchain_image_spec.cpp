@@ -9,6 +9,16 @@
 using namespace lsfgvk::layer;
 
 namespace {
+    const VkImageUsageFlags2CreateInfoKHR* findUsageFlags2(const void* chain) {
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(chain);
+        while (current) {
+            if (current->sType == VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR)
+                return reinterpret_cast<const VkImageUsageFlags2CreateInfoKHR*>(current);
+            current = current->pNext;
+        }
+        return nullptr;
+    }
+
     const VkImageFormatListCreateInfo* findFormatList(const void* chain) {
         auto* current = reinterpret_cast<const VkBaseInStructure*>(chain);
         while (current) {
@@ -25,7 +35,15 @@ VirtualSwapchainImageSpec lsfgvk::layer::makeVirtualSwapchainImageSpec(
     VirtualSwapchainImageSpec spec{};
     spec.extent = info.imageExtent;
     spec.format = info.imageFormat;
-    spec.usage = info.imageUsage;
+    spec.arrayLayers = info.imageArrayLayers;
+    spec.effectiveUsage = effectiveSwapchainImageUsage(info);
+    spec.usageFitsLegacy = (spec.effectiveUsage & ~VkImageUsageFlags2KHR{UINT32_MAX}) == 0;
+    spec.usage = static_cast<VkImageUsageFlags>(spec.effectiveUsage);
+    constexpr VkImageUsageFlags2KHR requiredTransferUsage =
+        VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR
+        | VK_IMAGE_USAGE_2_TRANSFER_DST_BIT_KHR;
+    spec.hasRequiredTransferUsage =
+        (spec.effectiveUsage & requiredTransferUsage) == requiredTransferUsage;
     spec.sharingMode = info.imageSharingMode;
 
     // These WSI-only flags control presentation behavior of the real swapchain
@@ -40,7 +58,8 @@ VirtualSwapchainImageSpec lsfgvk::layer::makeVirtualSwapchainImageSpec(
     spec.unsupportedSwapchainFlags = info.flags & ~supportedFlags;
 
     if (info.flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
-        spec.imageFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        spec.imageFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+            | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
 
     if (info.imageSharingMode == VK_SHARING_MODE_CONCURRENT
             && info.queueFamilyIndexCount
@@ -60,4 +79,11 @@ VirtualSwapchainImageSpec lsfgvk::layer::makeVirtualSwapchainImageSpec(
     }
 
     return spec;
+}
+
+VkImageUsageFlags2KHR lsfgvk::layer::effectiveSwapchainImageUsage(
+        const VkSwapchainCreateInfoKHR& info) noexcept {
+    if (const auto* usage2 = findUsageFlags2(info.pNext))
+        return usage2->usage;
+    return info.imageUsage;
 }

@@ -1,7 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <array>
+
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "generated_output_return_diagnostic.hpp"
+#include "device_retirement_reactor.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "lsfg-vk-common/vulkan/vulkan_native_external_image_backing.hpp"
@@ -12,12 +17,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <unistd.h>
+#include <sys/eventfd.h>
 
 namespace lsfgvk::test {
 
@@ -33,6 +40,10 @@ struct ObservedQueueSubmit {
     uint32_t signalCount{};
     VkSemaphore signal{};
     VkFence fence{};
+    std::array<VkSemaphore, 4> waits{};
+    std::array<uint64_t, 4> waitValues{};
+    std::array<VkSemaphore, 4> signals{};
+    std::array<uint64_t, 4> signalValues{};
 };
 
 struct ObservedImageCreate {
@@ -227,6 +238,187 @@ public:
             shaderResources());
     }
 
+    [[nodiscard]] std::unique_ptr<vk::Vulkan> createQueuePresentVulkan(
+            bool extOnlyRelease = false) {
+        auto funcs = deviceFunctionTable();
+        funcs.QueuePresentKHR = queuePresent;
+        funcs.AcquireNextImageKHR = acquireNextImage;
+        funcs.CreateSwapchainKHR = createSwapchain;
+        funcs.GetSwapchainImagesKHR = getSwapchainImages;
+        funcs.ReleaseSwapchainImagesKHR = extOnlyRelease
+            ? nullptr : releaseSwapchainImagesKhr;
+        funcs.ReleaseSwapchainImagesEXT = releaseSwapchainImagesExt;
+        funcs.DestroySwapchainKHR = destroySwapchain;
+        funcs.GetFenceFdKHR = getFenceFd;
+        return std::make_unique<vk::Vulkan>(instance, device,
+            generationPhysicalDevice, instanceFunctionTable(), funcs, false);
+    }
+
+    [[nodiscard]] vk::RuntimeDevicePair sameDevicePair() const {
+        const auto endpoint = generationEndpoint();
+        return {
+            {endpoint.identity, vk::RuntimeDeviceOwnership::ApplicationManaged},
+            {endpoint.identity, vk::RuntimeDeviceOwnership::BackendManaged},
+            vk::RuntimeDevicePairMode::SamePhysicalDevice,
+            std::nullopt};
+    }
+
+    [[nodiscard]] VkDevice queuePresentDevice() const { return device; }
+    [[nodiscard]] uint32_t observedQueuePresentCalls() const { return queuePresentCalls; }
+    [[nodiscard]] uint32_t observedAcquireCalls() const { return acquireCalls; }
+    [[nodiscard]] uint32_t observedDeviceWaitIdleCalls() const {
+        return deviceIdleCalls;
+    }
+    [[nodiscard]] uint32_t observedReleaseCalls() const { return releaseCalls; }
+    [[nodiscard]] uint32_t observedKhrReleaseCalls() const { return khrReleaseCalls; }
+    [[nodiscard]] uint32_t observedExtReleaseCalls() const { return extReleaseCalls; }
+    [[nodiscard]] uint32_t controlledFenceResetCalls() const {
+        return controlledFenceResets;
+    }
+    [[nodiscard]] uint32_t observedCreateSwapchainCalls() const {
+        return createSwapchainCalls;
+    }
+    [[nodiscard]] const VkSwapchainCreateInfoKHR& observedSwapchainCreateInfo() const {
+        return swapchainCreateInfo;
+    }
+    [[nodiscard]] const std::vector<uint32_t>& observedCreateQueueFamilies() const {
+        return createQueueFamilies;
+    }
+    [[nodiscard]] const std::vector<uint32_t>& observedReleasedIndices() const {
+        return releasedIndices;
+    }
+    [[nodiscard]] uint64_t observedAcquireTimeout() const { return acquireTimeout; }
+    [[nodiscard]] VkSemaphore observedAcquireSemaphore() const {
+        return acquireSemaphore;
+    }
+    [[nodiscard]] VkFence observedAcquireFence() const { return acquireFence; }
+    [[nodiscard]] const VkAcquireNextImageInfoKHR& observedAcquire2() const {
+        return acquire2Info;
+    }
+    [[nodiscard]] VkQueue observedPresentedQueue() const { return presentedQueue; }
+    [[nodiscard]] VkSwapchainKHR observedPresentedSwapchain() const {
+        return presentedSwapchain;
+    }
+    [[nodiscard]] uint32_t observedPresentedImageIndex() const {
+        return presentedImageIndex;
+    }
+    [[nodiscard]] const std::vector<VkSemaphore>& observedPresentedWaits() const {
+        return presentedWaits;
+    }
+    [[nodiscard]] const void* observedPresentedNext() const { return presentedNext; }
+    [[nodiscard]] VkFence observedPresentedFence() const { return presentedFence; }
+    [[nodiscard]] uint32_t observedPresentFenceStructCount() const {
+        return presentFenceStructCount;
+    }
+    [[nodiscard]] uint32_t observedDestroySwapchainCalls() const {
+        return destroySwapchainCalls;
+    }
+    [[nodiscard]] const VkAllocationCallbacks* observedDestroyAllocator() const {
+        return destroyAllocator;
+    }
+    [[nodiscard]] std::thread::id observedDestroyThread() const {
+        return destroyThread;
+    }
+    [[nodiscard]] uint32_t observedDestroyDeviceCalls() const {
+        return destroyDeviceCalls;
+    }
+    [[nodiscard]] size_t observedApplicationSubmitCount() const {
+        return frontSubmits.size();
+    }
+    void setQueuePresentFenceStatus(VkResult result) {
+        backendFenceStatusResult = result;
+    }
+    void setTimelineCounterValue(uint64_t value) noexcept {
+        timelineCounterValue = value;
+    }
+    void setD2RetirementFenceStatus(VkResult result) {
+        bReturnFenceStatusResult = result;
+    }
+    void setQueuePresentResult(VkResult result) { queuePresentResult = result; }
+    void setQueuePresentPerResults(std::vector<VkResult> values) {
+        queuePresentPerResults = std::move(values);
+    }
+    void setQueueSubmitResult(VkResult result) { submitResult = result; }
+    void failAllocationsAfterFrontSubmit(std::atomic_bool* flag,
+            size_t oneBasedSubmitCall) noexcept {
+        postSubmitAllocationFailureFlag = flag;
+        postSubmitAllocationFailureCall = oneBasedSubmitCall;
+    }
+    void restoreAllocationFailureAfterPresent(bool value) noexcept {
+        restorePostPresentAllocationFailure = value;
+    }
+    void clearPostSubmitAllocationFailure() noexcept {
+        if (postSubmitAllocationFailureFlag)
+            postSubmitAllocationFailureFlag->store(false, std::memory_order_relaxed);
+        postSubmitAllocationFailureFlag = nullptr;
+        postSubmitAllocationFailureCall = 0;
+    }
+    void setFenceFdExportResult(VkResult result) noexcept {
+        fenceFdExportResult = result;
+    }
+    void setFenceFdInitiallySignaled(bool value) noexcept {
+        fenceFdInitiallySignaled = value;
+    }
+    void setQueueSubmitFailureOnCall(uint32_t call, VkResult result) noexcept {
+        queueSubmitFailureCall = call;
+        queueSubmitFailureResult = result;
+    }
+    void clearQueueSubmitFailureOnCall() noexcept {
+        queueSubmitFailureCall = 0;
+        queueSubmitFailureResult = VK_SUCCESS;
+    }
+    void setShadowFailurePoint(ShadowHarnessFailurePoint point) noexcept {
+        failurePoint = point;
+    }
+    void setAcquireNextImageResult(VkResult result) {
+        acquireNextImageResult = result;
+    }
+    void setAcquiredImageIndex(uint32_t index) noexcept {
+        acquiredImageIndex = index;
+    }
+    void setReleaseSwapchainImagesResult(VkResult result) {
+        releaseSwapchainImagesResult = result;
+    }
+    void setDeviceWaitIdleResult(VkResult result) {
+        deviceWaitIdleResult = result;
+    }
+    void observeApplicationFence(VkFence fence) { observedApplicationFence = fence; }
+    bool simulatePresentFenceEnqueued(VkFence fence) noexcept {
+        const auto found = controlledFences.find(fence);
+        if (found == controlledFences.end()
+                || found->second != ControlledFenceState::Unsignaled)
+            return false;
+        found->second = ControlledFenceState::PendingSignal;
+        return true;
+    }
+    void enableAdaptiveProducerFenceModel() noexcept {
+        adaptiveProducerFenceModel = true;
+    }
+    [[nodiscard]] uint32_t applicationFenceExportCalls() const { return applicationFenceExportCount; }
+    [[nodiscard]] uint32_t applicationFenceResetCalls() const { return applicationFenceResetCount; }
+    [[nodiscard]] uint32_t applicationFenceWaitCalls() const { return applicationFenceWaitCount; }
+    [[nodiscard]] uint32_t fenceWaitCallsForTesting() const { return fenceWaitCalls; }
+    void setFenceWaitResultForTesting(VkResult result) { fenceWaitResult = result; }
+    [[nodiscard]] uint32_t applicationFenceDestroyCalls() const { return applicationFenceDestroyCount; }
+    [[nodiscard]] uint32_t d2SemaphoreImportCalls() const {
+        return d2SemaphoreImports;
+    }
+    [[nodiscard]] uint32_t d2FenceImportCalls() const { return d2FenceImports; }
+    [[nodiscard]] uint32_t observedD2QueueSubmitCalls() const {
+        return observed.calls;
+    }
+    [[nodiscard]] const ObservedImageCopy& observedImageCopy() const {
+        return imageCopy;
+    }
+    [[nodiscard]] const std::vector<ObservedPipelineBarrier>&
+    observedImageBarriers() const { return barriers; }
+    void setD2SemaphoreImportResult(VkResult result) {
+        d2SemaphoreImportResult = result;
+    }
+    void setD2FenceImportResult(VkResult result) {
+        d2FenceImportResult = result;
+    }
+
     [[nodiscard]] vk::PhysicalDeviceIdentity generationIdentity() const {
         vk::PhysicalDeviceIdentity result;
         result.name = "generation";
@@ -296,6 +488,8 @@ public:
         result.queue = renderQueue;
         result.queueFamilyIndex = renderQueueFamily;
         result.QueueSubmit = queueSubmit;
+        result.submitObserver = renderSubmitObserver;
+        result.submitResultObserver = renderSubmitResultObserver;
         result.CreateFence = createFence;
         result.DestroyFence = destroyFence;
         result.GetFenceStatus = getFenceStatus;
@@ -465,6 +659,8 @@ public:
 
     VkResult submitResult{VK_SUCCESS};
     VkResult exportResult{VK_SUCCESS};
+    VkResult fenceFdExportResult{VK_SUCCESS};
+    bool fenceFdInitiallySignaled{true};
     VkResult memoryExportResult{VK_SUCCESS};
     VkResult fenceWaitResult{VK_TIMEOUT};
     VkResult sourceFenceWaitResult{VK_TIMEOUT};
@@ -472,8 +668,12 @@ public:
     VkResult aFenceWaitResult{VK_TIMEOUT};
     VkResult aFenceStatusResult{VK_NOT_READY};
     VkResult backendFenceStatusResult{VK_SUCCESS};
+    uint64_t timelineCounterValue{};
     VkResult bReturnFenceStatusResult{VK_NOT_READY};
     VkResult aImportResult{VK_SUCCESS};
+    bool uniqueRenderSemaphores{};
+    vk::QueueSubmitObserver renderSubmitObserver{};
+    vk::QueueSubmitResultObserver renderSubmitResultObserver{};
     ShadowHarnessFailurePoint failurePoint{ShadowHarnessFailurePoint::NONE};
     ShadowAHarnessFailurePoint aFailurePoint{ShadowAHarnessFailurePoint::NONE};
 
@@ -518,11 +718,24 @@ public:
     uint32_t aFenceWaitCalls{};
     uint32_t aFenceStatusCalls{};
     uint32_t deviceIdleCalls{};
+    uint32_t destroySwapchainCalls{};
+    uint32_t destroyDeviceCalls{};
+    const VkAllocationCallbacks* destroyAllocator{};
+    std::thread::id destroyThread{};
     uint32_t productionBReturnCalls{};
     uint32_t productionBReturnExportCalls{};
     uint32_t aPhaseCalls{};
     uint32_t aImportCalls{};
     uint32_t aQueueSubmitCalls{};
+    uint32_t d2SemaphoreImports{};
+    uint32_t d2FenceImports{};
+    VkResult d2SemaphoreImportResult{VK_SUCCESS};
+    VkResult d2FenceImportResult{VK_SUCCESS};
+    uint32_t queueSubmitFailureCall{};
+    VkResult queueSubmitFailureResult{VK_SUCCESS};
+    std::atomic_bool* postSubmitAllocationFailureFlag{};
+    size_t postSubmitAllocationFailureCall{};
+    bool restorePostPresentAllocationFailure{};
     uint32_t foreignReadbackPendingCalls{};
     uint32_t returnedForGraphicsCalls{};
     uint32_t terminalCalls{};
@@ -743,6 +956,17 @@ public:
                 terminalQueueFamily, returnedForGraphics});
     }
 
+    [[nodiscard]] backend::ReturnedGeneratedOperation completeProductionAReturn(
+            layer::GeneratedOutputReturnSession& returnSession,
+            layer::RuntimeGeneratedBReturnPending&& pending,
+            backend::Instance& backendInstance,
+            backend::RuntimeGenerateSession& backendSession,
+            vk::RuntimeForeignImageHandoffInfo handoff) {
+        ++aPhaseCalls;
+        return returnSession.completeProductionGeneratedReturnOnA(
+            std::move(pending), backendInstance, backendSession, handoff);
+    }
+
     [[nodiscard]] vk::RuntimeForeignImageHandoffInfo productionHandoff() const noexcept {
         return {terminalQueueFamily, returnedForGraphics};
     }
@@ -754,8 +978,18 @@ public:
         return reinterpret_cast<const vk::RuntimeExchangeChannel*>(uintptr_t{1});
     }
 
+    [[nodiscard]] static vk::VulkanInstanceFuncs controlledInstanceFunctions() {
+        return instanceFunctionTable();
+    }
+    [[nodiscard]] static vk::VulkanDeviceFuncs controlledDeviceFunctions() {
+        return deviceFunctionTable();
+    }
+
     void armProductionReturnForOwner() noexcept { returnResourcesArmed = true; }
 
+    void reserveFrontSubmitCapacity(size_t capacity) {
+        frontSubmits.reserve(capacity);
+    }
     [[nodiscard]] size_t frontSubmitCount() const noexcept {
         return frontSubmits.size();
     }
@@ -764,6 +998,23 @@ public:
     }
     [[nodiscard]] uint32_t frontFenceWaitCount() const noexcept {
         return backendFenceWaitCalls;
+    }
+    [[nodiscard]] VkCommandPool latestCommandPool() const noexcept {
+        return commandPoolObservation.pool;
+    }
+    [[nodiscard]] VkCommandBuffer latestCommandBuffer() const noexcept {
+        return commandAllocation.command;
+    }
+    [[nodiscard]] uint32_t commandPoolCreateCalls() const noexcept {
+        return commandPoolObservation.createCalls
+            + aCommandPoolObservation.createCalls;
+    }
+    [[nodiscard]] uint32_t commandPoolDestroyCalls() const noexcept {
+        return commandPoolObservation.destroyCalls
+            + aCommandPoolObservation.destroyCalls;
+    }
+    [[nodiscard]] uint32_t commandBufferFreeCalls() const noexcept {
+        return commandAllocation.freeCalls + aCommandAllocation.freeCalls;
     }
     [[nodiscard]] uint32_t frontImportedFdCount() const noexcept {
         return backendImportedFdCalls;
@@ -821,6 +1072,52 @@ private:
     std::vector<uint8_t> mappedStorage = std::vector<uint8_t>(1024U * 1024U);
     uint32_t backendFenceWaitCalls{};
     uint32_t backendImportedFdCalls{};
+    uint32_t queuePresentCalls{};
+    uint32_t acquireCalls{};
+    uint32_t createSwapchainCalls{};
+    uint32_t releaseCalls{};
+    uint32_t khrReleaseCalls{};
+    uint32_t extReleaseCalls{};
+    enum class ControlledFenceState : uint8_t {
+        Unsignaled, PendingSignal, Signaled, ExportedCopyReset
+    };
+    std::unordered_map<VkFence, ControlledFenceState> controlledFences;
+    bool adaptiveProducerFenceModel{};
+    uint32_t controlledFenceResets{};
+    std::vector<uint32_t> releasedIndices;
+    VkQueue presentedQueue{};
+    VkSwapchainKHR presentedSwapchain{};
+    uint32_t presentedImageIndex{};
+    std::vector<VkSemaphore> presentedWaits;
+    const void* presentedNext{};
+    VkResult queuePresentResult{VK_SUCCESS};
+    std::vector<VkResult> queuePresentPerResults;
+    VkSwapchainCreateInfoKHR swapchainCreateInfo{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    std::vector<uint32_t> createQueueFamilies;
+    VkSwapchainKHR createdSwapchain{
+        reinterpret_cast<VkSwapchainKHR>(uintptr_t{0x8800})};
+    std::array<VkImage, 3> realSwapchainImages{
+        reinterpret_cast<VkImage>(uintptr_t{0x8810}),
+        reinterpret_cast<VkImage>(uintptr_t{0x8811}),
+        reinterpret_cast<VkImage>(uintptr_t{0x8812})};
+    VkResult acquireNextImageResult{VK_SUCCESS};
+    VkResult releaseSwapchainImagesResult{VK_SUCCESS};
+    VkResult deviceWaitIdleResult{VK_SUCCESS};
+    uint32_t acquiredImageIndex{};
+    uint64_t acquireTimeout{};
+    VkSemaphore acquireSemaphore{};
+    VkFence acquireFence{};
+    VkAcquireNextImageInfoKHR acquire2Info{
+        .sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR};
+    VkFence observedApplicationFence{};
+    VkFence presentedFence{};
+    std::vector<VkFence> presentedFences;
+    uint32_t presentFenceStructCount{};
+    uint32_t applicationFenceExportCount{};
+    uint32_t applicationFenceResetCount{};
+    uint32_t applicationFenceWaitCount{};
+    uint32_t applicationFenceDestroyCount{};
 
     template<class T> [[nodiscard]] T nextHandle() {
         return handle<T>(nextBackendHandle++);
@@ -854,6 +1151,20 @@ private:
             if (out.commandCount) out.command = submit.pCommandBuffers[0];
             out.signalCount = submit.signalSemaphoreCount;
             if (out.signalCount) out.signal = submit.pSignalSemaphores[0];
+            const auto* timeline = static_cast<const VkTimelineSemaphoreSubmitInfo*>(
+                submit.pNext);
+            for (uint32_t i = 0; i < std::min(out.waitCount, 4U); ++i) {
+                out.waits[i] = submit.pWaitSemaphores[i];
+                if (timeline && timeline->sType
+                        == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                    out.waitValues[i] = timeline->pWaitSemaphoreValues[i];
+            }
+            for (uint32_t i = 0; i < std::min(out.signalCount, 4U); ++i) {
+                out.signals[i] = submit.pSignalSemaphores[i];
+                if (timeline && timeline->sType
+                        == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                    out.signalValues[i] = timeline->pSignalSemaphoreValues[i];
+            }
         }
         return out;
     }
@@ -899,6 +1210,7 @@ private:
         result.CmdFillBuffer = cmdFillBuffer;
         result.CmdCopyBuffer = cmdCopyBuffer;
         result.CmdBlitImage = cmdBlitImage;
+        result.CmdCopyImage = cmdCopyImage;
         result.CmdClearColorImage = cmdClearColorImage;
         result.CmdBindPipeline = cmdBindPipeline;
         result.CmdBindDescriptorSets = cmdBindDescriptorSets;
@@ -912,6 +1224,8 @@ private:
         result.CreateFence = createFence;
         result.DestroyFence = destroyFence;
         result.GetFenceStatus = getFenceStatus;
+        result.GetSemaphoreCounterValueKHR = getSemaphoreCounterValue;
+        result.ImportFenceFdKHR = importFenceFd;
         result.ResetFences = resetFences;
         result.WaitForFences = waitForFences;
         result.CreateImage = createImage;
@@ -947,7 +1261,22 @@ private:
         auto& self = *active;
         const auto call = observeSubmit(queue, count, submits, fence);
         if (self.fullBackendMode && !self.returnResourcesArmed) {
+            if (fence != VK_NULL_HANDLE) {
+                const auto it = self.controlledFences.find(fence);
+                if (it != self.controlledFences.end()
+                        && it->second != ControlledFenceState::Unsignaled)
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                if (it != self.controlledFences.end())
+                    it->second = ControlledFenceState::PendingSignal;
+            }
             self.frontSubmits.push_back(call);
+            if (self.queueSubmitFailureCall == self.frontSubmits.size())
+                return self.queueSubmitFailureResult;
+            if (self.postSubmitAllocationFailureFlag
+                    && self.frontSubmits.size()
+                        == self.postSubmitAllocationFailureCall)
+                self.postSubmitAllocationFailureFlag->store(
+                    true, std::memory_order_relaxed);
             return self.submitResult;
         }
         if (queue == self.renderQueue) {
@@ -970,8 +1299,192 @@ private:
             const auto previousCalls = out.calls;
             out = call;
             out.calls = previousCalls + 1;
+            if (self.queueSubmitFailureCall == out.calls)
+                return self.queueSubmitFailureResult;
         }
         return self.submitResult;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL queuePresent(
+            VkQueue queue, const VkPresentInfoKHR* info) {
+        auto& self = *active;
+        if (self.postSubmitAllocationFailureFlag)
+            self.postSubmitAllocationFailureFlag->store(
+                false, std::memory_order_relaxed);
+        ++self.queuePresentCalls;
+        self.presentedQueue = queue;
+        self.presentedNext = info ? info->pNext : nullptr;
+        self.presentedFence = VK_NULL_HANDLE;
+        self.presentedFences.clear();
+        self.presentFenceStructCount = 0;
+        auto* next = info
+            ? reinterpret_cast<const VkBaseInStructure*>(info->pNext) : nullptr;
+        while (next) {
+            if (next->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR) {
+                ++self.presentFenceStructCount;
+                const auto* fences = reinterpret_cast<
+                    const VkSwapchainPresentFenceInfoKHR*>(next);
+                if (fences->swapchainCount && fences->pFences) {
+                    self.presentedFences.assign(fences->pFences,
+                        fences->pFences + fences->swapchainCount);
+                    if (fences->swapchainCount == 1)
+                        self.presentedFence = fences->pFences[0];
+                }
+            }
+            next = next->pNext;
+        }
+        self.presentedWaits.clear();
+        if (info && info->waitSemaphoreCount)
+            self.presentedWaits.assign(info->pWaitSemaphores,
+                info->pWaitSemaphores + info->waitSemaphoreCount);
+        if (info && info->swapchainCount) {
+            self.presentedSwapchain = info->pSwapchains[0];
+            self.presentedImageIndex = info->pImageIndices[0];
+            if (info->pResults
+                    && self.queuePresentResult != VK_ERROR_OUT_OF_HOST_MEMORY
+                    && self.queuePresentResult != VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                for (uint32_t i = 0; i < info->swapchainCount; ++i)
+                    info->pResults[i] = self.queuePresentPerResults.size()
+                            == info->swapchainCount
+                        ? self.queuePresentPerResults[i]
+                        : self.queuePresentResult;
+        }
+        self.queuePresentPerResults.clear();
+        if ((self.queuePresentResult == VK_SUCCESS
+                    || self.queuePresentResult == VK_SUBOPTIMAL_KHR
+                    || self.queuePresentResult == VK_ERROR_OUT_OF_DATE_KHR
+                    || self.queuePresentResult == VK_ERROR_SURFACE_LOST_KHR
+                    || self.queuePresentResult
+                        == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+                    || self.queuePresentResult
+                        == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT)) {
+            for (const auto fence : self.presentedFences) {
+                if (fence == VK_NULL_HANDLE) continue;
+                const auto it = self.controlledFences.find(fence);
+                if (it != self.controlledFences.end()
+                        && it->second == ControlledFenceState::Unsignaled)
+                    it->second = ControlledFenceState::PendingSignal;
+            }
+        }
+        if (self.restorePostPresentAllocationFailure
+                && self.postSubmitAllocationFailureFlag)
+            self.postSubmitAllocationFailureFlag->store(
+                true, std::memory_order_relaxed);
+        return self.queuePresentResult;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL acquireNextImage(VkDevice,
+            VkSwapchainKHR, uint64_t timeout, VkSemaphore semaphore,
+            VkFence fence, uint32_t* index) {
+        ++active->acquireCalls;
+        active->acquireTimeout = timeout;
+        active->acquireSemaphore = semaphore;
+        active->acquireFence = fence;
+        if (active->acquireNextImageResult != VK_SUCCESS
+                && active->acquireNextImageResult != VK_SUBOPTIMAL_KHR)
+            return active->acquireNextImageResult;
+        if (fence != VK_NULL_HANDLE) {
+            const auto it = active->controlledFences.find(fence);
+            if (it != active->controlledFences.end())
+                it->second = ControlledFenceState::PendingSignal;
+        }
+        *index = active->acquiredImageIndex;
+        return active->acquireNextImageResult;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL createSwapchain(VkDevice,
+            const VkSwapchainCreateInfoKHR* info,
+            const VkAllocationCallbacks*, VkSwapchainKHR* swapchain) {
+        ++active->createSwapchainCalls;
+        if (!info || !swapchain) return VK_ERROR_INITIALIZATION_FAILED;
+        active->swapchainCreateInfo = *info;
+        active->createQueueFamilies.clear();
+        if (info->queueFamilyIndexCount)
+            active->createQueueFamilies.assign(info->pQueueFamilyIndices,
+                info->pQueueFamilyIndices + info->queueFamilyIndexCount);
+        *swapchain = active->createdSwapchain;
+        return VK_SUCCESS;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL getSwapchainImages(VkDevice,
+            VkSwapchainKHR, uint32_t* count, VkImage* images) {
+        if (!count) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!images) {
+            *count = static_cast<uint32_t>(active->realSwapchainImages.size());
+            return VK_SUCCESS;
+        }
+        const auto written = std::min(*count,
+            static_cast<uint32_t>(active->realSwapchainImages.size()));
+        std::copy_n(active->realSwapchainImages.begin(), written, images);
+        *count = written;
+        return written == active->realSwapchainImages.size()
+            ? VK_SUCCESS : VK_INCOMPLETE;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL acquireNextImage2(VkDevice,
+            const VkAcquireNextImageInfoKHR* info, uint32_t* index) {
+        if (info) active->acquire2Info = *info;
+        if (active->acquireNextImageResult != VK_SUCCESS
+                && active->acquireNextImageResult != VK_SUBOPTIMAL_KHR)
+            return active->acquireNextImageResult;
+        *index = active->acquiredImageIndex;
+        return active->acquireNextImageResult;
+    }
+
+    static VkResult releaseSwapchainImagesCommon(
+            const VkReleaseSwapchainImagesInfoKHR* info) {
+        ++active->releaseCalls;
+        active->releasedIndices.clear();
+        if (info && info->imageIndexCount)
+            active->releasedIndices.assign(info->pImageIndices,
+                info->pImageIndices + info->imageIndexCount);
+        return active->releaseSwapchainImagesResult;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL releaseSwapchainImagesKhr(VkDevice,
+            const VkReleaseSwapchainImagesInfoKHR* info) {
+        ++active->khrReleaseCalls;
+        return releaseSwapchainImagesCommon(info);
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL releaseSwapchainImagesExt(VkDevice,
+            const VkReleaseSwapchainImagesInfoKHR* info) {
+        ++active->extReleaseCalls;
+        return releaseSwapchainImagesCommon(info);
+    }
+
+    static VKAPI_ATTR void VKAPI_CALL destroySwapchain(VkDevice,
+            VkSwapchainKHR, const VkAllocationCallbacks* allocator) {
+        ++active->destroySwapchainCalls;
+        active->destroyAllocator = allocator;
+        active->destroyThread = std::this_thread::get_id();
+        if (allocator && allocator->pfnFree)
+            allocator->pfnFree(allocator->pUserData, nullptr);
+    }
+
+    static VKAPI_ATTR void VKAPI_CALL destroyDevice(
+            VkDevice, const VkAllocationCallbacks*) {
+        ++active->destroyDeviceCalls;
+    }
+
+    static VKAPI_ATTR VkResult VKAPI_CALL getFenceFd(VkDevice,
+            const VkFenceGetFdInfoKHR* info, int* fd) {
+        if (info && info->fence == active->observedApplicationFence)
+            ++active->applicationFenceExportCount;
+        if (active->fenceFdExportResult != VK_SUCCESS)
+            return active->fenceFdExportResult;
+        if (info) {
+            const auto it = active->controlledFences.find(info->fence);
+            if (it != active->controlledFences.end()) {
+                if (it->second != ControlledFenceState::PendingSignal
+                        && it->second != ControlledFenceState::Signaled)
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                it->second = ControlledFenceState::ExportedCopyReset;
+            }
+        }
+        *fd = ::eventfd(active->fenceFdInitiallySignaled ? 1 : 0,
+            EFD_CLOEXEC | EFD_NONBLOCK);
+        if (*fd < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        layer::markControlledRetirementFd(*fd);
+        return VK_SUCCESS;
     }
 
     static VKAPI_ATTR VkResult VKAPI_CALL enumeratePhysicalDevices(
@@ -1054,6 +1567,10 @@ private:
             return reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage);
         if (std::strcmp(name, "vkGetImageSubresourceLayout") == 0)
             return reinterpret_cast<PFN_vkVoidFunction>(getImageSubresourceLayout);
+        if (std::strcmp(name, "vkDestroyDevice") == 0)
+            return reinterpret_cast<PFN_vkVoidFunction>(destroyDevice);
+        if (std::strcmp(name, "vkAcquireNextImage2KHR") == 0)
+            return reinterpret_cast<PFN_vkVoidFunction>(acquireNextImage2);
         return nullptr;
     }
 
@@ -1234,6 +1751,14 @@ private:
             VkDeviceMemory* memory) {
         auto& self = *active;
         if (self.fullBackendMode && !self.returnResourcesArmed) {
+            for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext);
+                    next; next = next->pNext) {
+                if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) {
+                    const auto* imported = reinterpret_cast<
+                        const VkImportMemoryFdInfoKHR*>(next);
+                    if (imported->fd >= 0) ::close(imported->fd);
+                }
+            }
             *memory = self.nextHandle<VkDeviceMemory>();
             return VK_SUCCESS;
         }
@@ -1350,9 +1875,16 @@ private:
             VkCommandPool* pool) {
         auto& self = *active;
         if (self.fullBackendMode && !self.returnResourcesArmed) {
+            ++self.commandPoolObservation.createCalls;
+            if (self.failurePoint
+                    == ShadowHarnessFailurePoint::COMMAND_POOL_CREATE)
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
             if (info->queueFamilyIndex != generationQueueFamily)
                 return VK_ERROR_INITIALIZATION_FAILED;
             *pool = self.nextHandle<VkCommandPool>();
+            self.commandPoolObservation.queueFamilyIndex = info->queueFamilyIndex;
+            self.commandPoolObservation.flags = info->flags;
+            self.commandPoolObservation.pool = *pool;
             return VK_SUCCESS;
         }
         const bool aSide = info->queueFamilyIndex == renderQueueFamily;
@@ -1377,8 +1909,6 @@ private:
             ++active->aCommandPoolObservation.destroyCalls;
             return;
         }
-        if (active->fullBackendMode && pool != active->returnCommandPool)
-            return;
         ++active->commandPoolObservation.destroyCalls;
     }
 
@@ -1386,8 +1916,17 @@ private:
             const VkCommandBufferAllocateInfo* info, VkCommandBuffer* commands) {
         auto& self = *active;
         if (self.fullBackendMode && !self.returnResourcesArmed) {
-            for (uint32_t i = 0; i < info->commandBufferCount; ++i)
+            ++self.commandAllocation.calls;
+            self.commandAllocation.pool = info->commandPool;
+            self.commandAllocation.level = info->level;
+            self.commandAllocation.count = info->commandBufferCount;
+            if (self.failurePoint
+                    == ShadowHarnessFailurePoint::COMMAND_BUFFER_ALLOCATION)
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            for (uint32_t i = 0; i < info->commandBufferCount; ++i) {
                 commands[i] = self.nextHandle<VkCommandBuffer>();
+                if (i == 0) self.commandAllocation.command = commands[i];
+            }
             return VK_SUCCESS;
         }
         const bool aSide = info->commandPool == self.aCommandPool;
@@ -1416,8 +1955,6 @@ private:
             observed.pool = pool;
             return;
         }
-        if (active->fullBackendMode && pool != active->returnCommandPool)
-            return;
         auto& observed = active->commandAllocation;
         ++observed.freeCalls;
         observed.freedCount += count;
@@ -1428,7 +1965,8 @@ private:
             VkCommandBuffer command, const VkCommandBufferBeginInfo* info) {
         auto& self = *active;
         if (self.fullBackendMode && !self.returnResourcesArmed)
-            return VK_SUCCESS;
+            return self.failurePoint == ShadowHarnessFailurePoint::BEGIN_COMMAND_BUFFER
+                ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
         const bool aSide = command == self.aCommand;
         auto& observed = aSide ? self.aCommandBeginEnd : self.commandBeginEnd;
         ++observed.beginCalls;
@@ -1677,7 +2215,8 @@ private:
             if (active->aFailurePoint
                     == ShadowAHarnessFailurePoint::SEMAPHORE_CREATE)
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
-            *value = active->aImportedWait;
+            *value = active->uniqueRenderSemaphores
+                ? active->nextHandle<VkSemaphore>() : active->aImportedWait;
             return VK_SUCCESS;
         }
         ++active->semaphoreCreateCalls;
@@ -1726,13 +2265,25 @@ private:
             return observed.result;
         }
         ++active->backendImportedFdCalls;
-        if (info->fd >= 0) ::close(info->fd);
-        return VK_SUCCESS;
+        ++active->d2SemaphoreImports;
+        if (active->d2SemaphoreImportResult == VK_SUCCESS && info->fd >= 0)
+            ::close(info->fd);
+        return active->d2SemaphoreImportResult;
+    }
+    static VKAPI_ATTR VkResult VKAPI_CALL importFenceFd(VkDevice,
+            const VkImportFenceFdInfoKHR* info) {
+        ++active->d2FenceImports;
+        if (active->d2FenceImportResult == VK_SUCCESS && info->fd >= 0)
+            ::close(info->fd);
+        return active->d2FenceImportResult;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL createFence(VkDevice fenceDevice,
             const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* value) {
         if (active->fullBackendMode && !active->returnResourcesArmed) {
             *value = active->nextHandle<VkFence>();
+            if (active->adaptiveProducerFenceModel)
+                active->controlledFences.emplace(
+                    *value, ControlledFenceState::Unsignaled);
             return VK_SUCCESS;
         }
         if (fenceDevice == active->renderDevice) {
@@ -1748,6 +2299,8 @@ private:
     }
     static VKAPI_ATTR void VKAPI_CALL destroyFence(
             VkDevice fenceDevice, VkFence fence, const VkAllocationCallbacks*) {
+        if (fence == active->observedApplicationFence)
+            ++active->applicationFenceDestroyCount;
         if (fenceDevice == active->renderDevice || fence == active->aReturnFence) {
             ++active->aFenceDestroyCalls;
             return;
@@ -1757,6 +2310,20 @@ private:
         ++active->fenceDestroyCalls;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL getFenceStatus(VkDevice, VkFence fence) {
+        if (fence == active->observedApplicationFence)
+            return active->backendFenceStatusResult;
+        if (const auto it = active->controlledFences.find(fence);
+                it != active->controlledFences.end()) {
+            if (it->second == ControlledFenceState::Signaled)
+                return VK_SUCCESS;
+            if (it->second == ControlledFenceState::PendingSignal) {
+                const auto result = active->backendFenceStatusResult;
+                if (result == VK_SUCCESS)
+                    it->second = ControlledFenceState::Signaled;
+                return result;
+            }
+            return VK_NOT_READY;
+        }
         if (fence == active->aReturnFence) {
             ++active->aFenceStatusCalls;
             return active->aFenceStatusResult;
@@ -1767,10 +2334,26 @@ private:
             return active->backendFenceStatusResult;
         return VK_NOT_READY;
     }
+    static VKAPI_ATTR VkResult VKAPI_CALL getSemaphoreCounterValue(
+            VkDevice, VkSemaphore, uint64_t* value) {
+        *value = active->timelineCounterValue;
+        return VK_SUCCESS;
+    }
     static VKAPI_ATTR VkResult VKAPI_CALL waitForFences(VkDevice, uint32_t count,
             const VkFence* fences, VkBool32, uint64_t) {
+        if (count && fences && fences[0] == active->observedApplicationFence)
+            ++active->applicationFenceWaitCount;
         if (active->fullBackendMode && !active->returnResourcesArmed) {
             ++active->backendFenceWaitCalls;
+            if (count && fences) {
+                const auto it = active->controlledFences.find(fences[0]);
+                if (it != active->controlledFences.end()) {
+                    if (it->second == ControlledFenceState::PendingSignal)
+                        it->second = ControlledFenceState::Signaled;
+                    else if (it->second != ControlledFenceState::Signaled)
+                        return VK_TIMEOUT;
+                }
+            }
             return VK_SUCCESS;
         }
         const VkFence fence = count && fences ? fences[0] : VK_NULL_HANDLE;
@@ -1787,10 +2370,23 @@ private:
         return active->fenceWaitResult;
     }
     static VKAPI_ATTR VkResult VKAPI_CALL resetFences(
-            VkDevice, uint32_t, const VkFence*) { return VK_SUCCESS; }
+            VkDevice, uint32_t count, const VkFence* fences) {
+        if (fences && fences[0] == active->observedApplicationFence)
+            ++active->applicationFenceResetCount;
+        if (count && fences) {
+            const auto it = active->controlledFences.find(fences[0]);
+            if (it != active->controlledFences.end()) {
+                if (it->second == ControlledFenceState::PendingSignal)
+                    return VK_ERROR_VALIDATION_FAILED_EXT;
+                it->second = ControlledFenceState::Unsignaled;
+                ++active->controlledFenceResets;
+            }
+        }
+        return VK_SUCCESS;
+    }
     static VKAPI_ATTR VkResult VKAPI_CALL deviceWaitIdle(VkDevice) {
         ++active->deviceIdleCalls;
-        return VK_SUCCESS;
+        return active->deviceWaitIdleResult;
     }
 };
 

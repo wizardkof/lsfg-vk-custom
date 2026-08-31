@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "d2_real_wsi_state.hpp"
+
 #include "d3b1_present_path.hpp"
 #include "d3b2_insertion_path.hpp"
 #include "d3b3_production_seams.hpp"
@@ -10,6 +12,7 @@
 #include "fixed_output_pacer.hpp"
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
+#include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -17,10 +20,14 @@
 #include "lsfg-vk-common/vulkan/runtime_device_pair.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
+#include "lsfg-vk-common/vulkan/destination_return_authority.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "runtime_dma_buf_backing.hpp"
 #include "generated_output_return_diagnostic.hpp"
+#include "d3b3_terminal_context.hpp"
 #include "graphics_final_queue.hpp"
+#include "presented_physical_image_lease.hpp"
+#include "swapchain_release_backend.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 
 #include <chrono>
@@ -38,8 +45,41 @@
 #include <vulkan/vulkan_core.h>
 
 namespace lsfgvk::layer {
+    class D2VulkanShadowRuntime;
+    class BorrowedPresentFenceRegistry;
+    class Adaptive1xPreparedLogicalFinal;
+    class Adaptive1xPreparationReservation;
+    class LogicalPresentError final : public ls::vulkan_error {
+    public:
+        explicit LogicalPresentError(VkResult result, const std::string& message) :
+            ls::vulkan_error(result, message) {}
+    };
 
-enum class SwapchainReleaseBackend : uint8_t { None, Khr, Ext };
+    enum class SwapchainPresentResultOrigin : uint8_t {
+        INTERNAL, LOGICAL_DOWNSTREAM
+    };
+
+    struct SwapchainPresentResult final {
+        VkResult result{VK_ERROR_DEVICE_LOST};
+        SwapchainPresentResultOrigin origin{SwapchainPresentResultOrigin::INTERNAL};
+        [[nodiscard]] static constexpr SwapchainPresentResult internal(
+                VkResult result) noexcept {
+            return {result, SwapchainPresentResultOrigin::INTERNAL};
+        }
+        [[nodiscard]] static constexpr SwapchainPresentResult logical(
+                VkResult result) noexcept {
+            return {result, SwapchainPresentResultOrigin::LOGICAL_DOWNSTREAM};
+        }
+    };
+
+    class DeviceRetirementReactor;
+    class VirtualPresentPendingOperation;
+    class D3B2VirtualPresentPendingOperation;
+    class D3B1VirtualPresentPendingOperation;
+    class SwapchainFencePendingOperation;
+    class ReactorFencePendingOperation;
+
+    enum class D2MultiplierReason : uint8_t { None, FoundationNoCarrier };
 
 enum class GeneratedOutputTerminalConsumer : uint8_t {
     DiagnosticOnly,
@@ -93,7 +133,9 @@ selectGeneratedOutputTerminalConsumer(
         VkFormat format;
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
-        VkImageUsageFlags usage{};
+        uint32_t arrayLayers{1};
+        VkImageUsageFlags2KHR usage{};
+        bool timelineSemaphoreAvailable{true};
         VkSharingMode sharingMode{VK_SHARING_MODE_EXCLUSIVE};
         std::vector<uint32_t> queueFamilyIndices;
         std::vector<uint32_t> surfacePresentFamilies;
@@ -105,6 +147,14 @@ selectGeneratedOutputTerminalConsumer(
         VkPresentModeKHR adaptivePresentMode{VK_PRESENT_MODE_FIFO_KHR};
         VkPresentModeKHR fixedPresentMode{VK_PRESENT_MODE_FIFO_KHR};
         bool virtualized{};
+        // Pass 4A native foundation: application visibility is the real WSI
+        // image set and no transformed/virtual topology may be constructed.
+        bool d2Foundation{};
+        std::shared_ptr<D2RealWsiState> d2State;
+        std::shared_ptr<D2VulkanShadowRuntime> d2VulkanRuntime;
+        uint32_t requestedMultiplier{1};
+        uint32_t effectiveMultiplier{1};
+        D2MultiplierReason multiplierReason{D2MultiplierReason::None};
         // True when LSFG injected a compatible FIFO + MAILBOX/IMMEDIATE
         // declaration and can select between them per present without
         // recreating the application-visible virtual topology.
@@ -112,8 +162,14 @@ selectGeneratedOutputTerminalConsumer(
         // Tracks the mode of the Root-owned Swapchain context. The virtual
         // VkImage handles and VirtualSwapchainRuntime remain stable.
         bool fixedContext{};
+        bool presentFenceAvailable{true};
         SwapchainReleaseBackend releaseBackend{SwapchainReleaseBackend::None};
     };
+
+    /// Common FG capability contract used before resource construction and
+    /// again before presentation.
+    [[nodiscard]] bool fgTransformationEligible(
+        const ls::GameConf& profile, const SwapchainInfo& info) noexcept;
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
     /// @param profile active game profile
@@ -123,7 +179,7 @@ selectGeneratedOutputTerminalConsumer(
         VkSwapchainCreateInfoKHR& createInfo);
 
     /// swapchain context for a layer instance
-    class Swapchain {
+    class Swapchain : public std::enable_shared_from_this<Swapchain> {
     public:
         /// create a new swapchain context
         /// @param vk vulkan instance
@@ -143,6 +199,9 @@ selectGeneratedOutputTerminalConsumer(
         }
 
         [[nodiscard]] PrePresentGateResult prePresentGate() noexcept;
+        [[nodiscard]] uint64_t physicalLifecycleIdentity() const noexcept {
+            return physicalSwapchainLifecycleIdentity;
+        }
 
         /// present a frame
         /// @param vk vulkan instance
@@ -151,7 +210,7 @@ selectGeneratedOutputTerminalConsumer(
         /// @param imageIdx swapchain image index to present to
         /// @param semaphores semaphores to wait on before presenting
         /// @throws ls::vulkan_error on vulkan errors
-        VkResult present(const vk::Vulkan& vk,
+        SwapchainPresentResult present(const vk::Vulkan& vk,
             VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
             VkSwapchainKHR swapchain,
             void* next_chain, uint32_t imageIdx,
@@ -161,11 +220,51 @@ selectGeneratedOutputTerminalConsumer(
             bool d3bSingleSwapchainEligible = false,
             const GraphicsFinalQueueInfo* graphicsFinalQueue = nullptr,
             BorrowedGraphicsQueueLease* graphicsLease = nullptr,
-            bool* stopAfterCompletion = nullptr);
+            bool* stopAfterCompletion = nullptr,
+            std::shared_ptr<D3B3DeviceLifetimeQuarantine> deviceQuarantine = {},
+            std::shared_ptr<DeviceRetirementReactor> deviceRetirementReactor = {},
+            std::shared_ptr<PresentedPhysicalImageLeaseRegistry> physicalImageLeases = {},
+            std::shared_ptr<BorrowedPresentFenceRegistry> borrowedPresentFences = {},
+            std::unique_ptr<VirtualPresentPendingOperation>* pendingCompletion = nullptr,
+            PresentedPhysicalImageIdentity* presentedIdentity = nullptr,
+            std::shared_ptr<void> virtualGpuBacking = {});
+
+        /// Prepare one Adaptive virtual 1x physical presentation. The supplied
+        /// wait is a layer-owned, single-preparation authority. This function
+        /// stops before the logical QueuePresentKHR and retains no application
+        /// present pointers or pNext storage.
+        [[nodiscard]] Adaptive1xPreparedLogicalFinal
+        prepareAdaptive1xLogicalFinal(const vk::Vulkan&, VkQueue,
+            std::shared_ptr<std::mutex> queueMutex, VkSwapchainKHR,
+            uint32_t virtualImageIndex, VkSemaphore preparationWaitSemaphore,
+            VkFence applicationPresentFence, std::stop_token,
+            std::shared_ptr<void> runtimeGpuLifetime,
+            std::shared_ptr<DeviceRetirementReactor>,
+            std::shared_ptr<BorrowedPresentFenceRegistry>,
+            std::shared_ptr<std::unique_ptr<VirtualPresentPendingOperation>>
+                completionPublication);
+        [[nodiscard]] Adaptive1xPreparationReservation
+        reserveAdaptive1xPreparation(const vk::Vulkan&, VkQueue,
+            std::shared_ptr<std::mutex> queueMutex, VkSwapchainKHR,
+            uint32_t virtualImageIndex, VkFence applicationPresentFence,
+            std::stop_token, std::shared_ptr<void> runtimeGpuLifetime,
+            std::shared_ptr<DeviceRetirementReactor>,
+            std::shared_ptr<BorrowedPresentFenceRegistry>,
+            std::shared_ptr<std::unique_ptr<VirtualPresentPendingOperation>>
+                completionPublication);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        void primeAdaptiveBuilderForTesting(const vk::Vulkan&, uint32_t,
+            std::shared_ptr<D3B3DeviceLifetimeQuarantine>,
+            std::shared_ptr<PresentedPhysicalImageLeaseRegistry>);
+        [[nodiscard]] SwapchainReleaseBackend
+        setReleaseBackendForTesting(SwapchainReleaseBackend) noexcept;
+#endif
     private:
         std::vector<vk::Image> sourceImages;
         std::vector<vk::Image> destinationImages;
         ls::lazy<vk::TimelineSemaphore> syncSemaphore;
+        std::vector<vk::TimelineSemaphore> destinationReturnSemaphores;
+        std::vector<vk::DestinationReturnLayerState> destinationReturnStates;
 
         ls::lazy<vk::CommandBuffer> renderCommandBuffer;
         ls::lazy<vk::Fence> renderFence;
@@ -186,6 +285,8 @@ selectGeneratedOutputTerminalConsumer(
         ls::lazy<vk::Semaphore> d3b2OriginalAcquireSemaphore;
         ls::lazy<vk::Semaphore> d3b2GeneratedPresentSemaphore;
         ls::lazy<vk::Semaphore> d3b2OriginalPresentSemaphore;
+        uint64_t physicalSwapchainLifecycleIdentity{};
+        std::shared_ptr<PresentedPhysicalImageLeaseRegistry> presentedPhysicalImages;
 
         ls::R<backend::Instance> instance;
         vk::RuntimeDevicePair devicePair;
@@ -212,18 +313,26 @@ selectGeneratedOutputTerminalConsumer(
             runtimeGenerateDiagnosticSession;
         std::unique_ptr<GeneratedOutputReturnSession>
             generatedOutputReturnDiagnosticSession;
-        std::optional<vk::Semaphore> returnedForGraphics;
+        std::shared_ptr<D3B3PerSwapchainTerminalContext> terminalContext;
+        std::unique_ptr<D3B3AReturnHandoffBinding> terminalHandoffBinding;
+        std::optional<D3B3AReturnHandoffLease> returnedForGraphicsLease;
+        std::optional<ReturnedForGraphicsWaitAuthority> returnedForGraphicsWaitAuthority;
         D3B1PresentationState d3b1State{D3B1PresentationState::IDLE};
         D3B2InsertionState d3b2State{D3B2InsertionState::INACTIVE};
         std::unique_ptr<D3B3ProductionState> d3b3ProductionState;
 
-        void ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family);
+        void ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family,
+            std::shared_ptr<D3B3DeviceLifetimeQuarantine>);
 
         void captureRealFrameOnce(const vk::Vulkan& vk, VkImage sourceImage,
             uint32_t imageIndex, const std::vector<VkSemaphore>& bridgeSemaphores);
 
         ls::GameConf profile;
         SwapchainInfo info;
+        friend class D3B2VirtualPresentPendingOperation;
+        friend class D3B1VirtualPresentPendingOperation;
+        friend class SwapchainFencePendingOperation;
+        friend class ReactorFencePendingOperation;
     };
 
 }

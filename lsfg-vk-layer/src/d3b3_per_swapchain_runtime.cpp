@@ -236,28 +236,20 @@ D3B3PerSwapchainRuntimeOwner::D3B3PerSwapchainRuntimeOwner(
         const D3B3PerSwapchainRuntimeAssembly& assembly) {
     if (descriptor.present.swapchain == VK_NULL_HANDLE
             || descriptor.present.swapchainGeneration == 0
-            || !assembly.bindFiniteOperations || !assembly.bindRetirementReady
-            || !assembly.bindAsyncFiniteOperations)
+            || !assembly.bindAsyncFiniteOperations
+            || !assembly.resourceState)
         throw std::invalid_argument("incomplete D3B3 per-swapchain assembly");
 
     auto localCore = std::make_unique<D3B3ProductionCoreOwner>(descriptor.core);
-    auto retirement = assembly.bindRetirementReady(*localCore);
-    if (!retirement)
-        throw std::invalid_argument("D3B3 retirement authority is incomplete");
-    auto operations = assembly.bindFiniteOperations(*localCore, descriptor);
     auto asyncFinite = std::make_unique<D3B3AsyncFiniteComposition>(
         assembly.bindAsyncFiniteOperations(*localCore, descriptor));
-    auto runtime = std::make_unique<D3B3ProductionRuntimeSession>(
-        descriptor.present.swapchainGeneration, std::move(operations));
-    if (!runtime->structurallyReady())
-        throw std::invalid_argument("D3B3 finite runtime assembly is incomplete");
     auto adapter = std::make_unique<D3B3NormalPresentAdapter>(
-        descriptor.present, std::move(runtime));
+        descriptor.present, *asyncFinite);
     if (!adapter->constructOperations())
         throw std::invalid_argument("D3B3 normal adapter prerequisites are incomplete");
 
     core = std::move(localCore);
-    isRetirementReady = std::move(retirement);
+    resourceState = assembly.resourceState;
     this->asyncFinite = std::move(asyncFinite);
     normalAdapter = std::move(adapter);
 }
@@ -278,7 +270,7 @@ bool D3B3PerSwapchainRuntimeOwner::structurallyReady() const noexcept {
 bool D3B3PerSwapchainRuntimeOwner::retirementReady() const noexcept {
     try {
         return asyncFinite && asyncFinite->retirementReady()
-            && isRetirementReady && isRetirementReady();
+            && resourceState && resourceState->retirementReady();
     } catch (...) {
         return false;
     }

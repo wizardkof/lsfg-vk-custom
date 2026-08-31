@@ -11,7 +11,9 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <cstdint>
+#include <array>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -111,27 +113,18 @@ void CommandBuffer::dispatch(const vk::Vulkan& vk,
 void CommandBuffer::blitImage(const vk::Vulkan& vk,
         const std::vector<vk::Barrier>& preBarriers,
         std::pair<VkImage, VkImage> images, VkExtent2D extent,
-        const std::vector<vk::Barrier>& postBarriers) const {
-    blitImage(vk, preBarriers, images, {extent, extent}, postBarriers);
+        const std::vector<vk::Barrier>& postBarriers,
+        uint32_t arrayLayers) const {
+    blitImage(vk, preBarriers, images, {extent, extent}, postBarriers, arrayLayers);
 }
 
-void CommandBuffer::blitImage(const vk::Vulkan& vk,
-        const std::vector<vk::Barrier>& preBarriers,
-        std::pair<VkImage, VkImage> images,
+VkImageBlit vk::makeImageBlitRegion(
         std::pair<VkExtent2D, VkExtent2D> extents,
-        const std::vector<vk::Barrier>& postBarriers) const {
-    vk.df().CmdPipelineBarrier(*this->commandBuffer,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0,
-        0, VK_NULL_HANDLE,
-        0, VK_NULL_HANDLE,
-        static_cast<uint32_t>(preBarriers.size()), preBarriers.data()
-    );
-
-    const VkImageBlit region{
+        uint32_t arrayLayers) noexcept {
+    return VkImageBlit{
         .srcSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .layerCount = 1
+            .layerCount = arrayLayers
         },
         .srcOffsets = {
             { 0, 0, 0 },
@@ -140,7 +133,7 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         },
         .dstSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .layerCount = 1
+            .layerCount = arrayLayers
         },
         .dstOffsets = {
             { 0, 0, 0 },
@@ -148,6 +141,23 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
               static_cast<int32_t>(extents.second.height), 1 }
         }
     };
+}
+
+void CommandBuffer::blitImage(const vk::Vulkan& vk,
+        const std::vector<vk::Barrier>& preBarriers,
+        std::pair<VkImage, VkImage> images,
+        std::pair<VkExtent2D, VkExtent2D> extents,
+        const std::vector<vk::Barrier>& postBarriers,
+        uint32_t arrayLayers) const {
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0, VK_NULL_HANDLE,
+        0, VK_NULL_HANDLE,
+        static_cast<uint32_t>(preBarriers.size()), preBarriers.data()
+    );
+
+    const auto region = vk::makeImageBlitRegion(extents, arrayLayers);
     vk.df().CmdBlitImage(*this->commandBuffer,
         images.first, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         images.second, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -263,7 +273,9 @@ void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
         VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
         std::vector<VkSemaphore> signalSemaphores,
         VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-        VkFence fence, VkPipelineStageFlags waitStage) const {
+        VkFence fence, VkPipelineStageFlags waitStage,
+        const SubmitObserver& observer,
+        const SubmitResultObserver& resultObserver) const {
     if (waitTimelineSemaphore)
         waitSemaphores.push_back(waitTimelineSemaphore);
 
@@ -297,9 +309,102 @@ void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
         .signalSemaphoreCount = static_cast<uint32_t>(signalSemaphores.size()),
         .pSignalSemaphores = signalSemaphores.data()
     };
-    auto res = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
+    const QueueSubmitObserver queueObserver = observer
+        ? QueueSubmitObserver{[&](VkQueue observedQueue, uint32_t count,
+              const VkSubmitInfo* submits, VkFence observedFence) {
+              if (count != 1 || !submits)
+                  throw std::logic_error("CommandBuffer submit observation shape changed");
+              observer(observedQueue, submits[0], observedFence);
+          }}
+        : QueueSubmitObserver{};
+    const QueueSubmitResultObserver queueResultObserver = resultObserver
+        ? QueueSubmitResultObserver{[&](VkQueue observedQueue, uint32_t count,
+              const VkSubmitInfo* submits, VkFence observedFence, VkResult result) {
+              if (count != 1 || !submits)
+                  throw std::logic_error("CommandBuffer result observation shape changed");
+              resultObserver(observedQueue, submits[0], observedFence, result);
+          }}
+        : QueueSubmitResultObserver{};
+    auto res = executeQueueSubmit(vk.df().QueueSubmit, queue, 1, &submitInfo, fence,
+        queueObserver, queueResultObserver);
     if (res != VK_SUCCESS)
         throw ls::vulkan_error(res, "vkQueueSubmit() failed");
+}
+
+void CommandBuffer::submit(const vk::Vulkan& vk, VkQueue queue,
+        const CommandBufferSubmit& submission, VkFence fence,
+        const SubmitObserver& observer,
+        const SubmitResultObserver& resultObserver) const {
+    PreparedCommandBufferSubmit prepared;
+    prepareCommandBufferSubmit(*this->commandBuffer, submission, prepared);
+    if (observer) observer(queue, prepared.submitInfo, fence);
+    const auto result = vk.df().QueueSubmit(queue, 1, &prepared.submitInfo, fence);
+    if (resultObserver) resultObserver(queue, prepared.submitInfo, fence, result);
+    if (result != VK_SUCCESS)
+        throw ls::vulkan_error(result, "vkQueueSubmit() failed");
+}
+
+void vk::prepareCommandBufferSubmit(VkCommandBuffer commandBuffer,
+        const CommandBufferSubmit& submission,
+        PreparedCommandBufferSubmit& prepared) {
+    const size_t waitCount = submission.binaryWaits.size()
+        + submission.timelineWaits.size();
+    const size_t signalCount = submission.binarySignals.size()
+        + submission.timelineSignals.size();
+    if (waitCount > MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES
+            || signalCount > MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES)
+        throw std::logic_error("CommandBuffer submit semaphore capacity exceeded");
+    if (!submission.binaryWaitStages.empty()
+            && submission.binaryWaitStages.size() != submission.binaryWaits.size())
+        throw std::logic_error("binary wait stage count does not match wait count");
+
+    size_t cursor{};
+    for (size_t i = 0; i < submission.binaryWaits.size(); ++i, ++cursor) {
+        prepared.waits[cursor] = submission.binaryWaits[i];
+        prepared.waitStages[cursor] = submission.binaryWaitStages.empty()
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            : submission.binaryWaitStages[i];
+    }
+    for (const auto& wait : submission.timelineWaits) {
+        prepared.waits[cursor] = wait.semaphore;
+        prepared.waitValues[cursor] = wait.value;
+        prepared.waitStages[cursor] = wait.stage;
+        ++cursor;
+    }
+
+    cursor = 0;
+    for (const auto semaphore : submission.binarySignals)
+        prepared.signals[cursor++] = semaphore;
+    for (const auto& signal : submission.timelineSignals) {
+        prepared.signals[cursor] = signal.semaphore;
+        prepared.signalValues[cursor] = signal.value;
+        ++cursor;
+    }
+
+    prepared.timelineInfo = VkTimelineSemaphoreSubmitInfo{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = static_cast<uint32_t>(waitCount),
+        .pWaitSemaphoreValues = prepared.waitValues.data(),
+        .signalSemaphoreValueCount = static_cast<uint32_t>(signalCount),
+        .pSignalSemaphoreValues = prepared.signalValues.data()
+    };
+    prepared.submitInfo = VkSubmitInfo{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &prepared.timelineInfo,
+        .waitSemaphoreCount = static_cast<uint32_t>(waitCount),
+        .pWaitSemaphores = prepared.waits.data(),
+        .pWaitDstStageMask = prepared.waitStages.data(),
+        .commandBufferCount = 1,
+        .pCommandBuffers = &prepared.commandBuffer,
+        .signalSemaphoreCount = static_cast<uint32_t>(signalCount),
+        .pSignalSemaphores = prepared.signals.data()
+    };
+    prepared.commandBuffer = commandBuffer;
+}
+
+void CommandBuffer::submit(const vk::Vulkan& vk,
+        const CommandBufferSubmit& submission, VkFence fence) const {
+    this->submit(vk, vk.queue(), submission, fence);
 }
 
 

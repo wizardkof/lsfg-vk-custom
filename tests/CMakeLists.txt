@@ -5,6 +5,198 @@
 
 find_package(Threads REQUIRED)
 
+add_executable(lsfg-vk-test-d2-real-wsi-state d2_real_wsi_state_test.cpp)
+target_include_directories(lsfg-vk-test-d2-real-wsi-state PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-d2-real-wsi-state PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-d2-real-wsi-state
+    COMMAND lsfg-vk-test-d2-real-wsi-state)
+
+add_executable(lsfg-vk-test-d2-vulkan-shadow-runtime
+    d2_vulkan_shadow_runtime_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/acquire_fence_proxy_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/borrowed_present_fence_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d2_vulkan_shadow_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/device_retirement_reactor.cpp")
+target_include_directories(lsfg-vk-test-d2-vulkan-shadow-runtime PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(lsfg-vk-test-d2-vulkan-shadow-runtime PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option -Wno-unsafe-buffer-usage)
+target_link_libraries(lsfg-vk-test-d2-vulkan-shadow-runtime PRIVATE
+    lsfg-vk-common lsfg-vk-backend Threads::Threads)
+add_test(NAME lsfg-vk-test-d2-vulkan-shadow-runtime
+    COMMAND lsfg-vk-test-d2-vulkan-shadow-runtime)
+
+add_executable(lsfg-vk-test-device-entrypoint-interception
+    device_entrypoint_interception_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/batch_application_present_bridge_authority.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/batch_present_transaction.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/present_batch_projection.cpp")
+target_include_directories(lsfg-vk-test-device-entrypoint-interception PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(lsfg-vk-test-device-entrypoint-interception PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-device-entrypoint-interception PRIVATE
+    lsfg-vk-layer)
+add_test(NAME lsfg-vk-test-device-entrypoint-interception
+    COMMAND lsfg-vk-test-device-entrypoint-interception)
+set_tests_properties(lsfg-vk-test-device-entrypoint-interception PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:lsfg-vk-layer>")
+
+add_executable(lsfg-vk-test-aborted-present-semantics
+    aborted_present_semantics_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/aborted_present_semantics.cpp")
+target_include_directories(lsfg-vk-test-aborted-present-semantics PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-aborted-present-semantics PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-aborted-present-semantics
+    COMMAND lsfg-vk-test-aborted-present-semantics)
+
+add_executable(lsfg-vk-test-borrowed-present-fence
+    borrowed_present_fence_registry_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/borrowed_present_fence_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp")
+target_include_directories(lsfg-vk-test-borrowed-present-fence PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-borrowed-present-fence PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-borrowed-present-fence
+    COMMAND lsfg-vk-test-borrowed-present-fence)
+
+
+add_executable(lsfg-vk-test-present-batch-projection
+    present_batch_projection_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/present_batch_projection.cpp")
+target_include_directories(lsfg-vk-test-present-batch-projection PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-present-batch-projection PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-present-batch-projection
+    COMMAND lsfg-vk-test-present-batch-projection)
+
+add_executable(lsfg-vk-test-batch-present-transaction
+    batch_present_transaction_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/batch_present_transaction.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp")
+target_include_directories(lsfg-vk-test-batch-present-transaction PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-batch-present-transaction PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-batch-present-transaction
+    COMMAND lsfg-vk-test-batch-present-transaction)
+
+add_executable(lsfg-vk-test-batch-application-present-bridge-authority
+    batch_application_present_bridge_authority_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/batch_application_present_bridge_authority.cpp")
+target_include_directories(lsfg-vk-test-batch-application-present-bridge-authority PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-batch-application-present-bridge-authority PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-batch-application-present-bridge-authority
+    COMMAND lsfg-vk-test-batch-application-present-bridge-authority)
+
+add_executable(lsfg-vk-test-adaptive-1x-recovery-authority
+    adaptive_1x_recovery_authority_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_recovery_authority.cpp")
+target_include_directories(lsfg-vk-test-adaptive-1x-recovery-authority PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-adaptive-1x-recovery-authority PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-adaptive-1x-recovery-authority
+    COMMAND lsfg-vk-test-adaptive-1x-recovery-authority)
+
+add_executable(lsfg-vk-test-adaptive-1x-prepared-logical-final
+    adaptive_1x_prepared_logical_final_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_prepared_logical_final.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_recovery_authority.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/borrowed_present_fence_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp")
+target_include_directories(lsfg-vk-test-adaptive-1x-prepared-logical-final PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-adaptive-1x-prepared-logical-final PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-adaptive-1x-prepared-logical-final
+    COMMAND lsfg-vk-test-adaptive-1x-prepared-logical-final)
+
+add_executable(lsfg-vk-test-adaptive-1x-preparation-reservation
+    adaptive_1x_preparation_reservation_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_preparation_reservation.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_prepared_logical_final.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/adaptive_1x_recovery_authority.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/borrowed_present_fence_registry.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp")
+target_include_directories(lsfg-vk-test-adaptive-1x-preparation-reservation PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-adaptive-1x-preparation-reservation PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-adaptive-1x-preparation-reservation PRIVATE
+    lsfg-vk-common)
+add_test(NAME lsfg-vk-test-adaptive-1x-preparation-reservation
+    COMMAND lsfg-vk-test-adaptive-1x-preparation-reservation)
+
+add_executable(lsfg-vk-test-presented-physical-image-lease
+    presented_physical_image_lease_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp")
+target_include_directories(lsfg-vk-test-presented-physical-image-lease PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-presented-physical-image-lease PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+add_test(NAME lsfg-vk-test-presented-physical-image-lease
+    COMMAND lsfg-vk-test-presented-physical-image-lease)
+
+add_executable(lsfg-vk-test-device-retirement-reactor
+    device_retirement_reactor_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/device_retirement_reactor.cpp")
+target_include_directories(lsfg-vk-test-device-retirement-reactor PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-device-retirement-reactor PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_compile_definitions(lsfg-vk-test-device-retirement-reactor PRIVATE
+    LSFGVK_TESTING_SHADOW_SPLIT)
+target_link_libraries(lsfg-vk-test-device-retirement-reactor PRIVATE Threads::Threads)
+add_test(NAME lsfg-vk-test-device-retirement-reactor
+    COMMAND lsfg-vk-test-device-retirement-reactor)
+
+add_executable(lsfg-vk-test-queue-submit-observation
+    queue_submit_observation_test.cpp)
+target_compile_options(lsfg-vk-test-queue-submit-observation PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-queue-submit-observation PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-queue-submit-observation
+    COMMAND lsfg-vk-test-queue-submit-observation)
+
+add_executable(lsfg-vk-test-destination-return-authority
+    destination_return_authority_test.cpp)
+target_compile_options(lsfg-vk-test-destination-return-authority PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-destination-return-authority PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-destination-return-authority
+    COMMAND lsfg-vk-test-destination-return-authority)
+
+add_executable(lsfg-vk-test-prepared-frame-schedule-authority
+    prepared_frame_schedule_authority_test.cpp)
+target_compile_options(lsfg-vk-test-prepared-frame-schedule-authority PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-prepared-frame-schedule-authority PRIVATE lsfg-vk-common)
+add_test(NAME lsfg-vk-test-prepared-frame-schedule-authority
+    COMMAND lsfg-vk-test-prepared-frame-schedule-authority)
+
+add_executable(lsfg-vk-test-prepared-frame-schedule-reservation
+    prepared_frame_schedule_reservation_test.cpp)
+target_compile_definitions(lsfg-vk-test-prepared-frame-schedule-reservation PRIVATE
+    LSFGVK_TESTING_SHADOW_SPLIT)
+target_compile_options(lsfg-vk-test-prepared-frame-schedule-reservation PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-prepared-frame-schedule-reservation PRIVATE
+    lsfg-vk-backend)
+add_test(NAME lsfg-vk-test-prepared-frame-schedule-reservation
+    COMMAND lsfg-vk-test-prepared-frame-schedule-reservation)
+
 add_executable(lsfg-vk-test-d3b3-production-state
     d3b3_production_state_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
@@ -53,6 +245,22 @@ lsfgvk_add_layer_unit_test(
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/virtual_swapchain_state.cpp")
 target_link_libraries(lsfg-vk-test-virtual-swapchain-state
     PRIVATE Threads::Threads)
+
+add_executable(lsfg-vk-test-virtual-present-completion
+    virtual_present_completion_test.cpp
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/presented_physical_image_lease.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/virtual_swapchain_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/virtual_swapchain_state.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+target_include_directories(lsfg-vk-test-virtual-present-completion PRIVATE
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
+target_compile_options(lsfg-vk-test-virtual-present-completion PRIVATE
+    -UNDEBUG -Wno-unknown-warning-option)
+target_link_libraries(lsfg-vk-test-virtual-present-completion PRIVATE
+    lsfg-vk-common lsfg-vk-backend Threads::Threads)
+add_test(NAME lsfg-vk-test-virtual-present-completion
+    COMMAND lsfg-vk-test-virtual-present-completion)
 
 lsfgvk_add_layer_unit_test(
     lsfg-vk-test-virtual-swapchain-image-spec
@@ -140,15 +348,18 @@ target_link_libraries(lsfg-vk-test-d3b3-production-seams PRIVATE
 add_executable(lsfg-vk-test-d3b3-normal-present-adapter
     d3b3_normal_present_adapter_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_per_swapchain_runtime.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
-    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp")
 target_include_directories(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
 target_compile_options(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
     -UNDEBUG -Wno-unknown-warning-option)
 target_link_libraries(lsfg-vk-test-d3b3-normal-present-adapter PRIVATE
-    lsfg-vk-common lsfg-vk-backend)
+    lsfg-vk-common lsfg-vk-backend Threads::Threads)
 add_test(NAME lsfg-vk-test-d3b3-normal-present-adapter
     COMMAND lsfg-vk-test-d3b3-normal-present-adapter)
 
@@ -446,6 +657,7 @@ add_executable(lsfg-vk-test-shadow-b-return-execution-harness
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
+    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_terminal_context.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")
 target_include_directories(lsfg-vk-test-shadow-b-return-execution-harness PRIVATE
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src")
@@ -460,7 +672,6 @@ add_executable(lsfg-vk-test-d3b3-production-core-runner
     d3b3_production_core_runner_test.cpp
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/generated_output_return_diagnostic.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_core_owner.cpp"
-    "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_normal_present_adapter.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_runtime.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b3_production_seams.cpp"
     "${PROJECT_SOURCE_DIR}/lsfg-vk-layer/src/d3b2_insertion_path.cpp")

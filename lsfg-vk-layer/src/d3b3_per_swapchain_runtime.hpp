@@ -97,14 +97,10 @@ struct D3B3PerSwapchainRuntimeDescriptor {
 /// Production composition seam.  The callback binds the already-qualified
 /// finite operations to this owner's real core; it is not an execution API.
 struct D3B3PerSwapchainRuntimeAssembly {
-    std::function<D3B3FiniteProductionOperations(
-        D3B3ProductionCoreOwner&, const D3B3PerSwapchainRuntimeDescriptor&)>
-        bindFiniteOperations;
-    std::function<std::function<bool()>(D3B3ProductionCoreOwner&)>
-        bindRetirementReady;
     std::function<D3B3AsyncFiniteOperations(
         D3B3ProductionCoreOwner&, const D3B3PerSwapchainRuntimeDescriptor&)>
         bindAsyncFiniteOperations;
+    std::shared_ptr<D3B3ProductionResourceState> resourceState;
 };
 
 class D3B3PerSwapchainRuntimeOwner {
@@ -126,10 +122,10 @@ public:
     }
 
 private:
-    // Destruction is reverse declaration order: adapter/session/callbacks die
+    // Destruction is reverse declaration order: adapter/callbacks die
     // before the GPU core to which their finite bindings may refer.
     std::unique_ptr<D3B3ProductionCoreOwner> core;
-    std::function<bool()> isRetirementReady;
+    std::shared_ptr<D3B3ProductionResourceState> resourceState;
     std::unique_ptr<D3B3AsyncFiniteComposition> asyncFinite;
     std::unique_ptr<D3B3NormalPresentAdapter> normalAdapter;
 };

@@ -21,6 +21,7 @@
 #include <vulkan/vulkan_core.h>
 
 namespace lsfgvk::layer {
+    class DeviceRetirementReactor;
 
     /// Layer-owned/safely-shareable queue reserved during VkDevice creation.
     /// P3D uses it for the one-shot A -> B -> A control-channel handshake instead
@@ -104,10 +105,10 @@ namespace lsfgvk::layer {
             if (it == this->swapchains.end())
                 throw ls::error("swapchain context not found");
 
-            return it->second;
+            return *it->second;
         }
         /// present through a swapchain context while protecting it from hot reload
-        VkResult presentSwapchain(const vk::Vulkan& vk,
+        SwapchainPresentResult presentSwapchain(const vk::Vulkan& vk,
             VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
             VkSwapchainKHR swapchain, void* nextChain, uint32_t imageIndex,
             const std::vector<VkSemaphore>& semaphores,
@@ -116,7 +117,14 @@ namespace lsfgvk::layer {
             bool d3bSingleSwapchainEligible = false,
             const GraphicsFinalQueueInfo* graphicsFinalQueue = nullptr,
             BorrowedGraphicsQueueLease* graphicsLease = nullptr,
-            bool* stopAfterCompletion = nullptr);
+            bool* stopAfterCompletion = nullptr,
+            std::shared_ptr<D3B3DeviceLifetimeQuarantine> deviceQuarantine = {},
+            std::shared_ptr<DeviceRetirementReactor> deviceRetirementReactor = {},
+            std::shared_ptr<PresentedPhysicalImageLeaseRegistry> physicalImageLeases = {},
+            std::shared_ptr<BorrowedPresentFenceRegistry> borrowedPresentFences = {},
+            std::unique_ptr<VirtualPresentPendingOperation>* pendingCompletion = nullptr,
+            PresentedPhysicalImageIdentity* presentedIdentity = nullptr,
+            std::shared_ptr<void> virtualGpuBacking = {});
         /// atomically replace a swapchain context after a configuration reload
         /// @param snapshot immutable configuration for this reload
         void recreateSwapchainContext(const ConfigSnapshot& snapshot,
@@ -126,6 +134,15 @@ namespace lsfgvk::layer {
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        /// Install the concrete context used by same-module entrypoint tests.
+        /// This does not exist in tests-OFF builds and does not select an
+        /// alternate presentation implementation.
+        [[nodiscard]] bool installSwapchainContextForTesting(
+            VkSwapchainKHR swapchain, std::shared_ptr<Swapchain> context);
+        void setProfileForTesting(ls::GameConf profile);
+        [[nodiscard]] size_t swapchainContextCountForTesting();
+#endif
     private:
         mutable std::mutex configMutex;
         ls::WatchedConfig config;
@@ -133,7 +150,7 @@ namespace lsfgvk::layer {
 
         ls::lazy<backend::Instance> backend;
         std::mutex swapchainMutex;
-        std::unordered_map<VkSwapchainKHR, Swapchain> swapchains;
+        std::unordered_map<VkSwapchainKHR, std::shared_ptr<Swapchain>> swapchains;
     };
 
 }

@@ -6,10 +6,14 @@
 #include "buffer.hpp"
 #include "descriptor_set.hpp"
 #include "image.hpp"
+#include "queue_submit.hpp"
 #include "shader.hpp"
 #include "vulkan.hpp"
 
 #include <cstdint>
+#include <array>
+#include <functional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -17,7 +21,51 @@
 
 namespace vk {
 
+    using SubmitObserver = std::function<void(
+        VkQueue, const VkSubmitInfo&, VkFence)>;
+    using SubmitResultObserver = std::function<void(
+        VkQueue, const VkSubmitInfo&, VkFence, VkResult)>;
+
     using Barrier = VkImageMemoryBarrier;
+
+    struct TimelineWait {
+        VkSemaphore semaphore{};
+        uint64_t value{};
+        VkPipelineStageFlags stage{VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
+    };
+
+    struct TimelineSignal {
+        VkSemaphore semaphore{};
+        uint64_t value{};
+    };
+
+    struct CommandBufferSubmit {
+        std::span<const VkSemaphore> binaryWaits{};
+        std::span<const VkPipelineStageFlags> binaryWaitStages{};
+        std::span<const TimelineWait> timelineWaits{};
+        std::span<const VkSemaphore> binarySignals{};
+        std::span<const TimelineSignal> timelineSignals{};
+    };
+
+    inline constexpr size_t MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES = 16;
+    struct PreparedCommandBufferSubmit {
+        std::array<VkSemaphore, MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES> waits{};
+        std::array<uint64_t, MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES> waitValues{};
+        std::array<VkPipelineStageFlags, MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES> waitStages{};
+        std::array<VkSemaphore, MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES> signals{};
+        std::array<uint64_t, MAX_COMMAND_BUFFER_SUBMIT_SEMAPHORES> signalValues{};
+        VkCommandBuffer commandBuffer{};
+        VkTimelineSemaphoreSubmitInfo timelineInfo{};
+        VkSubmitInfo submitInfo{};
+    };
+
+    void prepareCommandBufferSubmit(VkCommandBuffer commandBuffer,
+        const CommandBufferSubmit& submission,
+        PreparedCommandBufferSubmit& prepared);
+
+    [[nodiscard]] VkImageBlit makeImageBlitRegion(
+        std::pair<VkExtent2D, VkExtent2D> extents,
+        uint32_t arrayLayers = 1) noexcept;
 
     /// vulkan command buffer
     class CommandBuffer {
@@ -45,12 +93,14 @@ namespace vk {
         void blitImage(const vk::Vulkan& vk,
             const std::vector<vk::Barrier>& preBarriers,
             std::pair<VkImage, VkImage> images, VkExtent2D extent,
-            const std::vector<vk::Barrier>& postBarriers) const;
+            const std::vector<vk::Barrier>& postBarriers,
+            uint32_t arrayLayers = 1) const;
         void blitImage(const vk::Vulkan& vk,
             const std::vector<vk::Barrier>& preBarriers,
             std::pair<VkImage, VkImage> images,
             std::pair<VkExtent2D, VkExtent2D> extents,
-            const std::vector<vk::Barrier>& postBarriers) const;
+            const std::vector<vk::Barrier>& postBarriers,
+            uint32_t arrayLayers = 1) const;
 
         /// insert a bunch of barriers
         /// @param vk the vulkan instance
@@ -124,7 +174,21 @@ namespace vk {
             std::vector<VkSemaphore> signalSemaphores,
             VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
             VkFence fence = VK_NULL_HANDLE,
-            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) const;
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            const SubmitObserver& observer = {},
+            const SubmitResultObserver& resultObserver = {}) const;
+
+        /// Submit with allocation-free span descriptors and any number of
+        /// binary/timeline waits and signals (up to the fixed implementation cap).
+        void submit(const vk::Vulkan& vk, VkQueue queue,
+            const CommandBufferSubmit& submission,
+            VkFence fence = VK_NULL_HANDLE,
+            const SubmitObserver& observer = {},
+            const SubmitResultObserver& resultObserver = {}) const;
+
+        void submit(const vk::Vulkan& vk,
+            const CommandBufferSubmit& submission,
+            VkFence fence = VK_NULL_HANDLE) const;
 
         /// submit the command buffer instantly
         /// @param vk the vulkan instance

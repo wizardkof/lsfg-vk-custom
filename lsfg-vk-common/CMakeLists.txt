@@ -15,6 +15,7 @@ set(COMMON_SOURCES
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
     "src/vulkan/physical_device.cpp"
+    "src/vulkan/queue_submit.cpp"
     "src/vulkan/runtime_device_pair.cpp"
     "src/vulkan/runtime_exchange_channel.cpp"
     "src/vulkan/runtime_exchange_endpoint.cpp"

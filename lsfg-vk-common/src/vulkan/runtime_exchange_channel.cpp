@@ -1161,7 +1161,9 @@ RuntimeForeignImageReadbackPending RuntimeImageEndpoint::submitForeignImageReadb
         handoffSubmit.pWaitDstStageMask = &stage; handoffSubmit.commandBufferCount = 1;
         handoffSubmit.pCommandBuffers = &command; handoffSubmit.signalSemaphoreCount = 1;
         handoffSubmit.pSignalSemaphores = &signal;
-        result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &handoffSubmit, pending.fence);
+        result = executeQueueSubmit(imageA.endpoint.QueueSubmit,
+            imageA.endpoint.queue, 1, &handoffSubmit, pending.fence,
+            imageA.endpoint.submitObserver, imageA.endpoint.submitResultObserver);
         if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkQueueSubmit handoff A");
         pending.imported = std::move(imported);
         pending.submitted = true;
@@ -1171,7 +1173,9 @@ RuntimeForeignImageReadbackPending RuntimeImageEndpoint::submitForeignImageReadb
     submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &wait;
     submit.pWaitDstStageMask = &stage; submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    result = imageA.endpoint.QueueSubmit(imageA.endpoint.queue, 1, &submit, pending.fence);
+    result = executeQueueSubmit(imageA.endpoint.QueueSubmit,
+        imageA.endpoint.queue, 1, &submit, pending.fence,
+        imageA.endpoint.submitObserver, imageA.endpoint.submitResultObserver);
     if (result != VK_SUCCESS) throw ls::vulkan_error(result, "D3A1 vkQueueSubmit A");
     pending.imported = std::move(imported);
     pending.submitted = true;

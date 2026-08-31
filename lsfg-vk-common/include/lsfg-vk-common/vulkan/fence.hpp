@@ -13,10 +13,20 @@ namespace vk {
     /// vulkan fence
     class Fence {
     public:
+        enum class ExternalHandle : uint8_t {
+            None,
+            SyncFd
+        };
+
         /// create a fence
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
-        Fence(const vk::Vulkan& vk);
+        Fence(const vk::Vulkan& vk,
+            ExternalHandle externalHandle = ExternalHandle::None);
+
+        /// Copy-export the current fence payload as a Linux sync_file FD.
+        /// A return value of -1 is the Vulkan immediate-completion sentinel.
+        [[nodiscard]] int exportSyncFd(const vk::Vulkan& vk) const;
 
         /// reset the fence
         /// @param vk the vulkan instance

@@ -12,6 +12,7 @@
 #include <exception>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <utility>
 #include <vector>
 #include <array>
@@ -20,6 +21,302 @@
 #include <vulkan/vulkan_core.h>
 
 using namespace lsfgvk::layer;
+
+namespace {
+class RuntimeRetirementWakeTarget final : public DeviceRetirementWakeTarget {
+public:
+    explicit RuntimeRetirementWakeTarget(VirtualSwapchainState& value) : state(&value) {}
+    void notifyDeviceRetirement() noexcept override {
+        const std::scoped_lock lock(mutex);
+        if (state) state->wake();
+    }
+    void detach() noexcept {
+        const std::scoped_lock lock(mutex);
+        state = nullptr;
+    }
+private:
+    std::mutex mutex;
+    VirtualSwapchainState* state{};
+};
+}
+
+VirtualImageBacking::VirtualImageBacking(const vk::Vulkan& vk,
+        const VirtualSwapchainImageSpec& spec,
+        const vk::ImageCreateOptions& options) :
+    image(vk, spec.extent, spec.format, spec.usage, options),
+    ready(vk), originalReady(vk) {}
+
+PresentExecutionResult PresentExecutionResult::completed(
+        VkResult result, PresentResultOrigin origin) noexcept {
+    return {PresentExecutionStatus::COMPLETED, result,
+        origin, {}};
+}
+
+PresentExecutionResult PresentExecutionResult::pendingCompletion(VkResult result,
+        std::unique_ptr<VirtualPresentPendingOperation> operation,
+        PresentResultOrigin origin) noexcept {
+    return {PresentExecutionStatus::PENDING, result,
+        origin, std::move(operation)};
+}
+
+PresentExecutionResult PresentExecutionResult::failed(
+        VkResult result, PresentResultOrigin origin) noexcept {
+    return {PresentExecutionStatus::FAILED, result,
+        origin, {}};
+}
+
+VkResult lsfgvk::layer::publicPresentResult(VkResult result,
+        PresentResultOrigin origin, PresentTransactionPhase phase) noexcept {
+    // Once the transaction crossed C1, waits may already have been consumed
+    // by a bridge submit. An OOM result can no longer preserve Vulkan's
+    // unchanged-state contract, regardless of downstream origin.
+    if (phase == PresentTransactionPhase::POST_COMMIT
+            && (result == VK_ERROR_OUT_OF_HOST_MEMORY
+                || result == VK_ERROR_OUT_OF_DEVICE_MEMORY))
+        return VK_ERROR_DEVICE_LOST;
+    if (origin == PresentResultOrigin::DOWNSTREAM_LOGICAL_PRESENT)
+        return allowedPublicPresentResult(result) ? result : VK_ERROR_DEVICE_LOST;
+    if (result == VK_SUCCESS)
+        return VK_SUCCESS;
+    if (result == VK_ERROR_DEVICE_LOST)
+        return result;
+    if (phase == PresentTransactionPhase::PRE_COMMIT
+            && (result == VK_ERROR_OUT_OF_HOST_MEMORY
+                || result == VK_ERROR_OUT_OF_DEVICE_MEMORY))
+        return result;
+    return VK_ERROR_DEVICE_LOST;
+}
+
+bool lsfgvk::layer::allowedPublicPresentResult(VkResult result) noexcept {
+    return result != VK_NOT_READY && result != VK_TIMEOUT
+        && result != VK_ERROR_INITIALIZATION_FAILED
+        && result != VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+VkResult lsfgvk::layer::publicPrePresentGateResult(
+        PrePresentGateResult result) noexcept {
+    return result == PrePresentGateResult::READY
+        ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+}
+
+VkResult lsfgvk::layer::publicBridgePresentResult(VkResult result) noexcept {
+    return result == VK_SUCCESS ? VK_SUCCESS
+        : publicPresentResult(result, PresentResultOrigin::INTERNAL,
+            PresentTransactionPhase::PRE_COMMIT);
+}
+
+bool VirtualPresentPendingSet::install(uint32_t imageIndex,
+        uint64_t lifecycleIdentity,
+        std::unique_ptr<VirtualPresentPendingOperation> operation,
+        const std::shared_ptr<DeviceRetirementWakeTarget>& wakeTarget) noexcept {
+    if (!operation || lifecycleIdentity == 0 || contains(imageIndex))
+        return false;
+    try {
+        operation->activateCompletionWake(wakeTarget);
+        entries.push_back(Entry{
+            imageIndex, lifecycleIdentity, std::move(operation)});
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::optional<VirtualPresentPendingSet::ReservedInstall>
+VirtualPresentPendingSet::reserveInstall(
+        uint32_t imageIndex, uint64_t lifecycleIdentity) noexcept {
+    if (!lifecycleIdentity || contains(imageIndex)) return std::nullopt;
+    try {
+        ReservedInstall result;
+        result.node.push_back(Entry{imageIndex, lifecycleIdentity, nullptr});
+        return result;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool VirtualPresentPendingSet::installReserved(ReservedInstall& reserved,
+        std::unique_ptr<VirtualPresentPendingOperation> operation,
+        const std::shared_ptr<DeviceRetirementWakeTarget>& wakeTarget) noexcept {
+    if (!operation || reserved.node.size() != 1) return false;
+    auto& entry = reserved.node.front();
+    if (!entry.lifecycleIdentity || contains(entry.imageIndex)) return false;
+    operation->activateCompletionWake(wakeTarget);
+    entry.operation = std::move(operation);
+    entries.splice(entries.end(), reserved.node);
+    return true;
+}
+
+bool VirtualPresentPendingSet::contains(uint32_t imageIndex) const noexcept {
+    return std::ranges::any_of(entries, [imageIndex](const Entry& entry) {
+        return entry.imageIndex == imageIndex;
+    });
+}
+
+VirtualSwapchainRuntime::BatchPresentReservation::BatchPresentReservation(
+        BatchPresentReservation&& other) noexcept
+    : owner(other.owner), stateReservation(other.stateReservation),
+      pendingReservation(std::move(other.pendingReservation)),
+      backing(std::move(other.backing)), publication(std::move(other.publication)),
+      bridgeCommitted(other.bridgeCommitted), terminal(other.terminal) {
+    other.owner = nullptr;
+    other.terminal = true;
+}
+
+VirtualSwapchainRuntime::BatchPresentReservation&
+VirtualSwapchainRuntime::BatchPresentReservation::operator=(
+        BatchPresentReservation&& other) noexcept {
+    if (this == &other) return *this;
+    if (valid()) static_cast<void>(abortCleanly());
+    owner = other.owner;
+    stateReservation = other.stateReservation;
+    pendingReservation = std::move(other.pendingReservation);
+    backing = std::move(other.backing);
+    publication = std::move(other.publication);
+    bridgeCommitted = other.bridgeCommitted;
+    terminal = other.terminal;
+    other.owner = nullptr;
+    other.terminal = true;
+    return *this;
+}
+
+VirtualSwapchainRuntime::BatchPresentReservation::~BatchPresentReservation() noexcept {
+    if (valid()) static_cast<void>(abortCleanly());
+}
+
+bool VirtualSwapchainRuntime::BatchPresentReservation::valid() const noexcept {
+    return owner && stateReservation.valid && pendingReservation.valid()
+        && backing && publication && !terminal;
+}
+
+bool VirtualSwapchainRuntime::BatchPresentReservation::commitAfterBridge() noexcept {
+    if (!valid() || bridgeCommitted
+            || !owner->state.commitBatchPresent(stateReservation)) return false;
+    bridgeCommitted = true;
+    return true;
+}
+
+bool VirtualSwapchainRuntime::BatchPresentReservation::abortCleanly() noexcept {
+    if (!valid()) return false;
+    if (!owner->state.abortBatchPresent(stateReservation, bridgeCommitted))
+        return false;
+    terminal = true;
+    backing.reset();
+    publication.reset();
+    return true;
+}
+
+bool VirtualSwapchainRuntime::BatchPresentReservation::
+installPublishedCompletion() noexcept {
+    if (!valid() || !bridgeCommitted || !publication || !*publication)
+        return false;
+    const std::scoped_lock lock(owner->pendingPresentsMutex);
+    if (!owner->pendingPresents.installReserved(pendingReservation,
+            std::move(*publication), owner->retirementWakeTarget)) return false;
+    terminal = true;
+    backing.reset();
+    publication.reset();
+    owner->state.wake();
+    return true;
+}
+
+std::optional<VirtualSwapchainRuntime::BatchPresentReservation>
+VirtualSwapchainRuntime::reserveBatchPresent(
+        uint32_t imageIndex, VkResult* failure) noexcept {
+    const auto fail = [&](VkResult result) {
+        if (failure) *failure = result;
+        return std::optional<BatchPresentReservation>{};
+    };
+    const auto pending = asyncResult.load();
+    if (pending != VK_SUCCESS && pending != VK_SUBOPTIMAL_KHR)
+        return fail(pending);
+    if (prePresentGate) {
+        try {
+            if (prePresentGate() != PrePresentGateResult::READY)
+                return fail(VK_ERROR_DEVICE_LOST);
+        } catch (const std::bad_alloc&) {
+            return fail(VK_ERROR_OUT_OF_HOST_MEMORY);
+        } catch (...) {
+            return fail(VK_ERROR_DEVICE_LOST);
+        }
+    }
+    try {
+        const auto serial = presentSerial.fetch_add(1);
+        auto backing = imageBackings.at(imageIndex);
+        auto publication = std::make_shared<
+            std::unique_ptr<VirtualPresentPendingOperation>>();
+        std::optional<VirtualPresentPendingSet::ReservedInstall> reserved;
+        {
+            const std::scoped_lock lock(pendingPresentsMutex);
+            reserved = pendingPresents.reserveInstall(imageIndex, serial);
+        }
+        if (!reserved) return fail(VK_ERROR_DEVICE_LOST);
+        auto stateToken = state.prepareBatchPresent(imageIndex, serial);
+        if (!stateToken) return fail(VK_ERROR_DEVICE_LOST);
+        BatchPresentReservation result;
+        result.owner = this;
+        result.stateReservation = *stateToken;
+        result.backing = std::move(backing);
+        result.publication = std::move(publication);
+        result.pendingReservation = std::move(*reserved);
+        if (failure) *failure = VK_SUCCESS;
+        return result;
+    } catch (const std::bad_alloc&) {
+        return fail(VK_ERROR_OUT_OF_HOST_MEMORY);
+    } catch (...) {
+        return fail(VK_ERROR_DEVICE_LOST);
+    }
+}
+
+void DeferredVirtualRetirementOwner::adopt(
+        VirtualPresentPendingSet& source) noexcept {
+    {
+        const std::scoped_lock lock(mutex);
+        const auto self = weak_from_this().lock();
+        if (!self) std::terminate();
+        for (auto& entry : source.entries)
+            entry.operation->redirectCompletionWake(self);
+        operations.splice(operations.end(), source.entries);
+    }
+    // Closes the completion-before-redirect race without polling any Vulkan
+    // object; tryComplete observes only already-owned reactor tickets.
+    notifyDeviceRetirement();
+}
+
+void DeferredVirtualRetirementOwner::notifyDeviceRetirement() noexcept {
+    const std::scoped_lock lock(mutex);
+    for (auto it = operations.begin(); it != operations.end();) {
+        const auto status = it->operation->tryComplete();
+        if (status == VirtualPresentCompletionStatus::RETIRED)
+            it = operations.erase(it);
+        else
+            ++it;
+    }
+}
+
+size_t DeferredVirtualRetirementOwner::pendingCount() const noexcept {
+    const std::scoped_lock lock(mutex);
+    return operations.size();
+}
+
+VirtualPresentCompletionStatus VirtualPresentPendingSet::tryCompleteOnce(
+        VirtualSwapchainState& state) noexcept {
+    bool retiredAny{};
+    for (auto iterator = entries.begin(); iterator != entries.end();) {
+        const auto status = iterator->operation->tryComplete();
+        if (status == VirtualPresentCompletionStatus::NOT_READY) {
+            ++iterator;
+            continue;
+        }
+        if (status != VirtualPresentCompletionStatus::RETIRED)
+            return status;
+        if (!state.complete(iterator->imageIndex))
+            return VirtualPresentCompletionStatus::FAILED;
+        iterator = entries.erase(iterator);
+        retiredAny = true;
+    }
+    return retiredAny ? VirtualPresentCompletionStatus::RETIRED
+                      : VirtualPresentCompletionStatus::NOT_READY;
+}
 
 VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
         VkQueue offloadQueue,
@@ -36,21 +333,17 @@ VirtualSwapchainRuntime::VirtualSwapchainRuntime(const vk::Vulkan& vk,
         throw ls::error("virtual swapchain requires a dedicated graphics queue");
     if (!spec.supported())
         throw ls::error("virtual swapchain image specification is not supported");
+    this->retirementWakeTarget =
+        std::make_shared<RuntimeRetirementWakeTarget>(this->state);
 
-    this->images.reserve(imageCount);
-    this->readySemaphores.reserve(imageCount);
-    this->originalReadySemaphores.reserve(imageCount);
+    this->imageBackings.reserve(imageCount);
     for (size_t i = 0; i < imageCount; ++i) {
         auto formatList = spec.makeFormatListInfo();
         const void* pNext = spec.hasFormatList ? &formatList : nullptr;
 
-        this->images.emplace_back(vk,
-            spec.extent,
-            spec.format,
-            spec.usage,
-            spec.imageOptions(pNext));
-        this->readySemaphores.emplace_back(vk);
-        this->originalReadySemaphores.emplace_back(vk);
+        const auto options = spec.imageOptions(pNext);
+        this->imageBackings.push_back(
+            std::make_shared<VirtualImageBacking>(vk, spec, options));
     }
 }
 
@@ -63,16 +356,16 @@ VkResult VirtualSwapchainRuntime::getImages(uint32_t* count, VkImage* images) co
         return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!images) {
-        *count = static_cast<uint32_t>(this->images.size());
+        *count = static_cast<uint32_t>(this->imageBackings.size());
         return VK_SUCCESS;
     }
 
     const auto requested = *count;
-    const auto available = static_cast<uint32_t>(this->images.size());
+    const auto available = static_cast<uint32_t>(this->imageBackings.size());
     const auto copied = std::min(requested, available);
 
     for (uint32_t i = 0; i < copied; ++i)
-        images[i] = this->images.at(i).handle();
+        images[i] = this->imageBackings.at(i)->image.handle();
 
     *count = copied;
     return requested < available ? VK_INCOMPLETE : VK_SUCCESS;
@@ -153,24 +446,22 @@ void VirtualSwapchainRuntime::setPrePresentGate(PrePresentGate gate) {
 VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
         uint32_t imageIndex, uint64_t epoch,
         const std::vector<VkSemaphore>& waitSemaphores) const noexcept {
-    if (sourceQueue == VK_NULL_HANDLE || imageIndex >= this->readySemaphores.size())
+    if (sourceQueue == VK_NULL_HANDLE || imageIndex >= this->imageBackings.size())
         return VK_ERROR_OUT_OF_DATE_KHR;
 
-    const auto ready = this->readySemaphores.at(imageIndex).handle();
-    const auto originalReady = this->originalReadySemaphores.at(imageIndex).handle();
-    const bool d3b2 = [] {
-        const char* value = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    const std::vector<VkSemaphore> signals = d3b2
-        ? std::vector<VkSemaphore>{ready, originalReady}
-        : std::vector<VkSemaphore>{ready};
-
-    // vkQueuePresentKHR requires host access to its queue to be externally
-    // synchronized by the caller. The layer is executing inside that call, so
-    // this bridge submit can safely consume the same present waits on the
-    // application's source queue before returning control to the application.
     try {
+        const auto& backing = this->imageBackings.at(imageIndex);
+        const auto ready = backing->ready.handle();
+        const auto originalReady = backing->originalReady.handle();
+        const bool d3b2 = [] {
+            const char* value = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const std::vector<VkSemaphore> signals = d3b2
+            ? std::vector<VkSemaphore>{ready, originalReady}
+            : std::vector<VkSemaphore>{ready};
+
+        // C0: all allocations above occur before QueueSubmit acceptance.
         ApplicationPresentWaitAuthority input(waitSemaphores, epoch,
             reinterpret_cast<uintptr_t>(this));
         return bridgeApplicationPresentWaits(input, sourceQueue, signals,
@@ -179,6 +470,8 @@ VkResult VirtualSwapchainRuntime::bridgePresentWaits(VkQueue sourceQueue,
                 return this->vk.get().df().QueueSubmit(
                     queue, 1, &submit, VK_NULL_HANDLE);
             }).result;
+    } catch (const std::bad_alloc&) {
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
     } catch (...) {
         return VK_ERROR_UNKNOWN;
     }
@@ -192,10 +485,11 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
         uint32_t imageIndex,
         const std::vector<VkSemaphore>& waitSemaphores,
         void* nextChain,
-        bool synchronous) noexcept {
+        bool synchronous,
+        PresentedPhysicalImageIdentity* presentedIdentity) noexcept {
     if (!this->worker.joinable() || !this->presenter || this->stopping.load()) {
         const auto result = this->asyncResult.load();
-        return result == VK_SUCCESS ? VK_ERROR_OUT_OF_DATE_KHR : result;
+        return result == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : result;
     }
 
     const auto pending = this->asyncResult.load();
@@ -205,15 +499,16 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
     // This is deliberately before both lease construction and bridge submission.
     // D3B2/D3B1 leave the gate empty, preserving their existing ordering.
     if (this->prePresentGate) {
-        const auto gate = this->prePresentGate();
-        if (gate != PrePresentGateResult::READY) {
-            switch (gate) {
-            case PrePresentGateResult::TIMEOUT: return VK_TIMEOUT;
-            case PrePresentGateResult::DEVICE_LOST: return VK_ERROR_DEVICE_LOST;
-            case PrePresentGateResult::FAILED: return VK_ERROR_INITIALIZATION_FAILED;
-            case PrePresentGateResult::READY: break;
-            }
+        PrePresentGateResult gate{};
+        try {
+            gate = this->prePresentGate();
+        } catch (const std::bad_alloc&) {
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        } catch (...) {
+            return VK_ERROR_DEVICE_LOST;
         }
+        if (gate != PrePresentGateResult::READY)
+            return publicPrePresentGateResult(gate);
     }
 
     const auto serial = this->presentSerial.fetch_add(1);
@@ -221,7 +516,7 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
     const char* d3b2 = std::getenv("LSFGVK_D3B2_INSERTION_DIAGNOSTIC");
     if (d3bSingleSwapchainEligible && d3b2 && std::strcmp(d3b2, "1") == 0
             && !this->d3b2ReleaseCapable)
-        return VK_ERROR_FEATURE_NOT_PRESENT;
+        return VK_ERROR_DEVICE_LOST;
     // A borrowed application queue is valid only while the intercepted public
     // present remains open. Every borrowed graphics-final operation is thus
     // synchronous, including ordinary virtual-final blits.
@@ -235,20 +530,41 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
         .borrowed = true};
     if (graphicsFinalExecutionMode(graphicsFinalQueue, borrowedSynchronous)
             != GraphicsFinalExecutionMode::BORROWED_SYNCHRONOUS)
-        return VK_ERROR_FEATURE_NOT_PRESENT;
-    auto completion = std::make_shared<Completion>();
-    auto lease = std::make_shared<BorrowedGraphicsQueueLease>(
-        sourceQueue, sourceQueueFamily, sourceQueueIndex, serial);
-    {
+        return VK_ERROR_DEVICE_LOST;
+
+    std::optional<VirtualSwapchainState::PreparedPresent> prepared;
+    std::shared_ptr<Completion> completion;
+    std::shared_ptr<BorrowedGraphicsQueueLease> lease;
+    std::shared_ptr<PresentedPhysicalImageIdentity> installedIdentity;
+    try {
+        prepared = this->state.preparePresent(imageIndex, serial);
+        if (!prepared)
+            return VK_ERROR_DEVICE_LOST;
+        completion = std::make_shared<Completion>();
+        lease = std::make_shared<BorrowedGraphicsQueueLease>(
+            sourceQueue, sourceQueueFamily, sourceQueueIndex, serial);
+        installedIdentity = std::make_shared<PresentedPhysicalImageIdentity>();
+        const auto imageBacking = this->imageBackings.at(imageIndex);
         const std::scoped_lock lock(this->jobsMutex);
-        this->jobs.emplace(serial, Job {
+        const auto [it, inserted] = this->jobs.emplace(serial, Job {
             .nextChain = nextChain,
             .sourcePresentTime = std::chrono::steady_clock::now(),
             .completion = completion,
             .graphicsFinalQueue = graphicsFinalQueue,
             .borrowedLease = lease,
+            .presentedIdentity = installedIdentity,
+            .imageBacking = imageBacking,
             .d3bSingleSwapchainEligible = d3bSingleSwapchainEligible
         });
+        (void)it;
+        if (!inserted)
+            return VK_ERROR_DEVICE_LOST;
+    } catch (const std::bad_alloc&) {
+        if (lease) (void)lease->release();
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    } catch (...) {
+        if (lease) (void)lease->release();
+        return VK_ERROR_DEVICE_LOST;
     }
 
     // Queue the application's wait semaphores before publishing the job. This
@@ -263,20 +579,22 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
         }
         (void)this->state.release(imageIndex);
         (void)lease->release();
-        return bridge;
+        return publicBridgePresentResult(bridge);
     }
 
-    if (!this->state.queuePresent(imageIndex, serial)) {
+    // C1: QueueSubmit accepted the application waits. Everything needed for
+    // worker publication is already owned, and splice cannot allocate.
+    if (!this->state.commitPreparedPresent(*prepared)) {
         {
             const std::scoped_lock lock(this->jobsMutex);
             this->jobs.erase(serial);
         }
-        this->asyncResult.store(VK_ERROR_OUT_OF_DATE_KHR);
+        this->asyncResult.store(VK_ERROR_DEVICE_LOST);
         this->stopping.store(true);
         this->state.stop();
         (void)lease->release();
-        this->finishCompletion(completion, VK_ERROR_OUT_OF_DATE_KHR);
-        return VK_ERROR_OUT_OF_DATE_KHR;
+        this->finishCompletion(completion, VK_ERROR_DEVICE_LOST);
+        return VK_ERROR_DEVICE_LOST;
     }
 
     std::unique_lock lock(completion->mutex);
@@ -285,8 +603,9 @@ VkResult VirtualSwapchainRuntime::queuePresent(VkQueue sourceQueue,
     });
     if (!completion->done) {
         const auto result = this->asyncResult.load();
-        return result == VK_SUCCESS ? VK_ERROR_OUT_OF_DATE_KHR : result;
+        return result == VK_SUCCESS ? VK_ERROR_DEVICE_LOST : result;
     }
+    if (presentedIdentity) *presentedIdentity = *installedIdentity;
     return completion->result;
 }
 
@@ -306,17 +625,46 @@ void VirtualSwapchainRuntime::finishCompletion(
 
 void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
     while (!stopToken.stop_requested()) {
+        // Capture the wake generation before testing pending tickets so a
+        // reactor notification racing with the transition into sleep cannot be
+        // lost.  Completion wakeups are strictly event driven; no timer polls
+        // GPU fences in the qualified worker path.
+        const auto wakeGeneration = this->state.wakeGeneration();
+        const auto pendingStatus = this->tryCompletePendingPresents();
+        if (pendingStatus == VirtualPresentCompletionStatus::DEVICE_LOST
+                || pendingStatus == VirtualPresentCompletionStatus::FAILED) {
+            const auto failure = pendingStatus == VirtualPresentCompletionStatus::DEVICE_LOST
+                ? VK_ERROR_DEVICE_LOST : VK_ERROR_UNKNOWN;
+            this->asyncResult.store(failure);
+            this->stopping.store(true);
+            this->state.stop();
+            this->failPending(failure);
+            break;
+        }
+
+        bool hasPending{};
+        {
+            const std::scoped_lock lock(this->pendingPresentsMutex);
+            hasPending = !this->pendingPresents.empty();
+        }
+        if (hasPending) {
+            this->state.waitForWake(
+                wakeGeneration, VirtualSwapchainState::Duration::max());
+            continue;
+        }
         const auto present = this->state.waitPresent(
             VirtualSwapchainState::Duration::max());
-        if (!present.has_value())
-            break;
+        if (!present.has_value()) {
+            if (this->stopping.load() || stopToken.stop_requested()) break;
+            continue;
+        }
 
         Job job{};
         {
             const std::scoped_lock lock(this->jobsMutex);
             const auto it = this->jobs.find(present->serial);
             if (it == this->jobs.end()) {
-                this->asyncResult.store(VK_ERROR_UNKNOWN);
+                this->asyncResult.store(VK_ERROR_DEVICE_LOST);
                 this->stopping.store(true);
                 this->state.stop();
                 break;
@@ -325,40 +673,54 @@ void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
             this->jobs.erase(it);
         }
 
-        VkResult result{VK_ERROR_UNKNOWN};
+        PresentExecutionResult execution = PresentExecutionResult::failed(VK_ERROR_UNKNOWN);
         bool stopAfterCompletion{};
         try {
             if (!job.borrowedLease
                     || !job.borrowedLease->validFor(
                         job.graphicsFinalQueue.queue, job.graphicsFinalQueue.family))
                 throw ls::error("borrowed graphics queue lease is not active");
-            result = this->presenter(
+            execution = this->presenter(
                 present->imageIndex,
-                this->readySemaphores.at(present->imageIndex).handle(),
-                this->originalReadySemaphores.at(present->imageIndex).handle(),
+                job.imageBacking->ready.handle(),
+                job.imageBacking->originalReady.handle(),
                 job.nextChain,
                 stopToken,
                 job.sourcePresentTime,
                 job.d3bSingleSwapchainEligible,
                 job.graphicsFinalQueue,
                 *job.borrowedLease,
-                stopAfterCompletion);
+                stopAfterCompletion,
+                job.presentedIdentity.get(), job.imageBacking);
         } catch (...) {
-            result = VK_ERROR_UNKNOWN;
+            execution = PresentExecutionResult::failed(VK_ERROR_UNKNOWN);
         }
 
-        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
-            (void)this->state.complete(present->imageIndex);
-            if (result == VK_SUBOPTIMAL_KHR)
+        auto result = publicPresentResult(execution.result, execution.origin,
+            PresentTransactionPhase::POST_COMMIT);
+        const bool apiAccepted = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
+        if (execution.status == PresentExecutionStatus::COMPLETED && apiAccepted) {
+            if (!this->state.complete(present->imageIndex))
+                result = VK_ERROR_DEVICE_LOST;
+            else if (result == VK_SUBOPTIMAL_KHR)
                 this->asyncResult.store(result);
+        } else if (execution.status == PresentExecutionStatus::PENDING
+                && apiAccepted && execution.pending
+                && [&] {
+                    const std::scoped_lock lock(this->pendingPresentsMutex);
+                    return this->pendingPresents.install(present->imageIndex,
+                        present->serial, std::move(execution.pending),
+                        this->retirementWakeTarget);
+                }()) {
         } else {
+            if (apiAccepted) result = VK_ERROR_DEVICE_LOST;
             this->asyncResult.store(result);
             this->stopping.store(true);
             this->state.stop();
         }
 
         if (!job.borrowedLease || !job.borrowedLease->release())
-            result = VK_ERROR_UNKNOWN;
+            result = VK_ERROR_DEVICE_LOST;
         this->finishCompletion(job.completion, result);
         if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
                 && stopAfterCompletion) {
@@ -370,6 +732,12 @@ void VirtualSwapchainRuntime::workerLoop(std::stop_token stopToken) noexcept {
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
             break;
     }
+}
+
+VirtualPresentCompletionStatus
+VirtualSwapchainRuntime::tryCompletePendingPresents() noexcept {
+    const std::scoped_lock lock(this->pendingPresentsMutex);
+    return pendingPresents.tryCompleteOnce(state);
 }
 
 void VirtualSwapchainRuntime::failPending(VkResult result) noexcept {
@@ -398,17 +766,39 @@ void VirtualSwapchainRuntime::stop() noexcept {
             this->worker.join();
     }
 
+    if (const auto target = std::dynamic_pointer_cast<RuntimeRetirementWakeTarget>(
+            this->retirementWakeTarget))
+        target->detach();
+
     auto result = this->asyncResult.load();
     if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
         result = VK_ERROR_OUT_OF_DATE_KHR;
     this->failPending(result);
 }
 
+bool VirtualSwapchainRuntime::stopAndDetach(
+        const std::shared_ptr<DeferredVirtualRetirementOwner>& owner) noexcept {
+    this->stop();
+    const std::scoped_lock lock(this->pendingPresentsMutex);
+    if (this->pendingPresents.empty()) return true;
+    if (!owner) return false;
+    owner->adopt(this->pendingPresents);
+    return true;
+}
+
+bool VirtualSwapchainRuntime::installPendingForTesting(
+    uint32_t imageIndex, uint64_t lifecycleIdentity,
+        std::unique_ptr<VirtualPresentPendingOperation> operation) noexcept {
+    const std::scoped_lock lock(this->pendingPresentsMutex);
+    return this->pendingPresents.install(
+        imageIndex, lifecycleIdentity, std::move(operation));
+}
+
 std::vector<VkImage> VirtualSwapchainRuntime::imageHandles() const {
     std::vector<VkImage> handles;
-    handles.reserve(this->images.size());
-    for (const auto& image : this->images)
-        handles.push_back(image.handle());
+    handles.reserve(this->imageBackings.size());
+    for (const auto& backing : this->imageBackings)
+        handles.push_back(backing->image.handle());
     return handles;
 }
 

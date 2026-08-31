@@ -6,6 +6,7 @@
 #include "lsfg-vk-common/vulkan/physical_device.hpp"
 #include "lsfg-vk-common/vulkan/runtime_exchange_channel.hpp"
 #include "lsfg-vk-common/vulkan/runtime_image_observation.hpp"
+#include "lsfg-vk-common/vulkan/exchange_image_sync.hpp"
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -29,6 +30,11 @@ namespace lsfgvk::backend {
     class [[gnu::visibility("default")]] RuntimePrepassSessionImpl;
     class [[gnu::visibility("default")]] RuntimeGenerateSessionImpl;
     class RuntimeGenerateDiagnosticPendingState;
+    class PreparedFrameScheduleReservation;
+    struct PreparedFrameScheduleReservationState;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    struct PreparedFrameScheduleReservationTestAccess;
+#endif
     class RuntimeGenerationOperationRetirement;
     class RuntimeIngestPending;
     struct RuntimeGeneratedFrameTokenTestAccess;
@@ -38,6 +44,43 @@ namespace lsfgvk::backend {
     using Context = ContextImpl;
     using RuntimePrepassSession = RuntimePrepassSessionImpl;
     using RuntimeGenerateSession = RuntimeGenerateSessionImpl;
+
+    class [[gnu::visibility("default")]] PreparedFrameScheduleReservation {
+    public:
+        PreparedFrameScheduleReservation() noexcept;
+        PreparedFrameScheduleReservation(const PreparedFrameScheduleReservation&) = delete;
+        PreparedFrameScheduleReservation& operator=(const PreparedFrameScheduleReservation&) = delete;
+        PreparedFrameScheduleReservation(PreparedFrameScheduleReservation&&) noexcept;
+        PreparedFrameScheduleReservation& operator=(PreparedFrameScheduleReservation&&) noexcept;
+        ~PreparedFrameScheduleReservation();
+
+        [[nodiscard]] bool valid() const noexcept;
+        [[nodiscard]] vk::ExchangeTimelineFrame timeline() const noexcept;
+        [[nodiscard]] uint64_t frameIndex() const noexcept;
+        [[nodiscard]] size_t generatedFrames() const noexcept;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        [[nodiscard]] uintptr_t slotIdentityForTesting() const noexcept;
+        [[nodiscard]] VkBuffer constantBufferForTesting(size_t index) const noexcept;
+        [[nodiscard]] VkCommandBuffer commandBufferForTesting(size_t index) const noexcept;
+#endif
+        void execute();
+    private:
+        explicit PreparedFrameScheduleReservation(
+            std::unique_ptr<PreparedFrameScheduleReservationState>) noexcept;
+        std::unique_ptr<PreparedFrameScheduleReservationState> state;
+        friend class Instance;
+        friend class ContextImpl;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        friend struct PreparedFrameScheduleReservationTestAccess;
+#endif
+    };
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    struct PreparedFrameScheduleReservationTestAccess {
+        static PreparedFrameScheduleReservation make(
+            void* owner, void (*execute)(void*), void (*abort)(void*));
+    };
+#endif
 
     struct RuntimeShadowSplitResourceSnapshot {
         VkCommandBuffer ingestCommand{};
@@ -439,7 +482,14 @@ namespace lsfgvk::backend {
             std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
             std::vector<vk::ExternalImage> destImages,
             int syncFd,
+            std::vector<int> destinationReturnFds,
             float flow, bool perf
+        );
+
+        Context& openContext(
+            std::pair<vk::ExternalImage, vk::ExternalImage> sourceImages,
+            std::vector<vk::ExternalImage> destImages,
+            int syncFd, float flow, bool perf
         );
 
         ///
@@ -465,6 +515,11 @@ namespace lsfgvk::backend {
             const std::vector<float>& timestamps
         );
 
+        [[nodiscard]] std::optional<PreparedFrameScheduleReservation>
+        reserveFrameSchedule(Context& context,
+            const std::vector<float>& timestamps,
+            std::optional<vk::ExchangeTimelineFrame> expectedTimeline = std::nullopt);
+
         ///
         /// Close a frame generation context
         ///
@@ -482,6 +537,9 @@ namespace lsfgvk::backend {
         std::unique_ptr<InstanceImpl> m_impl;
 
         std::vector<std::unique_ptr<Context>> m_contexts;
+        // Closed contexts with potentially in-flight cross-device ownership
+        // remain alive until the backend device lifetime ends.
+        std::vector<std::unique_ptr<Context>> m_retiredContexts;
         std::vector<std::unique_ptr<RuntimePrepassSession>> m_runtimePrepassSessions;
         std::vector<std::unique_ptr<RuntimeGenerateSession>>
             m_runtimeGenerateDiagnosticSessions;

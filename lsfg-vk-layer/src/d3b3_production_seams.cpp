@@ -259,18 +259,24 @@ void D3B3PairOperation::submitTerminal() {
                 throw std::logic_error("D3B3 Pair1 terminal did not retire its graphics waiter");
         }
     } catch (...) {
-        fail();
+        if (terminalPending && terminalPending->submitAccepted)
+            current = D3B3PairState::TERMINAL_ACCEPTED_PRESENT_FAILED;
+        else
+            fail();
         throw;
     }
 }
 
 D3B2RetirementResult D3B3PairOperation::tryRetireTerminal() {
     if (current == D3B3PairState::GRAPHICS_RETIRED
+            || current == D3B3PairState::TERMINAL_RETIRED_PRESENT_FAILED
             || current == D3B3PairState::PRESENTS_RETIRED
             || current == D3B3PairState::PAIR_RETIRED)
         return D3B2RetirementResult::RETIRED;
     if (current != D3B3PairState::PRESENTS_SUBMITTED
-            || !terminalPath || !terminalPending)
+            && current != D3B3PairState::TERMINAL_ACCEPTED_PRESENT_FAILED)
+        return D3B2RetirementResult::FAILED;
+    if (!terminalPath || !terminalPending)
         return D3B2RetirementResult::FAILED;
     const auto result = tryRetireD3B2Insertion(*terminalPath, *terminalPending);
     if (result == D3B2RetirementResult::FAILED
@@ -422,13 +428,17 @@ void D3B3PairOperation::bindCallbacks() {
         current = D3B3PairState::PRESENTS_SUBMITTED;
     };
     path.onGraphicsFenceRetired = [this] {
-        if (!generatedPresentSubmitted || !originalPresentSubmitted
-                || current != D3B3PairState::PRESENTS_SUBMITTED)
+        const bool presentFailure =
+            current == D3B3PairState::TERMINAL_ACCEPTED_PRESENT_FAILED;
+        if ((!presentFailure && (!generatedPresentSubmitted || !originalPresentSubmitted
+                    || current != D3B3PairState::PRESENTS_SUBMITTED)))
             throw std::logic_error("D3B3 graphics retirement occurred out of order");
         returnedForGraphics.waitRetired(identity().generationId);
         originalReady.waitRetired();
         original.terminalRetired();
-        current = D3B3PairState::GRAPHICS_RETIRED;
+        current = presentFailure
+            ? D3B3PairState::TERMINAL_RETIRED_PRESENT_FAILED
+            : D3B3PairState::GRAPHICS_RETIRED;
     };
 }
 

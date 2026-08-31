@@ -1,6 +1,21 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "swapchain.hpp"
+#include "aborted_present_semantics.hpp"
+#include "adaptive_1x_prepared_logical_final.hpp"
+#include "adaptive_1x_preparation_reservation.hpp"
+#include "adaptive_1x_recovery_authority.hpp"
+#include "borrowed_present_fence_registry.hpp"
+#include "present_batch_projection.hpp"
+#include "device_retirement_reactor.hpp"
+#include "sync_file_completion.hpp"
+#include "owned_present_sync_fd.hpp"
+#include "lsfg-vk-common/helpers/owned_fd.hpp"
+#include "terminal_pending_gpu_operation.hpp"
+#include "virtual_swapchain_runtime.hpp"
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+#include "entrypoint_test_seam.hpp"
+#endif
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -13,8 +28,11 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
+#include <condition_variable>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -24,15 +42,725 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stop_token>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unistd.h>
+#include <poll.h>
 
 #include <vulkan/vulkan_core.h>
 
 using namespace lsfgvk;
 using namespace lsfgvk::layer;
+
+namespace lsfgvk::layer {
+namespace {
+std::atomic<uint64_t> nextProductionSwapchainLifecycleIdentity{1};
+std::atomic<uint64_t> nextRetirementOperationIdentity{1};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+std::atomic<void (*)()> adaptiveReservationBeforeExecute{};
+std::atomic<void (*)()> adaptiveReservationAfterExecute{};
+std::atomic<test::AdaptiveBuilderFailurePoint> adaptiveBuilderFailurePoint{};
+std::atomic<test::AdaptiveExecuteFailurePoint> adaptiveExecuteFailurePoint{};
+std::atomic_uint32_t adaptiveCommandPoolCreates{};
+std::atomic_uint32_t adaptiveCommandPoolDestroys{};
+std::mutex adaptiveCommandPoolLifecycleMutex;
+std::condition_variable adaptiveCommandPoolLifecycleCv;
+
+bool consumeAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint point) noexcept {
+    auto expected = point;
+    return adaptiveBuilderFailurePoint.compare_exchange_strong(expected,
+        test::AdaptiveBuilderFailurePoint::None, std::memory_order_acq_rel);
+}
+
+void failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint point) {
+    if (consumeAdaptiveBuilderAt(point)) throw std::bad_alloc();
+}
+
+bool failAdaptiveExecuteAt(test::AdaptiveExecuteFailurePoint point) noexcept {
+    auto expected = point;
+    return adaptiveExecuteFailurePoint.compare_exchange_strong(expected,
+        test::AdaptiveExecuteFailurePoint::None, std::memory_order_acq_rel);
+}
+#endif
+
+struct PresentedWsiSemaphoreBacking {
+    enum class CompletionAuthority : uint8_t {
+        UnexportedFence,
+        ExportedSyncFd,
+        ReactorOwnedSyncFd,
+        Completed,
+        Terminal
+    };
+
+    explicit PresentedWsiSemaphoreBacking(const vk::Vulkan& vk)
+        : ready(vk), internalPresentFence(
+            vk, vk::Fence::ExternalHandle::SyncFd) {}
+    void acceptExportedFd(int fd) noexcept {
+        const std::scoped_lock lock(completionMutex);
+        teardownFd.accept(fd);
+        completionAuthority = fd == -1
+            ? CompletionAuthority::Completed
+            : CompletionAuthority::ExportedSyncFd;
+    }
+
+    void markReactorOwned() noexcept {
+        const std::scoped_lock lock(completionMutex);
+        if (completionAuthority == CompletionAuthority::ExportedSyncFd)
+            completionAuthority = CompletionAuthority::ReactorOwnedSyncFd;
+    }
+
+    void markCompleted() noexcept {
+        const std::scoped_lock lock(completionMutex);
+        completionAuthority = CompletionAuthority::Completed;
+    }
+
+    [[nodiscard]] VkResult waitForCompletion(
+            VkDevice device, PFN_vkWaitForFences waitForFences) noexcept {
+        int fd{-1};
+        CompletionAuthority authority{};
+        {
+            const std::scoped_lock lock(completionMutex);
+            authority = completionAuthority;
+            fd = teardownFd.snapshot();
+        }
+        if (authority == CompletionAuthority::Completed) return VK_SUCCESS;
+        if (authority == CompletionAuthority::ExportedSyncFd
+                || authority == CompletionAuthority::ReactorOwnedSyncFd) {
+            if (fd < 0) return VK_ERROR_UNKNOWN;
+            pollfd descriptor{.fd = fd, .events = POLLIN};
+            int result{};
+            do { result = ::poll(&descriptor, 1, -1); }
+            while (result < 0 && errno == EINTR);
+            if (result <= 0 || (descriptor.revents & POLLNVAL))
+                return VK_ERROR_UNKNOWN;
+            switch (querySyncFileCompletion(fd)) {
+            case SyncFileCompletionState::Completed:
+                markCompleted();
+                return VK_SUCCESS;
+            case SyncFileCompletionState::Pending:
+                return VK_NOT_READY;
+            case SyncFileCompletionState::GpuError:
+                return VK_ERROR_DEVICE_LOST;
+            case SyncFileCompletionState::FailedPermanent:
+                return VK_ERROR_UNKNOWN;
+            }
+            return VK_ERROR_UNKNOWN;
+        }
+        if (authority != CompletionAuthority::UnexportedFence)
+            return VK_ERROR_DEVICE_LOST;
+        if (!waitForFences) return VK_ERROR_EXTENSION_NOT_PRESENT;
+        const auto fence = internalPresentFence.handle();
+        return waitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
+
+    [[nodiscard]] VkResult waitForCompletion(const vk::Vulkan& vk) noexcept {
+        return waitForCompletion(vk.dev(), vk.df().WaitForFences);
+    }
+
+    vk::Semaphore ready;
+    vk::Fence internalPresentFence;
+    std::mutex completionMutex;
+    OwnedPresentSyncFd teardownFd;
+    CompletionAuthority completionAuthority{CompletionAuthority::UnexportedFence};
+};
+
+struct AdaptiveAcquireSyncBacking final {
+    explicit AdaptiveAcquireSyncBacking(const vk::Vulkan& vk)
+        : semaphore(vk), fence(vk) {}
+    vk::Semaphore semaphore;
+    vk::Fence fence;
+};
+
+struct AdaptiveProducerSyncBacking final {
+    explicit AdaptiveProducerSyncBacking(const vk::Vulkan& vk)
+        : fence(vk, vk::Fence::ExternalHandle::SyncFd) {}
+    vk::Fence fence;
+};
+
+struct AdaptiveProducerCommandBacking final {
+    AdaptiveProducerCommandBacking(const vk::Vulkan& vk, uint32_t queueFamily) {
+        const VkCommandPoolCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            .queueFamilyIndex = queueFamily};
+        VkCommandPool handle{};
+        const auto result = vk.df().CreateCommandPool(
+            vk.dev(), &info, nullptr, &handle);
+        if (result != VK_SUCCESS)
+            throw ls::vulkan_error(result,
+                "Adaptive producer command-pool creation failed");
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        adaptiveCommandPoolCreates.fetch_add(1, std::memory_order_relaxed);
+#endif
+        pool = ls::owned_ptr<VkCommandPool>(new VkCommandPool(handle),
+            [device = vk.dev(), destroy = vk.df().DestroyCommandPool](
+                    VkCommandPool& value) {
+                destroy(device, value, nullptr);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+                adaptiveCommandPoolDestroys.fetch_add(1,
+                    std::memory_order_relaxed);
+                adaptiveCommandPoolLifecycleCv.notify_all();
+#endif
+            });
+        commandBuffer.emplace(vk, pool.get());
+    }
+
+    [[nodiscard]] VkCommandPool commandPool() const noexcept {
+        return pool.get();
+    }
+
+    // Reverse member destruction frees the command buffer before its pool.
+    ls::owned_ptr<VkCommandPool> pool;
+    ls::lazy<vk::CommandBuffer> commandBuffer;
+};
+
+struct OwnedInternalPresentFenceProjection {
+    VkFence fence{VK_NULL_HANDLE};
+    VkSwapchainPresentFenceInfoKHR injected{
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR};
+    std::optional<PresentPNextProjection> copied;
+    const void* head{};
+
+    [[nodiscard]] bool prepare(const void* applicationChain,
+            VkFence internalFence) noexcept {
+        fence = internalFence;
+        auto* current = reinterpret_cast<const VkBaseInStructure*>(applicationChain);
+        bool hasFenceNode{};
+        while (current) {
+            if (current->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR) {
+                hasFenceNode = true;
+                break;
+            }
+            current = current->pNext;
+        }
+        if (!hasFenceNode) {
+            injected.pNext = applicationChain;
+            injected.swapchainCount = 1;
+            injected.pFences = &fence;
+            head = &injected;
+            return true;
+        }
+
+        copied.emplace(PresentPNextProjection::build(applicationChain, 1, 0));
+        if (!copied->supported()) return false;
+        auto* owned = reinterpret_cast<VkBaseOutStructure*>(copied->head());
+        while (owned) {
+            if (owned->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR) {
+                auto* info = reinterpret_cast<VkSwapchainPresentFenceInfoKHR*>(owned);
+                info->swapchainCount = 1;
+                info->pFences = &fence;
+                head = copied->head();
+                return true;
+            }
+            owned = owned->pNext;
+        }
+        return false;
+    }
+};
+
+struct CompositeGpuRetirementBacking final {
+    std::shared_ptr<void> operation;
+    std::shared_ptr<void> dependency;
+};
+
+std::shared_ptr<void> combineGpuRetirementBacking(
+        std::shared_ptr<void> operation, std::shared_ptr<void> dependency) {
+    if (!dependency) return operation;
+    return std::make_shared<CompositeGpuRetirementBacking>(
+        CompositeGpuRetirementBacking{std::move(operation), std::move(dependency)});
+}
+
+[[nodiscard]] bool armInternalPresentFence(
+        VkDevice device, PFN_vkGetFenceFdKHR getFenceFd,
+        const std::shared_ptr<PresentedWsiSemaphoreBacking>& backing,
+        const std::shared_ptr<PresentedPhysicalImageLeaseRegistry>& leases,
+        const PresentedPhysicalImageIdentity& identity,
+        const std::shared_ptr<DeviceRetirementReactor>& reactor) noexcept {
+    if (!backing || !leases || !identity.valid() || !reactor) return false;
+    int reactorFd{-1};
+    try {
+        if (!getFenceFd) return false;
+        const VkFenceGetFdInfoKHR exportInfo{
+            .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+            .fence = backing->internalPresentFence.handle(),
+            .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+        int exportedFd{-1};
+        if (getFenceFd(device, &exportInfo, &exportedFd) != VK_SUCCESS)
+            return false;
+        backing->acceptExportedFd(exportedFd);
+        if (exportedFd >= 0) {
+            reactorFd = ::dup(exportedFd);
+            if (reactorFd < 0) return false;
+        }
+        auto ticket = std::make_shared<DeviceRetirementTicket>();
+        DeviceRetirementJob job{
+            .deviceIdentity = identity.deviceLifetimeIdentity,
+            .swapchainLifecycleIdentity = identity.swapchainLifecycleIdentity,
+            .operationIdentity = identity.presentOperationIdentity,
+            .completionFd = reactorFd,
+            .retainedBacking = backing,
+            .ticket = std::move(ticket),
+            .retireBacking = [leases, identity, backing](
+                    DeviceRetirementTicketState state) {
+                if (state == DeviceRetirementTicketState::Completed) {
+                    backing->markCompleted();
+                    static_cast<void>(leases->retireAfterPresentFence(identity));
+                }
+            }};
+        const bool accepted = reactorFd == -1
+            ? reactor->completeImmediately(std::move(job))
+            : reactor->registerJob(std::move(job));
+        if (accepted) {
+            backing->markReactorOwned();
+            return true;
+        }
+    } catch (...) {
+    }
+    if (reactorFd >= 0) static_cast<void>(::close(reactorFd));
+    // The committed lease remains the terminal owner. Teardown must observe
+    // the layer-owned fence directly before destroying it.
+    return false;
+}
+
+[[nodiscard]] bool armInternalPresentFence(
+        const vk::Vulkan& vk,
+        const std::shared_ptr<PresentedWsiSemaphoreBacking>& backing,
+        const std::shared_ptr<PresentedPhysicalImageLeaseRegistry>& leases,
+        const PresentedPhysicalImageIdentity& identity,
+        const std::shared_ptr<DeviceRetirementReactor>& reactor) noexcept {
+    return armInternalPresentFence(vk.dev(), vk.df().GetFenceFdKHR,
+        backing, leases, identity, reactor);
+}
+}
+
+class D3B2VirtualPresentPendingOperation final :
+        public VirtualPresentPendingOperation {
+public:
+    D3B2VirtualPresentPendingOperation(std::shared_ptr<Swapchain> value,
+            D3B2InsertionPath&& insertion, D3B2PendingInsertion&& pendingValue,
+            std::shared_ptr<DeviceRetirementReactor> retirement,
+            std::shared_ptr<void> backingValue,
+            std::vector<int> exportedFds = {}) :
+        owner(std::move(value)), path(std::move(insertion)),
+        pending(std::move(pendingValue)), reactor(std::move(retirement)),
+        backing(std::move(backingValue)), fds(std::move(exportedFds)) {
+        path.state = &owner->d3b2State;
+        tickets.reserve(fds.size());
+        for (size_t i = 0; i < fds.size(); ++i)
+            tickets.push_back(std::make_shared<DeviceRetirementTicket>());
+    }
+
+    ~D3B2VirtualPresentPendingOperation() override {
+        for (auto& fd : fds) if (fd >= 0) { static_cast<void>(::close(fd)); fd = -1; }
+    }
+
+    void activateCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        activate(wake);
+    }
+    void redirectCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        for (const auto& ticket : tickets) ticket->setWakeTarget(wake);
+    }
+    uint64_t swapchainLifecycleIdentity() const noexcept override {
+        return owner ? owner->physicalLifecycleIdentity() : 0;
+    }
+
+    VirtualPresentCompletionStatus tryComplete() noexcept override {
+        if (activationFailed.load()) return VirtualPresentCompletionStatus::FAILED;
+        if (!activated.load() || tickets.empty())
+            return VirtualPresentCompletionStatus::NOT_READY;
+
+        // The terminal QueueSubmit fence is a different completion domain from
+        // WSI presentation.  A5G requires returnedForGraphics to retire as soon
+        // as the terminal submit is complete, even while presentation fences
+        // remain pending and keep their own resources alive.
+        const auto gateStatus = completionGate.observe(tickets);
+        if (gateStatus == TerminalWsiCompletionGateStatus::Pending)
+            return VirtualPresentCompletionStatus::NOT_READY;
+        if (gateStatus == TerminalWsiCompletionGateStatus::DeviceLost) {
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        }
+        if (gateStatus == TerminalWsiCompletionGateStatus::Failed)
+            return VirtualPresentCompletionStatus::FAILED;
+
+        if (gateStatus == TerminalWsiCompletionGateStatus::TerminalReady) {
+            path.tryRetireGraphicsFence = [] { return VK_SUCCESS; };
+            const auto result = tryRetireD3B2Insertion(path, pending);
+            switch (result) {
+            case D3B2RetirementResult::RETIRED:
+                completionGate.markTerminalRetired();
+                break;
+            case D3B2RetirementResult::NOT_READY:
+                return VirtualPresentCompletionStatus::NOT_READY;
+            case D3B2RetirementResult::DEVICE_LOST:
+                if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+                return VirtualPresentCompletionStatus::DEVICE_LOST;
+            case D3B2RetirementResult::FAILED:
+                return VirtualPresentCompletionStatus::FAILED;
+            }
+        }
+
+        // Remaining tickets protect WSI-present resources only.  They may
+        // outlive logical terminal retirement but still gate virtual-image
+        // reuse until the current presentation path is fully safe.
+        const auto wsiStatus = completionGate.observe(tickets);
+        if (wsiStatus == TerminalWsiCompletionGateStatus::Pending)
+            return VirtualPresentCompletionStatus::NOT_READY;
+        if (wsiStatus == TerminalWsiCompletionGateStatus::DeviceLost) {
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        }
+        if (wsiStatus != TerminalWsiCompletionGateStatus::WsiReady)
+            return VirtualPresentCompletionStatus::FAILED;
+        owner->captureOnlyPhase = 6;
+        return VirtualPresentCompletionStatus::RETIRED;
+    }
+
+private:
+    void activate(const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept {
+        if (activated.exchange(true) || !reactor || !backing || fds.empty()) {
+            activationFailed.store(true);
+            return;
+        }
+        for (size_t index = 0; index < fds.size(); ++index) {
+            tickets[index]->setWakeTarget(wake);
+            DeviceRetirementJob job{
+                .deviceIdentity = owner->terminalContext
+                    ? owner->terminalContext->deviceIdentity() : 0,
+                .swapchainLifecycleIdentity = owner->terminalContext
+                    ? owner->terminalContext->lifecycleGeneration() : 0,
+                .operationIdentity = pending.submitAccepted
+                    ? nextRetirementOperationIdentity.fetch_add(
+                        1, std::memory_order_relaxed) : 0,
+                .completionFd = fds[index],
+                .retainedBacking = backing,
+                .ticket = tickets[index],
+                .wakeTarget = wake
+            };
+            const bool accepted = fds[index] == -1
+                ? reactor->completeImmediately(std::move(job))
+                : reactor->registerJob(std::move(job));
+            if (!accepted) {
+                if (fds[index] >= 0) {
+                    static_cast<void>(::close(fds[index]));
+                    fds[index] = -1;
+                }
+                if (!reactor->retainEventSourceLost(backing))
+                    std::cerr << "lsfg-vk: failed to retain D3B2 event-source-lost backing\n";
+                activationFailed.store(true);
+                return;
+            }
+            fds[index] = -1;
+        }
+    }
+
+    [[nodiscard]] VirtualPresentCompletionStatus eventStatus() const noexcept {
+        if (activationFailed.load()) return VirtualPresentCompletionStatus::FAILED;
+        if (!activated.load()) return VirtualPresentCompletionStatus::NOT_READY;
+        for (const auto& ticket : tickets) {
+            switch (ticket->state()) {
+            case DeviceRetirementTicketState::Pending:
+                return VirtualPresentCompletionStatus::NOT_READY;
+            case DeviceRetirementTicketState::DeviceLost:
+                return VirtualPresentCompletionStatus::DEVICE_LOST;
+            case DeviceRetirementTicketState::GpuError:
+            case DeviceRetirementTicketState::FailedPermanent:
+                return VirtualPresentCompletionStatus::FAILED;
+            case DeviceRetirementTicketState::Completed:
+                break;
+            }
+        }
+        return VirtualPresentCompletionStatus::RETIRED;
+    }
+
+    std::shared_ptr<Swapchain> owner;
+    D3B2InsertionPath path;
+    D3B2PendingInsertion pending;
+    std::shared_ptr<DeviceRetirementReactor> reactor;
+    std::shared_ptr<void> backing;
+    std::vector<int> fds;
+    std::vector<std::shared_ptr<DeviceRetirementTicket>> tickets;
+    std::atomic_bool activated{false};
+    std::atomic_bool activationFailed{false};
+    TerminalWsiCompletionGate completionGate;
+};
+
+class D3B1VirtualPresentPendingOperation final :
+        public VirtualPresentPendingOperation {
+public:
+    D3B1VirtualPresentPendingOperation(std::shared_ptr<Swapchain> value,
+            D3B1PresentPath&& presentPath, D3B1PendingPresent&& pendingValue,
+            std::shared_ptr<DeviceRetirementReactor> retirement,
+            std::shared_ptr<void> backingValue,
+            std::vector<int> exportedFds = {}) :
+        owner(std::move(value)), path(std::move(presentPath)),
+        pending(std::move(pendingValue)), reactor(std::move(retirement)),
+        backing(std::move(backingValue)), fds(std::move(exportedFds)) {
+        path.state = &owner->d3b1State;
+        tickets.reserve(fds.size());
+        for (size_t i = 0; i < fds.size(); ++i)
+            tickets.push_back(std::make_shared<DeviceRetirementTicket>());
+    }
+
+    ~D3B1VirtualPresentPendingOperation() override {
+        for (auto& fd : fds) if (fd >= 0) { static_cast<void>(::close(fd)); fd = -1; }
+    }
+
+    void activateCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        if (activated.exchange(true) || !reactor || !backing || fds.empty()) {
+            activationFailed.store(true);
+            return;
+        }
+        for (size_t index = 0; index < fds.size(); ++index) {
+            tickets[index]->setWakeTarget(wake);
+            DeviceRetirementJob job{
+                .deviceIdentity = owner->terminalContext
+                    ? owner->terminalContext->deviceIdentity() : 0,
+                .swapchainLifecycleIdentity = owner->terminalContext
+                    ? owner->terminalContext->lifecycleGeneration() : 0,
+                .operationIdentity = pending.submitAccepted
+                    ? nextRetirementOperationIdentity.fetch_add(
+                        1, std::memory_order_relaxed) : 0,
+                .completionFd = fds[index], .retainedBacking = backing,
+                .ticket = tickets[index], .wakeTarget = wake};
+            const bool accepted = fds[index] == -1
+                ? reactor->completeImmediately(std::move(job))
+                : reactor->registerJob(std::move(job));
+            if (!accepted) {
+                if (fds[index] >= 0) {
+                    static_cast<void>(::close(fds[index]));
+                    fds[index] = -1;
+                }
+                if (!reactor->retainEventSourceLost(backing))
+                    std::cerr << "lsfg-vk: failed to retain D3B1 event-source-lost backing\n";
+                activationFailed.store(true);
+                return;
+            }
+            fds[index] = -1;
+        }
+    }
+    void redirectCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        for (const auto& ticket : tickets) ticket->setWakeTarget(wake);
+    }
+    uint64_t swapchainLifecycleIdentity() const noexcept override {
+        return owner ? owner->physicalLifecycleIdentity() : 0;
+    }
+
+    VirtualPresentCompletionStatus tryComplete() noexcept override {
+        if (activationFailed.load()) return VirtualPresentCompletionStatus::FAILED;
+        if (!activated.load() || tickets.empty())
+            return VirtualPresentCompletionStatus::NOT_READY;
+
+        const auto gateStatus = completionGate.observe(tickets);
+        if (gateStatus == TerminalWsiCompletionGateStatus::Pending)
+            return VirtualPresentCompletionStatus::NOT_READY;
+        if (gateStatus == TerminalWsiCompletionGateStatus::DeviceLost) {
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        }
+        if (gateStatus == TerminalWsiCompletionGateStatus::Failed)
+            return VirtualPresentCompletionStatus::FAILED;
+
+        if (gateStatus == TerminalWsiCompletionGateStatus::TerminalReady) {
+            path.tryRetireRenderFence = [] { return VK_SUCCESS; };
+            const auto result = tryRetireD3B1Present(path, pending);
+            switch (result) {
+            case D3B1RetirementResult::RETIRED:
+                completionGate.markTerminalRetired();
+                break;
+            case D3B1RetirementResult::NOT_READY:
+                return VirtualPresentCompletionStatus::NOT_READY;
+            case D3B1RetirementResult::DEVICE_LOST:
+                if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+                return VirtualPresentCompletionStatus::DEVICE_LOST;
+            case D3B1RetirementResult::FAILED:
+                return VirtualPresentCompletionStatus::FAILED;
+            }
+        }
+
+        const auto wsiStatus = completionGate.observe(tickets);
+        if (wsiStatus == TerminalWsiCompletionGateStatus::Pending)
+            return VirtualPresentCompletionStatus::NOT_READY;
+        if (wsiStatus == TerminalWsiCompletionGateStatus::DeviceLost) {
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        }
+        if (wsiStatus != TerminalWsiCompletionGateStatus::WsiReady)
+            return VirtualPresentCompletionStatus::FAILED;
+        owner->captureOnlyPhase = 6;
+        return VirtualPresentCompletionStatus::RETIRED;
+    }
+
+private:
+    std::shared_ptr<Swapchain> owner;
+    D3B1PresentPath path;
+    D3B1PendingPresent pending;
+    std::shared_ptr<DeviceRetirementReactor> reactor;
+    std::shared_ptr<void> backing;
+    std::vector<int> fds;
+    std::vector<std::shared_ptr<DeviceRetirementTicket>> tickets;
+    std::atomic_bool activated{false};
+    std::atomic_bool activationFailed{false};
+    TerminalWsiCompletionGate completionGate;
+};
+
+class SwapchainFencePendingOperation final :
+        public VirtualPresentPendingOperation {
+public:
+    SwapchainFencePendingOperation(std::shared_ptr<Swapchain> value,
+            const vk::Vulkan& vulkan, VkFence valueFence,
+            bool advanceFrameValue,
+            std::vector<PresentedPhysicalImageAcquireToken> consumed = {}) :
+        owner(std::move(value)), vk(&vulkan), fence(valueFence),
+        advanceFrame(advanceFrameValue), consumedAcquires(std::move(consumed)) {}
+
+    VirtualPresentCompletionStatus tryComplete() noexcept override {
+        const auto result = vk->df().GetFenceStatus(vk->dev(), fence);
+        if (result == VK_NOT_READY || result == VK_TIMEOUT)
+            return VirtualPresentCompletionStatus::NOT_READY;
+        if (result == VK_ERROR_DEVICE_LOST) {
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        }
+        if (result != VK_SUCCESS)
+            return VirtualPresentCompletionStatus::FAILED;
+        for (const auto& token : consumedAcquires) {
+            if (!owner->presentedPhysicalImages
+                    || !owner->presentedPhysicalImages->retireAfterSafeCompletion(token))
+                return VirtualPresentCompletionStatus::FAILED;
+        }
+        consumedAcquires.clear();
+        if (advanceFrame) ++owner->fidx;
+        return VirtualPresentCompletionStatus::RETIRED;
+    }
+    uint64_t swapchainLifecycleIdentity() const noexcept override {
+        return owner ? owner->physicalLifecycleIdentity() : 0;
+    }
+
+private:
+    std::shared_ptr<Swapchain> owner;
+    const vk::Vulkan* vk{};
+    VkFence fence{};
+    bool advanceFrame{};
+    std::vector<PresentedPhysicalImageAcquireToken> consumedAcquires;
+};
+
+class ReactorFencePendingOperation final : public VirtualPresentPendingOperation {
+public:
+    ReactorFencePendingOperation(std::shared_ptr<Swapchain> value,
+            std::shared_ptr<DeviceRetirementReactor> retirement,
+            int completionFd,
+            std::vector<PresentedPhysicalImageAcquireToken> consumed = {},
+            bool advanceFrameValue = false,
+            std::shared_ptr<void> retained = {},
+            std::shared_ptr<DeviceRetirementReactor::ReservedJob> reservedJobValue = {},
+            std::shared_ptr<DeviceRetirementTicket> ticketValue = {}) : owner(std::move(value)),
+        reactor(std::move(retirement)), fd(completionFd),
+        consumedAcquires(std::move(consumed)), advanceFrame(advanceFrameValue),
+        ticket(ticketValue ? std::move(ticketValue)
+                           : std::make_shared<DeviceRetirementTicket>()),
+        reservedJob(std::move(reservedJobValue)),
+        retainedBacking(std::move(retained)) {
+        if (!retainedBacking) retainedBacking = owner;
+    }
+
+    [[nodiscard]] bool bindCompletion(int completionFd,
+            std::vector<PresentedPhysicalImageAcquireToken> consumed) noexcept {
+        if (fd != -2) return false;
+        fd = completionFd;
+        consumedAcquires = std::move(consumed);
+        return true;
+    }
+
+    ~ReactorFencePendingOperation() override {
+        if (fd >= 0) static_cast<void>(::close(fd));
+    }
+
+    void activateCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        if (activated.exchange(true) || !owner || !reactor || !ticket || fd == -2) {
+            activationFailed.store(true);
+            return;
+        }
+        DeviceRetirementJob job{
+            .deviceIdentity = owner->terminalContext
+                ? owner->terminalContext->deviceIdentity() : 0,
+            .swapchainLifecycleIdentity = owner->physicalSwapchainLifecycleIdentity,
+            .operationIdentity = nextRetirementOperationIdentity.fetch_add(
+                1, std::memory_order_relaxed),
+            .completionFd = fd,
+            .retainedBacking = retainedBacking,
+            .ticket = ticket,
+            .wakeTarget = wake};
+        ticket->setWakeTarget(wake);
+        const bool accepted = fd == -1
+            ? reactor->completeImmediately(std::move(job))
+            : (reservedJob && reservedJob->valid()
+                ? reactor->registerReservedJob(*reservedJob, fd, retainedBacking)
+                : reactor->registerJob(std::move(job)));
+        if (!accepted) {
+            if (fd >= 0) { static_cast<void>(::close(fd)); fd = -1; }
+            if (!reactor->retainEventSourceLost(retainedBacking))
+                std::cerr << "lsfg-vk: failed to retain virtual-final event-source-lost backing\n";
+            activationFailed.store(true);
+            return;
+        }
+        fd = -1;
+    }
+    void redirectCompletionWake(
+            const std::shared_ptr<DeviceRetirementWakeTarget>& wake) noexcept override {
+        ticket->setWakeTarget(wake);
+    }
+    uint64_t swapchainLifecycleIdentity() const noexcept override {
+        return owner ? owner->physicalLifecycleIdentity() : 0;
+    }
+
+    VirtualPresentCompletionStatus tryComplete() noexcept override {
+        if (activationFailed.load()) return VirtualPresentCompletionStatus::FAILED;
+        if (!activated.load()) return VirtualPresentCompletionStatus::NOT_READY;
+        switch (ticket->state()) {
+        case DeviceRetirementTicketState::Pending:
+            return VirtualPresentCompletionStatus::NOT_READY;
+        case DeviceRetirementTicketState::DeviceLost:
+            if (owner->terminalContext) owner->terminalContext->quarantineDeviceLost();
+            return VirtualPresentCompletionStatus::DEVICE_LOST;
+        case DeviceRetirementTicketState::GpuError:
+        case DeviceRetirementTicketState::FailedPermanent:
+            return VirtualPresentCompletionStatus::FAILED;
+        case DeviceRetirementTicketState::Completed:
+            break;
+        }
+        for (const auto& token : consumedAcquires) {
+            if (!owner->presentedPhysicalImages
+                    || !owner->presentedPhysicalImages->retireAfterSafeCompletion(token))
+                return VirtualPresentCompletionStatus::FAILED;
+        }
+        consumedAcquires.clear();
+        if (advanceFrame) ++owner->fidx;
+        return VirtualPresentCompletionStatus::RETIRED;
+    }
+
+private:
+    std::shared_ptr<Swapchain> owner;
+    std::shared_ptr<DeviceRetirementReactor> reactor;
+    int fd{-1};
+    std::vector<PresentedPhysicalImageAcquireToken> consumedAcquires;
+    bool advanceFrame{};
+    std::shared_ptr<DeviceRetirementTicket> ticket;
+    std::shared_ptr<DeviceRetirementReactor::ReservedJob> reservedJob;
+    std::shared_ptr<void> retainedBacking;
+    std::atomic_bool activated{false};
+    std::atomic_bool activationFailed{false};
+};
+
+}
 
 namespace {
     struct CaptureResources {
@@ -101,6 +829,12 @@ namespace {
             srcQueueFamilyIndex, dstQueueFamilyIndex, range);
     }
 
+    [[nodiscard]] VkImageSubresourceRange fullSwapchainRange(uint32_t arrayLayers) {
+        auto range = vk::exchangeImageSubresourceRange();
+        range.layerCount = arrayLayers;
+        return range;
+    }
+
     bool modifierSupportsBlitSource(const vk::Vulkan& vk, VkFormat format,
             uint64_t modifier) {
         VkDrmFormatModifierPropertiesListEXT list{
@@ -120,7 +854,8 @@ namespace {
 
     VkResult acquireRealSwapchainImage(const vk::Vulkan& vk,
             VkSwapchainKHR swapchain, VkSemaphore semaphore,
-            uint32_t* imageIndex, std::stop_token stopToken) {
+            uint32_t* imageIndex, std::stop_token stopToken,
+            VkFence fence = VK_NULL_HANDLE) {
         constexpr uint64_t WORKER_ACQUIRE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
         while (true) {
             if (stopToken.stop_possible() && stopToken.stop_requested())
@@ -130,13 +865,63 @@ namespace {
                 ? WORKER_ACQUIRE_SLICE_NS
                 : UINT64_MAX;
             const auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-                timeout, semaphore, VK_NULL_HANDLE, imageIndex);
+                timeout, semaphore, fence, imageIndex);
             if (res == VK_TIMEOUT && stopToken.stop_possible())
                 continue;
             return res;
         }
     }
 }
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+namespace lsfgvk::layer::test {
+__attribute__((visibility("default")))
+void setAdaptiveReservationExecuteHooks(
+        void (*before)(), void (*after)()) noexcept {
+    adaptiveReservationBeforeExecute.store(before, std::memory_order_release);
+    adaptiveReservationAfterExecute.store(after, std::memory_order_release);
+}
+
+__attribute__((visibility("default")))
+void setAdaptiveBuilderFailurePoint(AdaptiveBuilderFailurePoint point) noexcept {
+    adaptiveBuilderFailurePoint.store(point, std::memory_order_release);
+}
+
+__attribute__((visibility("default")))
+void setAdaptiveExecuteFailurePoint(AdaptiveExecuteFailurePoint point) noexcept {
+    adaptiveExecuteFailurePoint.store(point, std::memory_order_release);
+}
+
+__attribute__((visibility("default")))
+void resetAdaptiveCommandPoolLifecycleCounts() noexcept {
+    adaptiveCommandPoolCreates.store(0, std::memory_order_relaxed);
+    adaptiveCommandPoolDestroys.store(0, std::memory_order_relaxed);
+}
+
+__attribute__((visibility("default")))
+uint32_t adaptiveCommandPoolCreateCount() noexcept {
+    return adaptiveCommandPoolCreates.load(std::memory_order_relaxed);
+}
+
+__attribute__((visibility("default")))
+uint32_t adaptiveCommandPoolDestroyCount() noexcept {
+    return adaptiveCommandPoolDestroys.load(std::memory_order_relaxed);
+}
+
+__attribute__((visibility("default")))
+bool waitForAdaptiveCommandPoolDestroyCount(uint32_t count,
+        uint32_t timeoutMilliseconds) noexcept {
+    try {
+        std::unique_lock lock(adaptiveCommandPoolLifecycleMutex);
+        return adaptiveCommandPoolLifecycleCv.wait_for(lock,
+            std::chrono::milliseconds(timeoutMilliseconds), [count] {
+                return adaptiveCommandPoolDestroys.load(
+                    std::memory_order_relaxed) >= count;
+            });
+    } catch (...) { return false; }
+}
+}
+#endif
 
 PrePresentGateResult Swapchain::prePresentGate() noexcept {
     if (!d3b3ProductionState)
@@ -291,6 +1076,19 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
     }
 }
 
+bool layer::fgTransformationEligible(
+        const ls::GameConf& profile, const SwapchainInfo& info) noexcept {
+    constexpr VkImageUsageFlags2KHR requiredTransferUsage =
+        VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR
+        | VK_IMAGE_USAGE_2_TRANSFER_DST_BIT_KHR;
+    return !info.d2Foundation
+        && info.arrayLayers == 1
+        && info.timelineSemaphoreAvailable
+        && info.presentFenceAvailable
+        && (info.usage & requiredTransferUsage) == requiredTransferUsage
+        && !isAdaptiveBypass(profile);
+}
+
 Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             vk::RuntimeDevicePair devicePair,
             ls::GameConf profile, SwapchainInfo info,
@@ -300,6 +1098,9 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         fixedScheduler(profile.target_fps),
         fixedOutputPacer(profile.target_fps),
         profile(std::move(profile)), info(std::move(info)) {
+    this->physicalSwapchainLifecycleIdentity =
+        nextProductionSwapchainLifecycleIdentity.fetch_add(
+            1, std::memory_order_relaxed);
     this->offloadQueueFamily = offloadQueueFamily;
     if (this->devicePair.crossDevice())
         this->crossDeviceMode = CrossDeviceRuntimeMode::CAPTURE_ONLY;
@@ -310,6 +1111,9 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         if (offloadQueueFamily == VK_QUEUE_FAMILY_IGNORED)
             throw ls::error("virtual presentation requires an auxiliary queue family");
     }
+
+    if (!fgTransformationEligible(this->profile, this->info))
+        return;
 
     // P4C-B0 deliberately exposes only the application-side capture boundary.
     // Do not construct backend/LSFG resources until real-frame transport exists.
@@ -338,11 +1142,6 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
         this->frameTransportReady = true;
         return;
     }
-
-    // Adaptive multiplier == 1 keeps the Vulkan layer/profile active but
-    // bypasses LSFG. Fixed mode ignores multiplier and remains active.
-    if (isAdaptiveBypass(this->profile))
-        return;
 
     const VkExtent2D extent = this->info.extent;
     const bool hdr = this->info.format > 57;
@@ -385,11 +1184,28 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     int syncFd{};
     this->syncSemaphore.emplace(vk, 0, std::nullopt, &syncFd);
 
+    std::vector<ls::OwnedFd> ownedDestinationReturnFds;
+    ownedDestinationReturnFds.reserve(this->destinationImages.size());
+    this->destinationReturnSemaphores.reserve(this->destinationImages.size());
+    for (size_t i = 0; i < this->destinationImages.size(); ++i) {
+        int fd{-1};
+        this->destinationReturnSemaphores.emplace_back(
+            vk, 0, std::nullopt, &fd);
+        ownedDestinationReturnFds.emplace_back(fd);
+    }
+    this->destinationReturnStates.resize(this->destinationImages.size());
+
+    std::vector<int> destinationReturnFds;
+    destinationReturnFds.reserve(ownedDestinationReturnFds.size());
+    for (auto& fd : ownedDestinationReturnFds)
+        destinationReturnFds.push_back(fd.release());
+
     try {
         this->ctx = ls::owned_ptr<ls::R<backend::Context>>(
             new ls::R<backend::Context>(backend.openContext(
                 std::move(externalSourceImages),
                 std::move(externalDestinationImages), syncFd,
+                std::move(destinationReturnFds),
                 1.0F / this->profile.flow_scale, this->profile.performance_mode
             )),
             [backend = &backend](ls::R<backend::Context>& ctx) {
@@ -404,7 +1220,7 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
 
     this->renderCommandBuffer.emplace(vk);
     if (!this->renderFence.has_value())
-        this->renderFence.emplace(vk);
+        this->renderFence.emplace(vk, vk::Fence::ExternalHandle::SyncFd);
     for (size_t i = 0; i < this->destinationImages.size(); i++) {
         this->passes.emplace_back(RenderPass {
             .commandBuffer = vk::CommandBuffer(vk),
@@ -421,7 +1237,8 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     }
 }
 
-void Swapchain::ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family) {
+void Swapchain::ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t family,
+        std::shared_ptr<D3B3DeviceLifetimeQuarantine> deviceQuarantine) {
     if (family == VK_QUEUE_FAMILY_IGNORED)
         throw ls::error("graphics-final queue family is unavailable");
     if (this->virtualFinalCommandBuffer.has_value()) {
@@ -445,17 +1262,981 @@ void Swapchain::ensureGraphicsFinalResources(const vk::Vulkan& vk, uint32_t fami
     this->virtualFinalCommandBuffer.emplace(vk, pool);
     this->virtualFinalAcquireSemaphore.emplace(vk);
     this->virtualFinalPresentSemaphore.emplace(vk);
+    this->terminalContext = std::make_shared<D3B3PerSwapchainTerminalContext>(
+        vk, family, nextProductionSwapchainLifecycleIdentity.fetch_add(
+            1, std::memory_order_relaxed), std::move(deviceQuarantine));
+    this->terminalHandoffBinding = std::make_unique<D3B3AReturnHandoffBinding>(
+        this->terminalContext);
     if (d3b2InsertionDiagnosticEnabled()) {
         this->d3b2OriginalAcquireSemaphore.emplace(vk);
         this->d3b2GeneratedPresentSemaphore.emplace(vk);
         this->d3b2OriginalPresentSemaphore.emplace(vk);
     }
     if (!this->renderFence.has_value()) {
-      this->renderFence.emplace(vk);
+      this->renderFence.emplace(vk, vk::Fence::ExternalHandle::SyncFd);
     }
 }
 
-VkResult Swapchain::present(const vk::Vulkan& vk,
+struct AdaptivePreparationWaitBackingSlot final {
+    std::shared_ptr<void> value;
+};
+
+struct Adaptive1xPreparationContext final {
+    ~Adaptive1xPreparationContext() noexcept {
+        if (consumed) return;
+        if (reservedBorrowedFence && borrowedFences)
+            borrowedFences->abort(*reservedBorrowedFence);
+        if (reservedLease.valid() && leases)
+            leases->abort(reservedLease);
+    }
+    std::shared_ptr<Swapchain> owner;
+    VkDevice device{VK_NULL_HANDLE};
+    vk::VulkanDeviceFuncs dispatch{};
+    VkQueue queue{VK_NULL_HANDLE};
+    std::shared_ptr<std::mutex> queueMutex;
+    VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+    uint32_t virtualImageIndex{};
+    VkFence applicationPresentFence{VK_NULL_HANDLE};
+    std::stop_token stopToken;
+    std::shared_ptr<void> runtimeGpuLifetime;
+    std::shared_ptr<DeviceRetirementReactor> reactor;
+    std::shared_ptr<BorrowedPresentFenceRegistry> borrowedFences;
+    std::shared_ptr<PresentedPhysicalImageLeaseRegistry> leases;
+    std::shared_ptr<std::unique_ptr<VirtualPresentPendingOperation>> publication;
+    std::shared_ptr<AdaptiveAcquireSyncBacking> acquireBacking;
+    std::shared_ptr<AdaptiveProducerSyncBacking> producerBacking;
+    std::shared_ptr<AdaptiveProducerCommandBacking> commandBacking;
+    std::shared_ptr<PresentedWsiSemaphoreBacking> presentBacking;
+    std::shared_ptr<AdaptivePreparationWaitBackingSlot> waitBackingSlot;
+    std::shared_ptr<void> recoveryBacking;
+    std::shared_ptr<std::unique_ptr<ReactorFencePendingOperation>> pendingHolder;
+    std::shared_ptr<PresentedPhysicalImageIdentity> presentFenceIdentity;
+    std::shared_ptr<DeviceRetirementReactor::ReservedJob> presentFenceJob;
+    Adaptive1xPreparedLogicalFinal::Operations preparedOperations;
+    std::optional<Adaptive1xRecoveryAuthority> recovery;
+    PresentedPhysicalImageLeaseRegistry::ReservedPresentedLease reservedLease;
+    std::optional<BorrowedPresentFenceRegistry::ReservedBorrowedPresentFence>
+        reservedBorrowedFence;
+    std::vector<PresentedPhysicalImageAcquireToken> consumedAcquires;
+    uint64_t presentOperationIdentity{};
+    bool consumed{};
+};
+
+Adaptive1xPreparationReservation Swapchain::reserveAdaptive1xPreparation(
+        const vk::Vulkan& vk, VkQueue queue,
+        std::shared_ptr<std::mutex> queueMutex, VkSwapchainKHR swapchain,
+        uint32_t virtualImageIndex, VkFence applicationPresentFence,
+        std::stop_token stopToken, std::shared_ptr<void> runtimeGpuLifetime,
+        std::shared_ptr<DeviceRetirementReactor> reactor,
+        std::shared_ptr<BorrowedPresentFenceRegistry> borrowedFences,
+        std::shared_ptr<std::unique_ptr<VirtualPresentPendingOperation>> publication) {
+    if (!queueMutex || queue == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE
+            || !reactor || !publication
+            || this->info.releaseBackend == SwapchainReleaseBackend::None)
+        throw ls::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT,
+            "virtual Adaptive reservation inputs are unavailable");
+    auto context = std::make_shared<Adaptive1xPreparationContext>();
+    context->owner = shared_from_this();
+    context->device = vk.dev();
+    context->dispatch = vk.df();
+    context->queue = queue;
+    context->queueMutex = std::move(queueMutex);
+    context->swapchain = swapchain;
+    context->virtualImageIndex = virtualImageIndex;
+    context->applicationPresentFence = applicationPresentFence;
+    context->stopToken = stopToken;
+    context->runtimeGpuLifetime = std::move(runtimeGpuLifetime);
+    context->reactor = std::move(reactor);
+    context->borrowedFences = std::move(borrowedFences);
+    context->leases = this->presentedPhysicalImages;
+    context->publication = std::move(publication);
+    if (virtualImageIndex >= this->info.images.size()
+            || !this->presentedPhysicalImages || !this->terminalContext)
+        throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
+            "virtual Adaptive reservation identity is unavailable");
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::AcquireBacking);
+#endif
+    context->acquireBacking = std::make_shared<AdaptiveAcquireSyncBacking>(vk);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::ProducerBacking);
+#endif
+    context->producerBacking = std::make_shared<AdaptiveProducerSyncBacking>(vk);
+    context->commandBacking = std::make_shared<AdaptiveProducerCommandBacking>(
+        vk, this->virtualFinalCommandFamily);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::PresentBacking);
+#endif
+    context->presentBacking = std::make_shared<PresentedWsiSemaphoreBacking>(vk);
+    context->waitBackingSlot =
+        std::make_shared<AdaptivePreparationWaitBackingSlot>();
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(
+        test::AdaptiveBuilderFailurePoint::CompositeRecoveryBacking);
+#endif
+    context->recoveryBacking = combineGpuRetirementBacking(
+        combineGpuRetirementBacking(
+            combineGpuRetirementBacking(context->acquireBacking,
+                context->producerBacking), context->presentBacking),
+        context->runtimeGpuLifetime);
+    context->recoveryBacking = combineGpuRetirementBacking(
+        std::move(context->recoveryBacking), context->commandBacking);
+    context->recoveryBacking = combineGpuRetirementBacking(
+        std::move(context->recoveryBacking), context->waitBackingSlot);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::ConsumedAcquireStorage);
+#endif
+    context->consumedAcquires.reserve(1);
+    context->presentOperationIdentity =
+        nextRetirementOperationIdentity.fetch_add(1, std::memory_order_relaxed);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::ReactorPendingOperation);
+#endif
+    auto pendingTicket = std::make_shared<DeviceRetirementTicket>();
+    auto pendingReservation = context->reactor->reserveJob(DeviceRetirementJob{
+        .deviceIdentity = this->terminalContext->deviceIdentity(),
+        .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+        .operationIdentity = context->presentOperationIdentity,
+        .ticket = pendingTicket});
+    if (!pendingReservation)
+        throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+            "Adaptive producer reactor reservation failed");
+    auto pendingJob = std::make_shared<DeviceRetirementReactor::ReservedJob>(
+        std::move(*pendingReservation));
+    auto pendingOperation = std::make_unique<ReactorFencePendingOperation>(
+        shared_from_this(), context->reactor, -2,
+        std::vector<PresentedPhysicalImageAcquireToken>{}, true,
+        context->recoveryBacking, std::move(pendingJob),
+        std::move(pendingTicket));
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::PendingHolder);
+#endif
+    context->pendingHolder =
+        std::make_shared<std::unique_ptr<ReactorFencePendingOperation>>(
+            std::move(pendingOperation));
+    context->presentFenceIdentity =
+        std::make_shared<PresentedPhysicalImageIdentity>();
+    context->presentFenceJob =
+        std::make_shared<DeviceRetirementReactor::ReservedJob>();
+    auto presentFenceTicket = std::make_shared<DeviceRetirementTicket>();
+    auto presentFenceJob = context->reactor->reserveJob(DeviceRetirementJob{
+        .deviceIdentity = this->terminalContext->deviceIdentity(),
+        .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+        .operationIdentity = context->presentOperationIdentity,
+        .ticket = std::move(presentFenceTicket),
+        .retireBacking = [leases = context->leases,
+                identity = context->presentFenceIdentity,
+                backing = context->presentBacking](
+                DeviceRetirementTicketState state) {
+            if (state == DeviceRetirementTicketState::Completed) {
+                backing->markCompleted();
+                static_cast<void>(leases->retireAfterPresentFence(*identity));
+            }
+        }});
+    if (!presentFenceJob)
+        throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+            "Adaptive present-fence reactor reservation failed");
+    *context->presentFenceJob = std::move(*presentFenceJob);
+    const auto device = vk.dev();
+    const auto waitForFences = vk.df().WaitForFences;
+    const auto getFenceFd = vk.df().GetFenceFdKHR;
+    const auto releaseKhr = vk.df().ReleaseSwapchainImagesKHR;
+    const auto releaseExt = vk.df().ReleaseSwapchainImagesEXT;
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::PreparedCallbacks);
+#endif
+    context->preparedOperations = {
+        .armInternalPresentFence = [device, getFenceFd,
+                presentBacking = context->presentBacking,
+                leases = this->presentedPhysicalImages,
+                reactor = context->reactor,
+                reserved = context->presentFenceJob,
+                reservedIdentity = context->presentFenceIdentity](
+                const PresentedPhysicalImageIdentity& identity) {
+            if (!getFenceFd || !reactor || !reserved || !reserved->valid()
+                    || !identity.valid()) return false;
+            int fd{-1};
+            const VkFenceGetFdInfoKHR exportInfo{
+                .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+                .fence = presentBacking->internalPresentFence.handle(),
+                .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+            if (getFenceFd(device, &exportInfo, &fd) != VK_SUCCESS)
+                return false;
+            presentBacking->acceptExportedFd(fd);
+            *reservedIdentity = identity;
+            if (fd == -1) {
+                presentBacking->markCompleted();
+                static_cast<void>(leases->retireAfterPresentFence(identity));
+                return true;
+            }
+            const auto reactorFd = ::dup(fd);
+            if (reactorFd < 0) return false;
+            if (!reactor->registerReservedJob(
+                    *reserved, reactorFd, presentBacking)) {
+                static_cast<void>(::close(reactorFd));
+                return false;
+            }
+            presentBacking->markReactorOwned();
+            return true;
+        },
+        .exportProducerCompletion = [device, getFenceFd,
+                producerBacking = context->producerBacking](int* fd) {
+            if (!fd || !getFenceFd) return VK_ERROR_EXTENSION_NOT_PRESENT;
+            const VkFenceGetFdInfoKHR info{
+                .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+                .fence = producerBacking->fence.handle(),
+                .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+            return getFenceFd(device, &info, fd);
+        },
+        .publishCompletion = [pendingHolder = context->pendingHolder,
+                publication = context->publication](int fd,
+                std::vector<PresentedPhysicalImageAcquireToken>&& tokens) {
+            if (!publication || !*pendingHolder
+                    || !(*pendingHolder)->bindCompletion(fd, std::move(tokens)))
+                return VK_ERROR_DEVICE_LOST;
+            *publication = std::move(*pendingHolder);
+            return VK_SUCCESS;
+        },
+        .retainConservatively = [reactor = context->reactor](
+                std::shared_ptr<void> value) {
+            return reactor && reactor->retainEventSourceLost(std::move(value));
+        }};
+    const auto releaseBackend = this->info.releaseBackend;
+    const auto releasePhysicalImage = [device, swapchain, releaseBackend,
+            releaseKhr, releaseExt](uint32_t index) {
+        const VkReleaseSwapchainImagesInfoKHR releaseInfo{
+            .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
+            .swapchain = swapchain, .imageIndexCount = 1,
+            .pImageIndices = &index};
+        if (releaseBackend == SwapchainReleaseBackend::Khr && releaseKhr)
+            return releaseKhr(device, &releaseInfo);
+        if (releaseBackend == SwapchainReleaseBackend::Ext && releaseExt)
+            return releaseExt(device, &releaseInfo);
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    };
+    const auto recoveryGeneration = nextRetirementOperationIdentity.fetch_add(
+        1, std::memory_order_relaxed);
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(test::AdaptiveBuilderFailurePoint::RecoveryCallbacks);
+#endif
+    context->recovery.emplace(this->terminalContext->deviceIdentity(),
+        this->physicalSwapchainLifecycleIdentity, recoveryGeneration,
+        swapchain, releaseBackend, context->acquireBacking->semaphore.handle(),
+        context->acquireBacking->fence.handle(),
+        context->producerBacking->fence.handle(), context->recoveryBacking,
+        Adaptive1xRecoveryAuthority::Operations{
+            .waitAcquireCompletion = [device, waitForFences,
+                    backing = context->acquireBacking] {
+                const auto fence = backing->fence.handle();
+                return waitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            },
+            .waitProducerCompletion = [device, waitForFences,
+                    backing = context->producerBacking] {
+                const auto fence = backing->fence.handle();
+                return waitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            },
+            .releasePhysicalImage = releasePhysicalImage,
+            .retainTerminal = [reactor = context->reactor](
+                    std::shared_ptr<void> value) {
+                return reactor && reactor->retainEventSourceLost(std::move(value));
+            }});
+    if (!context->recovery->eligible())
+        throw ls::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT,
+            "virtual Adaptive recovery reservation is unavailable");
+    const PresentedPhysicalImageIdentity unboundIdentity{
+        .deviceLifetimeIdentity = this->terminalContext->deviceIdentity(),
+        .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+        .physicalSwapchainIdentity = reinterpret_cast<uintptr_t>(swapchain),
+        .physicalImageIndex = 0,
+        .presentOperationIdentity = context->presentOperationIdentity};
+    PresentedPhysicalImageLeaseRegistry::PrepareFailure leaseFailure{};
+    Adaptive1xPreparationReservation::Operations reservationOperations{
+        .execute = [context](VkSemaphore preparationWaitSemaphore)
+                -> Adaptive1xPreparedLogicalFinal {
+            auto& recovery = *context->recovery;
+            using PreparedLease = std::optional<
+                PresentedPhysicalImageLeaseRegistry::PreparedPresentedLease>;
+            using PreparedFence = std::optional<
+                BorrowedPresentFenceRegistry::PreparedBorrowedPresentFence>;
+            auto cleanReservations = [&](PreparedLease* preparedLease,
+                    PreparedFence* preparedFence) noexcept {
+                if (preparedFence && *preparedFence && context->borrowedFences)
+                    context->borrowedFences->abort(**preparedFence);
+                else if (context->reservedBorrowedFence
+                        && context->borrowedFences)
+                    context->borrowedFences->abort(
+                        *context->reservedBorrowedFence);
+                if (preparedLease && *preparedLease)
+                    context->leases->abort(**preparedLease);
+                else if (context->reservedLease.valid())
+                    context->leases->abort(context->reservedLease);
+            };
+            const auto recoverAcquire = [&]() noexcept {
+                const auto result = recovery.recoverAcquireFailureOnly();
+                if (result == VK_SUCCESS) {
+                    for (const auto& token : context->consumedAcquires)
+                        if (!context->leases->retireAfterAcquireCompletion(token))
+                            return VK_ERROR_DEVICE_LOST;
+                    context->consumedAcquires.clear();
+                }
+                return result;
+            };
+            if (!recovery.markAcquireCalled()) {
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
+                    "Adaptive reservation lost Acquire authority");
+            }
+            uint32_t realImageIdx{};
+            VkResult acquireResult{};
+            do {
+                if (context->stopToken.stop_possible()
+                        && context->stopToken.stop_requested()) {
+                    acquireResult = VK_ERROR_OUT_OF_DATE_KHR;
+                    break;
+                }
+                acquireResult = context->dispatch.AcquireNextImageKHR(
+                    context->device, context->swapchain,
+                    context->stopToken.stop_possible()
+                        ? 50ULL * 1000ULL * 1000ULL : UINT64_MAX,
+                    context->acquireBacking->semaphore.handle(),
+                    context->acquireBacking->fence.handle(), &realImageIdx);
+            } while (acquireResult == VK_TIMEOUT
+                && context->stopToken.stop_possible());
+            if (!recovery.bindAcquireResult(acquireResult, realImageIdx)) {
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "Adaptive reservation lost Acquire result");
+            }
+            if (acquireResult != VK_SUCCESS
+                    && acquireResult != VK_SUBOPTIMAL_KHR) {
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(acquireResult,
+                    "reserved Adaptive physical Acquire failed");
+            }
+            if (const auto token = context->leases->reacquired(
+                    context->owner->terminalContext->deviceIdentity(),
+                    context->owner->physicalSwapchainLifecycleIdentity,
+                    reinterpret_cast<uintptr_t>(context->swapchain), realImageIdx,
+                    nextRetirementOperationIdentity.fetch_add(
+                        1, std::memory_order_relaxed)))
+                context->consumedAcquires.push_back(*token);
+            if (realImageIdx >= context->owner->info.realImages.size()) {
+                static_cast<void>(recoverAcquire());
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "reserved Adaptive Acquire image is out of range");
+            }
+            const auto command = context->commandBacking->commandBuffer->handle();
+            const VkCommandBufferBeginInfo beginInfo{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+            auto result = context->dispatch.BeginCommandBuffer(command, &beginInfo);
+            if (result == VK_SUCCESS) {
+                const VkImageMemoryBarrier pre[]{
+                    barrierHelper(context->owner->info.images[
+                            context->virtualImageIndex], VK_ACCESS_NONE,
+                        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        fullSwapchainRange(context->owner->info.arrayLayers)),
+                    barrierHelper(context->owner->info.realImages[realImageIdx],
+                        VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        fullSwapchainRange(context->owner->info.arrayLayers))};
+                context->dispatch.CmdPipelineBarrier(command,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                    2, pre);
+                const auto region = vk::makeImageBlitRegion(
+                    {context->owner->info.extent, context->owner->info.extent},
+                    context->owner->info.arrayLayers);
+                context->dispatch.CmdBlitImage(command,
+                    context->owner->info.images[context->virtualImageIndex],
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    context->owner->info.realImages[realImageIdx],
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                    VK_FILTER_NEAREST);
+                const VkImageMemoryBarrier post[]{
+                    barrierHelper(context->owner->info.images[
+                            context->virtualImageIndex],
+                        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        fullSwapchainRange(context->owner->info.arrayLayers)),
+                    barrierHelper(context->owner->info.realImages[realImageIdx],
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        fullSwapchainRange(context->owner->info.arrayLayers))};
+                context->dispatch.CmdPipelineBarrier(command,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                    nullptr, 2, post);
+                result = context->dispatch.EndCommandBuffer(command);
+            }
+            if (result != VK_SUCCESS) {
+                static_cast<void>(recoverAcquire());
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(result,
+                    "reserved Adaptive command recording failed");
+            }
+            const PresentedPhysicalImageIdentity presented{
+                .deviceLifetimeIdentity =
+                    context->owner->terminalContext->deviceIdentity(),
+                .swapchainLifecycleIdentity =
+                    context->owner->physicalSwapchainLifecycleIdentity,
+                .physicalSwapchainIdentity =
+                    reinterpret_cast<uintptr_t>(context->swapchain),
+                .physicalImageIndex = realImageIdx,
+                .presentOperationIdentity = context->presentOperationIdentity};
+            PresentedPhysicalImageLeaseRegistry::PrepareFailure leaseFailure{};
+            auto preparedLease =
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+                failAdaptiveExecuteAt(test::AdaptiveExecuteFailurePoint::PhysicalLeaseBind)
+                    ? std::optional<PresentedPhysicalImageLeaseRegistry::
+                        PreparedPresentedLease>{}
+                    :
+#endif
+                context->leases->bindPhysicalImage(
+                    context->reservedLease, presented, &leaseFailure);
+            if (!preparedLease) {
+                static_cast<void>(recoverAcquire());
+                cleanReservations(nullptr, nullptr);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "reserved Adaptive physical lease bind failed");
+            }
+            std::optional<
+                BorrowedPresentFenceRegistry::PreparedBorrowedPresentFence>
+                preparedFence;
+            if (context->reservedBorrowedFence) {
+                BorrowedPresentFenceRegistry::PrepareFailure fenceFailure{};
+                preparedFence =
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+                    failAdaptiveExecuteAt(
+                        test::AdaptiveExecuteFailurePoint::BorrowedFenceBind)
+                        ? std::optional<BorrowedPresentFenceRegistry::
+                            PreparedBorrowedPresentFence>{}
+                        :
+#endif
+                    context->borrowedFences->bindPresentedIdentity(
+                        *context->reservedBorrowedFence, presented, &fenceFailure);
+                if (!preparedFence) {
+                    static_cast<void>(recoverAcquire());
+                    cleanReservations(&preparedLease, nullptr);
+                    context->consumed = true;
+                    throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                        "reserved Adaptive borrowed fence bind failed");
+                }
+            }
+            if (!recovery.markProducerPrepared()) {
+                static_cast<void>(recoverAcquire());
+                cleanReservations(&preparedLease, &preparedFence);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "reserved Adaptive producer authority was lost");
+            }
+            const VkSemaphore waits[]{preparationWaitSemaphore,
+                context->acquireBacking->semaphore.handle()};
+            const VkPipelineStageFlags stages[]{
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+            const VkSemaphore signal = context->presentBacking->ready.handle();
+            const VkSubmitInfo submitInfo{
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .waitSemaphoreCount = 2,
+                .pWaitSemaphores = waits,
+                .pWaitDstStageMask = stages,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &command,
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = &signal};
+            {
+                const std::scoped_lock queueLock(*context->queueMutex);
+                result = context->dispatch.QueueSubmit(context->queue, 1,
+                    &submitInfo, context->producerBacking->fence.handle());
+            }
+            if (!recovery.bindProducerSubmitResult(result)) {
+                cleanReservations(&preparedLease, &preparedFence);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "reserved Adaptive producer result was lost");
+            }
+            if (result != VK_SUCCESS) {
+                const auto recoveryState = recovery.state();
+                if (recoveryState == Adaptive1xRecoveryAuthority::State::DeviceLost
+                        || recoveryState
+                            == Adaptive1xRecoveryAuthority::State::Indeterminate) {
+                    // QueueSubmit may have consumed the Acquire semaphore and
+                    // referenced the command/resources.  The recovery authority
+                    // has already transferred the strong backing to the device
+                    // reactor; retain the bound physical-image lease as well.
+                    // No logical present occurred, so the application fence
+                    // association remains uncommitted and is aborted.
+                    if (preparedFence && context->borrowedFences)
+                        context->borrowedFences->abort(*preparedFence);
+                    if (!context->leases->commit(*preparedLease))
+                        context->leases->abort(*preparedLease);
+                    context->consumed = true;
+                    throw ls::vulkan_error(result,
+                        "reserved Adaptive producer submit was indeterminate");
+                }
+                if (result == VK_ERROR_OUT_OF_HOST_MEMORY
+                        || result == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                    static_cast<void>(recoverAcquire());
+                cleanReservations(&preparedLease, &preparedFence);
+                context->consumed = true;
+                throw ls::vulkan_error(result,
+                    "reserved Adaptive producer submit failed");
+            }
+            if (!recovery.markReadyForLogicalPresent()) {
+                static_cast<void>(recovery.recoverProducerFailureOnly());
+                cleanReservations(&preparedLease, &preparedFence);
+                context->consumed = true;
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "reserved Adaptive producer readiness was lost");
+            }
+            Adaptive1xPreparedLogicalFinal prepared(context->swapchain,
+                realImageIdx, signal, context->applicationPresentFence,
+                context->presentBacking->internalPresentFence.handle(), presented,
+                std::move(recovery), context->leases, *preparedLease,
+                context->borrowedFences, std::move(preparedFence),
+                std::move(context->consumedAcquires), context->recoveryBacking,
+                std::move(context->preparedOperations));
+            context->consumed = true;
+            return prepared;
+        },
+        .abortUnused = [context] {
+            if (context->reservedBorrowedFence && context->borrowedFences)
+                context->borrowedFences->abort(*context->reservedBorrowedFence);
+            if (context->reservedLease.valid() && context->leases)
+                context->leases->abort(context->reservedLease);
+            context->consumed = true;
+        },
+        .valid = [context] { return !context->consumed && context->owner
+                && context->publication && context->recovery
+                && context->reservedLease.valid(); },
+        .failureState = [context] {
+            if (!context->recovery)
+                return Adaptive1xPreparationReservation::State::CleanlyAborted;
+            using RecoveryState = Adaptive1xRecoveryAuthority::State;
+            switch (context->recovery->state()) {
+            case RecoveryState::DeviceLost:
+            case RecoveryState::Indeterminate:
+                return Adaptive1xPreparationReservation::State::ConservativelyRetained;
+            case RecoveryState::Released:
+                return Adaptive1xPreparationReservation::State::Recovered;
+            default:
+                return Adaptive1xPreparationReservation::State::CleanlyAborted;
+            }
+        },
+        .attachWaitBacking = [slot = context->waitBackingSlot](
+                std::shared_ptr<void> backing) noexcept {
+            if (!slot || slot->value || !backing) return false;
+            slot->value = std::move(backing);
+            return true;
+        }};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    if (consumeAdaptiveBuilderAt(
+            test::AdaptiveBuilderFailurePoint::PhysicalLeaseReserve))
+        test::failNextPresentedPhysicalLeaseReserve();
+#endif
+    auto reservedLease = context->leases->reserve(
+        unboundIdentity, context->recoveryBacking, &leaseFailure,
+        applicationPresentFence == VK_NULL_HANDLE
+            ? std::function<VkResult()>{[backing = context->presentBacking,
+                    device, waitForFences] {
+                return backing->waitForCompletion(device, waitForFences);
+            }} : std::function<VkResult()>{});
+    if (!reservedLease) {
+        if (leaseFailure
+                == PresentedPhysicalImageLeaseRegistry::PrepareFailure::OutOfHostMemory)
+            throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                "failed to reserve physical-image WSI lease");
+        throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+            "physical-image WSI lease reservation conflict");
+    }
+    context->reservedLease = *reservedLease;
+    if (applicationPresentFence != VK_NULL_HANDLE) {
+        if (!context->borrowedFences) {
+            context->leases->abort(context->reservedLease);
+            throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
+                "borrowed present-fence registry is unavailable");
+        }
+        BorrowedPresentFenceRegistry::PrepareFailure fenceFailure{};
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+        if (consumeAdaptiveBuilderAt(
+                test::AdaptiveBuilderFailurePoint::BorrowedFenceReserve))
+            test::failNextBorrowedPresentFenceReserve();
+#endif
+        context->reservedBorrowedFence = context->borrowedFences->reserve(
+            applicationPresentFence, context->leases, &fenceFailure);
+        if (!context->reservedBorrowedFence) {
+            context->leases->abort(context->reservedLease);
+            if (fenceFailure
+                    == BorrowedPresentFenceRegistry::PrepareFailure::OutOfHostMemory)
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "failed to reserve borrowed present-fence generation");
+            throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                "application present fence has no current object identity");
+        }
+    }
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+    failAdaptiveBuilderAt(
+        test::AdaptiveBuilderFailurePoint::AfterBothRegistryReservations);
+#endif
+    return Adaptive1xPreparationReservation(std::move(reservationOperations));
+}
+
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+void Swapchain::primeAdaptiveBuilderForTesting(const vk::Vulkan& vk,
+        uint32_t family,
+        std::shared_ptr<D3B3DeviceLifetimeQuarantine> quarantine,
+        std::shared_ptr<PresentedPhysicalImageLeaseRegistry> leases) {
+    this->presentedPhysicalImages = std::move(leases);
+    this->ensureGraphicsFinalResources(vk, family, std::move(quarantine));
+}
+
+SwapchainReleaseBackend Swapchain::setReleaseBackendForTesting(
+        SwapchainReleaseBackend value) noexcept {
+    const auto previous = this->info.releaseBackend;
+    this->info.releaseBackend = value;
+    return previous;
+}
+#endif
+
+Adaptive1xPreparedLogicalFinal Swapchain::prepareAdaptive1xLogicalFinal(
+        const vk::Vulkan& vk, VkQueue queue,
+        std::shared_ptr<std::mutex> queueMutex, VkSwapchainKHR swapchain,
+        uint32_t virtualImageIndex, VkSemaphore preparationWaitSemaphore,
+        VkFence applicationPresentFenceValue, std::stop_token stopToken,
+        std::shared_ptr<void> runtimeGpuLifetime,
+        std::shared_ptr<DeviceRetirementReactor> deviceRetirementReactor,
+        std::shared_ptr<BorrowedPresentFenceRegistry> borrowedPresentFences,
+        std::shared_ptr<std::unique_ptr<VirtualPresentPendingOperation>>
+            completionPublication) {
+    if (!queueMutex || queue == VK_NULL_HANDLE || swapchain == VK_NULL_HANDLE
+            || preparationWaitSemaphore == VK_NULL_HANDLE)
+        throw ls::error("virtual Adaptive preparation inputs are unavailable");
+    const auto& swapchainImage = this->info.images.at(virtualImageIndex);
+    const auto& outputImages = this->info.realImages;
+    const auto compensateAbortedLogicalPresentFence =
+        [&](const char*) -> VkResult {
+            if (applicationPresentFenceValue == VK_NULL_HANDLE)
+                return VK_SUCCESS;
+            const auto submit = [&](VkQueue actualQueue,
+                    const VkSubmitInfo& submitInfo, VkFence actualFence) {
+                const std::scoped_lock queueLock(*queueMutex);
+                return vk.df().QueueSubmit(
+                    actualQueue, 1, &submitInfo, actualFence);
+            };
+            return compensateEnqueuedPresentAbort(queue,
+                applicationPresentFenceValue, submit);
+        };
+        auto acquireBacking = std::make_shared<AdaptiveAcquireSyncBacking>(vk);
+        auto producerBacking = std::make_shared<AdaptiveProducerSyncBacking>(vk);
+        auto commandBacking = std::make_shared<AdaptiveProducerCommandBacking>(
+            vk, this->virtualFinalCommandFamily);
+        auto presentBacking = std::make_shared<PresentedWsiSemaphoreBacking>(vk);
+        auto recoveryBacking = combineGpuRetirementBacking(
+            combineGpuRetirementBacking(
+                combineGpuRetirementBacking(acquireBacking, producerBacking),
+                presentBacking),
+            runtimeGpuLifetime);
+        recoveryBacking = combineGpuRetirementBacking(
+            std::move(recoveryBacking), commandBacking);
+        std::vector<PresentedPhysicalImageAcquireToken> consumedAcquires;
+        consumedAcquires.reserve(1);
+        if (!completionPublication || !deviceRetirementReactor)
+            throw ls::error("virtual Adaptive event retirement is unavailable");
+        // All heap-backed state required to publish/finalize the prepared
+        // logical final is committed before the physical Acquire.  In
+        // particular, ProducerSubmitAccepted must be followed only by
+        // allocation-free moves/binds into Adaptive1xPreparedLogicalFinal.
+        auto pendingHolder =
+            std::make_shared<std::unique_ptr<ReactorFencePendingOperation>>(
+                std::make_unique<ReactorFencePendingOperation>(
+                    shared_from_this(), deviceRetirementReactor, -2,
+                    std::vector<PresentedPhysicalImageAcquireToken>{}, true,
+                    recoveryBacking));
+        const auto device = vk.dev();
+        const auto waitForFences = vk.df().WaitForFences;
+        const auto getFenceFd = vk.df().GetFenceFdKHR;
+        const auto releaseKhr = vk.df().ReleaseSwapchainImagesKHR;
+        const auto releaseExt = vk.df().ReleaseSwapchainImagesEXT;
+        Adaptive1xPreparedLogicalFinal::Operations preparedOperations{
+            .armInternalPresentFence = [device, getFenceFd, presentBacking,
+                    leases = this->presentedPhysicalImages,
+                    deviceRetirementReactor](
+                    const PresentedPhysicalImageIdentity& identity) {
+                return armInternalPresentFence(device, getFenceFd, presentBacking,
+                    leases, identity, deviceRetirementReactor);
+            },
+            .exportProducerCompletion = [device, getFenceFd,
+                    producerBacking](int* fd) {
+                if (!fd || !getFenceFd) return VK_ERROR_EXTENSION_NOT_PRESENT;
+                const VkFenceGetFdInfoKHR info{
+                    .sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+                    .fence = producerBacking->fence.handle(),
+                    .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+                return getFenceFd(device, &info, fd);
+            },
+            .publishCompletion = [pendingHolder, completionPublication](int fd,
+                    std::vector<PresentedPhysicalImageAcquireToken>&& tokens) {
+                if (!completionPublication || !*pendingHolder
+                        || !(*pendingHolder)->bindCompletion(
+                            fd, std::move(tokens)))
+                    return VK_ERROR_DEVICE_LOST;
+                *completionPublication = std::move(*pendingHolder);
+                return VK_SUCCESS;
+            },
+            .retainConservatively = [deviceRetirementReactor](
+                    std::shared_ptr<void> value) {
+                return deviceRetirementReactor
+                    && deviceRetirementReactor->retainEventSourceLost(
+                        std::move(value));
+            }};
+        const auto releaseBackend = this->info.releaseBackend;
+        const auto releasePhysicalImage = [device, swapchain, releaseBackend,
+                releaseKhr, releaseExt](uint32_t index) {
+            const VkReleaseSwapchainImagesInfoKHR releaseInfo{
+                .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
+                .swapchain = swapchain, .imageIndexCount = 1,
+                .pImageIndices = &index};
+            if (releaseBackend == SwapchainReleaseBackend::Khr && releaseKhr)
+                return releaseKhr(device, &releaseInfo);
+            if (releaseBackend == SwapchainReleaseBackend::Ext && releaseExt)
+                return releaseExt(device, &releaseInfo);
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        };
+        Adaptive1xRecoveryAuthority recovery(
+            this->terminalContext->deviceIdentity(),
+            this->physicalSwapchainLifecycleIdentity,
+            nextRetirementOperationIdentity.fetch_add(1, std::memory_order_relaxed),
+            swapchain, this->info.releaseBackend,
+            acquireBacking->semaphore.handle(), acquireBacking->fence.handle(),
+            producerBacking->fence.handle(), recoveryBacking, {
+                .waitAcquireCompletion = [device, waitForFences, acquireBacking] {
+                    const auto fence = acquireBacking->fence.handle();
+                    return waitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+                },
+                .waitProducerCompletion = [device, waitForFences, producerBacking] {
+                    const auto fence = producerBacking->fence.handle();
+                    return waitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+                },
+                .releasePhysicalImage = releasePhysicalImage,
+                .retainTerminal = [deviceRetirementReactor](std::shared_ptr<void> value) {
+                    return deviceRetirementReactor
+                        && deviceRetirementReactor->retainEventSourceLost(std::move(value));
+                }});
+        if (!recovery.eligible() || !recovery.markAcquireCalled())
+            throw ls::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT,
+                "virtual Adaptive 1x recovery authority is unavailable");
+
+        uint32_t realImageIdx{};
+        auto res = acquireRealSwapchainImage(vk, swapchain,
+            acquireBacking->semaphore.handle(), &realImageIdx,
+            stopToken, acquireBacking->fence.handle());
+        if (!recovery.bindAcquireResult(res, realImageIdx))
+            throw ls::error("physical Acquire recovery generation was lost");
+        if (classifyPresentResult(res) == PresentResultClass::EnqueuedRejection) {
+            const auto fenceResult =
+                compensateAbortedLogicalPresentFence("hidden Adaptive 1x acquire");
+            if (fenceResult != VK_SUCCESS)
+                throw ls::vulkan_error(fenceResult,
+                    "failed to compensate aborted logical present fence");
+        }
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
+
+        if (const auto token = this->presentedPhysicalImages->reacquired(
+                this->terminalContext->deviceIdentity(),
+                this->physicalSwapchainLifecycleIdentity,
+                reinterpret_cast<uintptr_t>(swapchain), realImageIdx,
+                nextRetirementOperationIdentity.fetch_add(
+                    1, std::memory_order_relaxed)))
+            consumedAcquires.push_back(*token);
+        const auto recoverAcquireOnly = [&] {
+            const auto result = recovery.recoverAcquireFailureOnly();
+            if (result == VK_SUCCESS) {
+                for (const auto& token : consumedAcquires)
+                    if (!this->presentedPhysicalImages
+                            ->retireAfterAcquireCompletion(token))
+                        return VK_ERROR_DEVICE_LOST;
+                consumedAcquires.clear();
+            }
+            return result;
+        };
+        if (realImageIdx >= outputImages.size()) {
+            static_cast<void>(recoverAcquireOnly());
+            throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                "physical Acquire returned an out-of-range image index");
+        }
+        const auto& realImage = outputImages.at(realImageIdx);
+        auto& finalCmdbuf = *commandBacking->commandBuffer;
+        try {
+        finalCmdbuf.begin(vk);
+        finalCmdbuf.blitImage(vk,
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_NONE,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    fullSwapchainRange(this->info.arrayLayers)
+                ),
+                barrierHelper(realImage,
+                    VK_ACCESS_NONE,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    fullSwapchainRange(this->info.arrayLayers)
+                ),
+            },
+            { swapchainImage, realImage },
+            this->info.extent,
+            {
+                barrierHelper(swapchainImage,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    fullSwapchainRange(this->info.arrayLayers)
+                ),
+                barrierHelper(realImage,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_MEMORY_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                    fullSwapchainRange(this->info.arrayLayers)
+                ),
+            },
+            this->info.arrayLayers
+        );
+        finalCmdbuf.end(vk);
+        } catch (...) {
+            static_cast<void>(recoverAcquireOnly());
+            throw;
+        }
+
+        const PresentedPhysicalImageIdentity presented{
+            .deviceLifetimeIdentity = this->terminalContext->deviceIdentity(),
+            .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+            .physicalSwapchainIdentity = reinterpret_cast<uintptr_t>(swapchain),
+            .physicalImageIndex = realImageIdx,
+            .presentOperationIdentity = nextRetirementOperationIdentity.fetch_add(
+                1, std::memory_order_relaxed)};
+        PresentedPhysicalImageLeaseRegistry::PrepareFailure leaseFailure{};
+        const auto applicationFence = applicationPresentFenceValue;
+        auto preparedLease = this->presentedPhysicalImages->prepare(
+            presented, recoveryBacking, &leaseFailure,
+            applicationFence == VK_NULL_HANDLE
+                ? std::function<VkResult()>{[backing = presentBacking, device,
+                        waitForFences] {
+                    return backing->waitForCompletion(device, waitForFences);
+                }} : std::function<VkResult()>{});
+        if (!preparedLease) {
+            static_cast<void>(recoverAcquireOnly());
+            if (leaseFailure == PresentedPhysicalImageLeaseRegistry::PrepareFailure::OutOfHostMemory)
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "failed to prepare physical-image WSI lease");
+            throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                "physical image already owns a WSI lease reservation");
+        }
+        std::optional<BorrowedPresentFenceRegistry::PreparedBorrowedPresentFence>
+            preparedFence;
+        if (applicationFence != VK_NULL_HANDLE && borrowedPresentFences) {
+            BorrowedPresentFenceRegistry::PrepareFailure fenceFailure{};
+            preparedFence = borrowedPresentFences->prepare(applicationFence,
+                this->presentedPhysicalImages, presented, &fenceFailure);
+            if (!preparedFence) {
+                this->presentedPhysicalImages->abort(*preparedLease);
+                static_cast<void>(recoverAcquireOnly());
+                if (fenceFailure == BorrowedPresentFenceRegistry::PrepareFailure::OutOfHostMemory)
+                    throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                        "failed to prepare borrowed present-fence generation");
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "application present fence has no current object identity");
+            }
+        }
+        if (!recovery.markProducerPrepared())
+            throw ls::error("virtual Adaptive producer authority was not prepared");
+        try {
+            const std::scoped_lock queueLock(*queueMutex);
+            finalCmdbuf.submit(vk, queue,
+                {
+                    preparationWaitSemaphore,
+                    acquireBacking->semaphore.handle()
+                },
+                VK_NULL_HANDLE, 0,
+                { presentBacking->ready.handle() },
+                VK_NULL_HANDLE, 0,
+                producerBacking->fence.handle()
+            );
+            if (!recovery.bindProducerSubmitResult(VK_SUCCESS)
+                    || !recovery.markReadyForLogicalPresent())
+                throw ls::error("virtual Adaptive producer acceptance was lost");
+        } catch (const ls::vulkan_error& e) {
+            if (preparedFence) borrowedPresentFences->abort(*preparedFence);
+            this->presentedPhysicalImages->abort(*preparedLease);
+            if (recovery.state()
+                    == Adaptive1xRecoveryAuthority::State::ProducerPrepared) {
+                static_cast<void>(recovery.bindProducerSubmitResult(
+                    e.error()));
+                if (e.error() == VK_ERROR_OUT_OF_HOST_MEMORY
+                        || e.error() == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                    static_cast<void>(recoverAcquireOnly());
+            } else if (recovery.state()
+                    == Adaptive1xRecoveryAuthority::State::ProducerSubmitAccepted
+                    || recovery.state()
+                        == Adaptive1xRecoveryAuthority::State::ReadyForLogicalPresent
+                    || recovery.state()
+                        == Adaptive1xRecoveryAuthority::State::LogicalPresentCalled) {
+                static_cast<void>(recovery.recoverProducerFailureOnly());
+            }
+            throw;
+        } catch (...) {
+            if (preparedFence) borrowedPresentFences->abort(*preparedFence);
+            this->presentedPhysicalImages->abort(*preparedLease);
+            if (recovery.state()
+                    == Adaptive1xRecoveryAuthority::State::ProducerPrepared)
+                static_cast<void>(recovery.bindProducerSubmitResult(VK_ERROR_UNKNOWN));
+            else if (recovery.state()
+                    == Adaptive1xRecoveryAuthority::State::ProducerSubmitAccepted
+                    || recovery.state()
+                        == Adaptive1xRecoveryAuthority::State::ReadyForLogicalPresent
+                    || recovery.state()
+                        == Adaptive1xRecoveryAuthority::State::LogicalPresentCalled)
+                static_cast<void>(recovery.recoverProducerFailureOnly());
+            throw;
+        }
+
+        Adaptive1xPreparedLogicalFinal prepared(
+            swapchain, realImageIdx, presentBacking->ready.handle(),
+            applicationFence, presentBacking->internalPresentFence.handle(),
+            presented, std::move(recovery), this->presentedPhysicalImages,
+            *preparedLease, borrowedPresentFences, std::move(preparedFence),
+            std::move(consumedAcquires), recoveryBacking,
+            std::move(preparedOperations));
+        if (!prepared.valid())
+            throw ls::error("virtual Adaptive prepared logical final is invalid");
+        return prepared;
+}
+
+SwapchainPresentResult Swapchain::present(const vk::Vulkan& vk,
         VkQueue queue, std::shared_ptr<std::mutex> queueMutex,
         VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
@@ -465,7 +2246,41 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         bool d3bSingleSwapchainEligible,
         const GraphicsFinalQueueInfo* graphicsFinalQueue,
         BorrowedGraphicsQueueLease* graphicsLease,
-        bool* stopAfterCompletion) {
+        bool* stopAfterCompletion,
+        std::shared_ptr<D3B3DeviceLifetimeQuarantine> deviceQuarantine,
+        std::shared_ptr<DeviceRetirementReactor> deviceRetirementReactor,
+        std::shared_ptr<PresentedPhysicalImageLeaseRegistry> physicalImageLeases,
+        std::shared_ptr<BorrowedPresentFenceRegistry> borrowedPresentFences,
+        std::unique_ptr<VirtualPresentPendingOperation>* pendingCompletion,
+        PresentedPhysicalImageIdentity* presentedIdentity,
+        std::shared_ptr<void> virtualGpuBacking) {
+    const bool transformationBypass =
+        !fgTransformationEligible(this->profile, this->info);
+
+    // A non-virtualized bypass is an exact logical native present. Keep this
+    // before every cross-device, capture, scheduling and hidden-acquire path.
+    if (transformationBypass && !this->info.virtualized) {
+        const VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = next_chain,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        return SwapchainPresentResult::logical(
+            vk.df().QueuePresentKHR(queue, &presentInfo));
+    }
+
+    auto runtimeGpuLifetime = combineGpuRetirementBacking(
+        shared_from_this(), std::move(virtualGpuBacking));
+    if (physicalImageLeases) {
+        if (this->presentedPhysicalImages
+                && this->presentedPhysicalImages != physicalImageLeases)
+            throw ls::error("physical-image lease owner changed within swapchain lifecycle");
+        this->presentedPhysicalImages = std::move(physicalImageLeases);
+    }
     if (this->info.virtualized) {
         if (!graphicsFinalQueue || !graphicsLease
                 || graphicsFinalExecutionMode(*graphicsFinalQueue, true)
@@ -474,10 +2289,13 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                     graphicsFinalQueue->queue, graphicsFinalQueue->family)
                 || queue != graphicsFinalQueue->queue)
             throw ls::error("borrowed graphics-final queue contract is unavailable");
-        this->ensureGraphicsFinalResources(vk, graphicsFinalQueue->family);
+        this->ensureGraphicsFinalResources(
+            vk, graphicsFinalQueue->family, std::move(deviceQuarantine));
     }
     if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY
             && this->d3b1State == D3B1PresentationState::PASS) {
+        if (!pendingCompletion)
+            throw ls::error("D3B1 drain async completion is unavailable");
         if (semaphores.size() != 1 || queue == VK_NULL_HANDLE || !queueMutex)
             throw ls::error("D3B1 terminal ready-semaphore drain is unavailable");
         constexpr VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -497,12 +2315,45 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         }
         if (result != VK_SUCCESS)
             throw ls::vulkan_error(result, "D3B1 terminal ready-semaphore drain failed");
-        if (!this->renderFence->wait(vk, UINT64_MAX))
-            throw ls::vulkan_error(VK_TIMEOUT,
-                "D3B1 terminal ready-semaphore drain did not retire");
-        return VK_SUCCESS;
+        if (!deviceRetirementReactor)
+            throw ls::error("D3B1 terminal drain reactor is unavailable");
+        int completionFd{-1};
+        try { completionFd = this->renderFence->exportSyncFd(vk); }
+        catch (...) {
+            if (!deviceRetirementReactor->retainEventSourceLost(shared_from_this()))
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "failed to retain D3B1 drain backing");
+            throw;
+        }
+        *pendingCompletion = std::make_unique<ReactorFencePendingOperation>(
+            shared_from_this(), deviceRetirementReactor, completionFd,
+            std::vector<PresentedPhysicalImageAcquireToken>{}, false,
+            runtimeGpuLifetime);
+        return SwapchainPresentResult::internal(VK_SUCCESS);
     }
     if (this->crossDeviceMode == CrossDeviceRuntimeMode::CAPTURE_ONLY) {
+        if (this->generatedOutputReturnDiagnosticSession
+                && this->generatedOutputReturnDiagnosticSession
+                    ->hasAcceptedBReturnFailure()) {
+            const auto status = this->generatedOutputReturnDiagnosticSession
+                ->tryRetireAcceptedBReturnFailure(
+                    this->instance.get(), this->runtimeGenerateDiagnosticSession.get());
+            if (status == backend::RuntimeRetirementStatus::NOT_READY)
+                throw ls::error("D3B3 post-submit B-return retirement is pending");
+            if (status == backend::RuntimeRetirementStatus::DEVICE_LOST) {
+                if (this->terminalContext) this->terminalContext->quarantineDeviceLost();
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "D3B3 post-submit B-return retirement lost the device");
+            }
+            if (status != backend::RuntimeRetirementStatus::RETIRED)
+                throw ls::error("D3B3 post-submit B-return retirement failed");
+            const auto released = this->generatedOutputReturnDiagnosticSession
+                ->releaseAcceptedBReturnFailure(
+                    this->instance.get(), this->runtimeGenerateDiagnosticSession.get());
+            if (released != backend::RuntimeRetirementStatus::RETIRED)
+                throw ls::error("D3B3 retired B-return resources were not released");
+            this->generatedOutputReturnDiagnosticSession.reset();
+        }
         if (this->captureOnlyPhase == 0) {
             const auto sourceImage = this->info.images.at(imageIdx);
             std::cerr << "[DG2X-P4C-B0] Cross-device capture-only runtime\n"
@@ -543,7 +2394,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             std::cerr << "DG2X_P4C_B0_CAPTURE_ONLY_RUNTIME_PASS\n"
                 << "cross-device capture hook reached, but real frame transport is not connected yet\n";
             this->captureOnlyPhase = 1;
-            return VK_SUCCESS;
+            return SwapchainPresentResult::internal(VK_SUCCESS);
         }
         if (this->captureOnlyPhase <= 2) {
             if (this->captureOnlyPhase == 1) {
@@ -569,7 +2420,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 this->runtimePrepassSession.get(), this->frameTransportB.image(),
                 std::move(transport));
             this->captureOnlyPhase++;
-            return VK_SUCCESS;
+            return SwapchainPresentResult::internal(VK_SUCCESS);
         }
         if (this->captureOnlyPhase <= 5) {
             if (this->captureOnlyPhase == 3) {
@@ -618,28 +2469,53 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 const auto terminalConsumer = selectGeneratedOutputTerminalConsumer(d3b, d3b2);
                 std::optional<vk::RuntimeForeignImageHandoffInfo> handoff;
                 if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly) {
-                    try { this->returnedForGraphics.emplace(vk); }
+                    try {
+                        if (!this->terminalHandoffBinding)
+                            throw std::logic_error("terminal context unavailable");
+                        this->returnedForGraphicsLease.emplace(
+                            this->terminalHandoffBinding->acquire(
+                                static_cast<uint64_t>(this->captureOnlyPhase + 1)));
+                    }
                     catch (...) {
                         if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B1)
                             this->d3b1State = D3B1PresentationState::FAILED;
                         throw;
                     }
-                    handoff = vk::RuntimeForeignImageHandoffInfo{
-                        .destinationQueueFamilyIndex = graphicsFinalQueue->family,
-                        .signalSemaphore = this->returnedForGraphics->handle()};
+                    handoff = this->returnedForGraphicsLease->handoffInfo();
                 }
                 try {
                     this->generatedOutputReturnDiagnosticSession =
                         std::make_unique<GeneratedOutputReturnSession>(
-                            std::move(*generated), this->instance.get(),
-                            this->runtimeGenerateDiagnosticSession.get(), this->devicePair,
+                            ProductionReturnExecution{}, this->devicePair,
                             this->instance.get().runtimeExchangeEndpoint(),
-                            vk::makeRuntimeExchangeEndpoint(vk), true, handoff);
+                            vk::makeRuntimeExchangeEndpoint(vk), true);
+                    this->generatedOutputReturnDiagnosticSession
+                        ->executeProductionGpuChained(
+                            std::move(*generated), this->instance.get(),
+                            this->runtimeGenerateDiagnosticSession.get(), handoff);
+                    if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly)
+                        this->returnedForGraphicsLease->signalSubmitted();
+                    if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly)
+                        this->returnedForGraphicsWaitAuthority.emplace(
+                            this->returnedForGraphicsLease->deriveWaitAuthority());
                 } catch (...) {
                     if (terminalConsumer != GeneratedOutputTerminalConsumer::DiagnosticOnly) {
+                        const auto failure = std::current_exception();
+                        bool deviceLost{};
+                        try { std::rethrow_exception(failure); }
+                        catch (const ls::vulkan_error& error) {
+                            deviceLost = error.error() == VK_ERROR_DEVICE_LOST;
+                        }
+                        catch (...) {}
+                        if (deviceLost && this->terminalContext)
+                            this->terminalContext->quarantineDeviceLost();
                         if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B1)
                             this->d3b1State = D3B1PresentationState::FAILED;
-                        this->returnedForGraphics.reset();
+                        this->returnedForGraphicsWaitAuthority.reset();
+                        if (!this->generatedOutputReturnDiagnosticSession
+                                || !this->generatedOutputReturnDiagnosticSession
+                                    ->presentationHandoffPending())
+                            this->returnedForGraphicsLease.reset();
                     }
                     throw;
                 }
@@ -653,6 +2529,15 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                     vk.fi().GetPhysicalDeviceFormatProperties2(
                         vk.physdev(), this->info.format, &destinationProperties);
                     if (terminalConsumer == GeneratedOutputTerminalConsumer::D3B2) {
+                        if (!pendingCompletion)
+                            throw std::logic_error("D3B2 async presenter completion is unavailable");
+                        const auto self = shared_from_this();
+                        const auto* vkPtr = &vk;
+                        auto operationBacking =
+                            std::make_shared<D3B2TerminalPendingGpuBacking>(
+                                vk, graphicsFinalQueue->family);
+                        auto detachedGpuBacking = combineGpuRetirementBacking(
+                            operationBacking, runtimeGpuLifetime);
                         this->d3b2State = D3B2InsertionState::INACTIVE;
                         D3B2InsertionPath insertion{
                             .generated = {
@@ -672,12 +2557,12 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                                 .blitSourceSupported = (destinationProperties.formatProperties.optimalTilingFeatures
                                     & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0},
                             .originalReady = semaphores.size() > 1 ? semaphores.at(1) : VK_NULL_HANDLE,
-                            .returnedForGraphics = this->returnedForGraphics->handle(),
-                            .acquireGenerated = this->virtualFinalAcquireSemaphore->handle(),
-                            .acquireOriginal = this->d3b2OriginalAcquireSemaphore->handle(),
-                            .generatedPresentReady = this->d3b2GeneratedPresentSemaphore->handle(),
-                            .originalPresentReady = this->d3b2OriginalPresentSemaphore->handle(),
-                            .graphicsFence = this->renderFence->handle(),
+                            .returnedForGraphics = this->returnedForGraphicsWaitAuthority->semaphore(),
+                            .acquireGenerated = operationBacking->generatedAcquireSemaphore(),
+                            .acquireOriginal = operationBacking->originalAcquireSemaphore(),
+                            .generatedPresentReady = operationBacking->generatedPresentSemaphore(),
+                            .originalPresentReady = operationBacking->originalPresentSemaphore(),
+                            .graphicsFence = operationBacking->completionFence(),
                             .commandPoolFamily = this->virtualFinalCommandFamily,
                             .submitQueueFamily = graphicsFinalQueue->family,
                             .submitQueueFlags = graphicsFinalQueue->flags,
@@ -688,19 +2573,23 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                                 & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
                             .maintenanceReleaseCapable = this->info.releaseBackend
                                 != SwapchainReleaseBackend::None,
+                            .presentFences = {
+                                operationBacking->generatedPresentationFence(),
+                                operationBacking->originalPresentationFence()},
                             .state = &this->d3b2State};
-                        insertion.acquire = [&](VkSemaphore acquireSemaphore) {
+                        insertion.acquire = [self, vkPtr, swapchain](VkSemaphore acquireSemaphore) {
                             uint32_t index{};
-                            const auto result = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                            const auto result = vkPtr->df().AcquireNextImageKHR(vkPtr->dev(), swapchain,
                                 2ULL * 1000 * 1000 * 1000, acquireSemaphore, VK_NULL_HANDLE, &index);
                             if (result != VK_SUCCESS)
                                 throw ls::vulkan_error(result, "D3B2 hidden WSI acquire failed");
-                            return D3B2HiddenImage{this->info.realImages.at(index), index, this->info.extent};
+                            return D3B2HiddenImage{self->info.realImages.at(index), index, self->info.extent};
                         };
-                        insertion.record = [&](const D3B2HiddenImage& generated,
+                        insertion.record = [self, vkPtr, view, imageIdx,
+                                operationBacking](const D3B2HiddenImage& generated,
                                 const D3B2HiddenImage& original) {
-                            const auto& command = *this->virtualFinalCommandBuffer;
-                            command.begin(vk);
+                            const auto& command = operationBacking->command();
+                            command.begin(*vkPtr);
                             std::vector<vk::Barrier> generatedPre;
                             if (view.handoffPendingAcquire())
                                 generatedPre.push_back(barrierHelper(view.image(), 0,
@@ -710,77 +2599,143 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                             generatedPre.push_back(barrierHelper(generated.image, 0,
                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
-                            command.blitImage(vk, generatedPre, {view.image(), generated.image},
+                            command.blitImage(*vkPtr, generatedPre, {view.image(), generated.image},
                                 {view.extent(), generated.extent}, {barrierHelper(generated.image,
                                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
-                            command.blitImage(vk, {
-                                    barrierHelper(this->info.images.at(imageIdx), 0,
+                            command.blitImage(*vkPtr, {
+                                    barrierHelper(self->info.images.at(imageIdx), 0,
                                         VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
                                     barrierHelper(original.image, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                                         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)},
-                                {this->info.images.at(imageIdx), original.image},
-                                this->info.extent,
-                                {barrierHelper(this->info.images.at(imageIdx),
+                                {self->info.images.at(imageIdx), original.image},
+                                self->info.extent,
+                                {barrierHelper(self->info.images.at(imageIdx),
                                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
                                  barrierHelper(original.image, VK_ACCESS_TRANSFER_WRITE_BIT,
                                     VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
-                            command.end(vk);
-                            this->renderFence->reset(vk);
+                            command.end(*vkPtr);
                         };
-                        insertion.submit = [&] {
+                        const auto originalReady = insertion.originalReady;
+                        const auto returnedForGraphics = insertion.returnedForGraphics;
+                        const auto acquireGenerated = insertion.acquireGenerated;
+                        const auto acquireOriginal = insertion.acquireOriginal;
+                        const auto generatedPresentReady = insertion.generatedPresentReady;
+                        const auto originalPresentReady = insertion.originalPresentReady;
+                        const auto graphicsFence = insertion.graphicsFence;
+                        insertion.submit = [self, vkPtr, queue, queueMutex, originalReady,
+                                returnedForGraphics, acquireGenerated, acquireOriginal,
+                                generatedPresentReady, originalPresentReady, graphicsFence,
+                                operationBacking] {
                             const std::vector<VkSemaphore> waits{
-                                insertion.originalReady, insertion.returnedForGraphics,
-                                insertion.acquireGenerated, insertion.acquireOriginal};
+                                originalReady, returnedForGraphics,
+                                acquireGenerated, acquireOriginal};
                             const std::scoped_lock queueLock(*queueMutex);
-                            this->virtualFinalCommandBuffer->submit(vk, queue, waits,
-                                VK_NULL_HANDLE, 0,
-                                {insertion.generatedPresentReady, insertion.originalPresentReady},
-                                VK_NULL_HANDLE, 0, insertion.graphicsFence,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT);
+                            submitReturnedForGraphicsTerminalWait(
+                                *self->returnedForGraphicsWaitAuthority,
+                                TerminalSubmitRole::D3B2TerminalWait,
+                                self->terminalContext->contextIdentity(),
+                                operationBacking->command(), *vkPtr, queue, waits,
+                                {generatedPresentReady, originalPresentReady},
+                                graphicsFence, VK_PIPELINE_STAGE_TRANSFER_BIT);
                             return VK_SUCCESS;
                         };
-                        insertion.present = [&](const D3B2HiddenImage& image, VkSemaphore ready) {
+                        insertion.present = [vkPtr, queue, queueMutex, swapchain](
+                                const D3B2HiddenImage& image, VkSemaphore ready) {
                             const VkPresentInfoKHR info{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                                 .waitSemaphoreCount = 1, .pWaitSemaphores = &ready,
                                 .swapchainCount = 1, .pSwapchains = &swapchain,
                                 .pImageIndices = &image.index};
                             const std::scoped_lock queueLock(*queueMutex);
-                            return vk.df().QueuePresentKHR(queue, &info);
+                            return vkPtr->df().QueuePresentKHR(queue, &info);
                         };
-                        insertion.waitGraphicsFence = [&] { return this->renderFence->wait(vk, UINT64_MAX); };
-                        insertion.generatedIntegrity = [&] {
-                            this->generatedOutputReturnDiagnosticSession->completePresentationDiagnostics();
-                            return this->generatedOutputReturnDiagnosticSession->gpuChainedPassed();
+                        insertion.presentWithFence = [vkPtr, queue, queueMutex, swapchain](
+                                const D3B2HiddenImage& image, VkSemaphore ready,
+                                VkFence presentFence) {
+                            const VkSwapchainPresentFenceInfoKHR fences{
+                                .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
+                                .swapchainCount = 1, .pFences = &presentFence};
+                            const VkPresentInfoKHR info{
+                                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                .pNext = &fences,
+                                .waitSemaphoreCount = 1, .pWaitSemaphores = &ready,
+                                .swapchainCount = 1, .pSwapchains = &swapchain,
+                                .pImageIndices = &image.index};
+                            const std::scoped_lock queueLock(*queueMutex);
+                            return vkPtr->df().QueuePresentKHR(queue, &info);
                         };
-                        insertion.originalIdentity = [&] { return insertion.original.image == this->info.images.at(imageIdx); };
-                        insertion.retire = [&] { this->generatedOutputReturnDiagnosticSession.reset(); this->returnedForGraphics.reset(); };
+                        insertion.tryRetireGraphicsFence = [] { return VK_NOT_READY; };
+                        insertion.generatedIntegrity = [self] {
+                            self->generatedOutputReturnDiagnosticSession->completePresentationDiagnostics();
+                            return self->generatedOutputReturnDiagnosticSession->gpuChainedPassed();
+                        };
+                        const auto originalImage = insertion.original.image;
+                        insertion.originalIdentity = [self, imageIdx, originalImage] {
+                            return originalImage == self->info.images.at(imageIdx);
+                        };
+                        insertion.retire = [self] {
+                            self->generatedOutputReturnDiagnosticSession.reset();
+                            self->returnedForGraphicsWaitAuthority->terminalWaitRetired();
+                            self->returnedForGraphicsWaitAuthority.reset();
+                            self->returnedForGraphicsLease.reset();
+                        };
                         insertion.emitMarker = [] { std::cerr << "DG2X_P4C_D3B2_GENERATED_THEN_ORIGINAL_PRESENT_PASS\n"; };
-                        insertion.releaseAcquiredImages = [&](const std::vector<uint32_t>& indices) {
+                        insertion.releaseAcquiredImages = [self, vkPtr, swapchain](
+                                const std::vector<uint32_t>& indices) {
                             VkReleaseSwapchainImagesInfoKHR releaseInfo{
                                 .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
                                 .swapchain = swapchain,
                                 .imageIndexCount = static_cast<uint32_t>(indices.size()),
                                 .pImageIndices = indices.data()};
-                            if (this->info.releaseBackend == SwapchainReleaseBackend::Khr
-                                    && vk.df().ReleaseSwapchainImagesKHR)
-                                return vk.df().ReleaseSwapchainImagesKHR(vk.dev(), &releaseInfo);
-                            if (this->info.releaseBackend == SwapchainReleaseBackend::Ext
-                                    && vk.df().ReleaseSwapchainImagesEXT)
-                                return vk.df().ReleaseSwapchainImagesEXT(vk.dev(), &releaseInfo);
+                            if (self->info.releaseBackend == SwapchainReleaseBackend::Khr
+                                    && vkPtr->df().ReleaseSwapchainImagesKHR)
+                                return vkPtr->df().ReleaseSwapchainImagesKHR(vkPtr->dev(), &releaseInfo);
+                            if (self->info.releaseBackend == SwapchainReleaseBackend::Ext
+                                    && vkPtr->df().ReleaseSwapchainImagesEXT)
+                                return vkPtr->df().ReleaseSwapchainImagesEXT(vkPtr->dev(), &releaseInfo);
                             return VK_ERROR_EXTENSION_NOT_PRESENT;
                         };
-                        const auto result = executeD3B2Insertion(insertion);
-                        this->captureOnlyPhase = 6;
-                        if (stopAfterCompletion && d3b1OneShotRequested(std::getenv("LSFGVK_D3B1_ONESHOT")))
-                            *stopAfterCompletion = true;
-                        return result;
+                        D3B2PendingInsertion pending;
+                        const auto result = submitD3B2InsertionNonblocking(insertion, pending);
+                        std::vector<int> completionFds;
+                        try {
+                            completionFds.push_back(
+                                operationBacking->exportCompletionFd(vk));
+                            completionFds.push_back(
+                                operationBacking->exportGeneratedPresentationFd(vk));
+                            completionFds.push_back(
+                                operationBacking->exportOriginalPresentationFd(vk));
+                        } catch (...) {
+                            for (const auto fd : completionFds)
+                                if (fd >= 0) static_cast<void>(::close(fd));
+                            completionFds.clear();
+                            if (deviceRetirementReactor)
+                                if (!deviceRetirementReactor->retainEventSourceLost(
+                                        detachedGpuBacking))
+                                    throw ls::vulkan_error(
+                                        VK_ERROR_OUT_OF_HOST_MEMORY,
+                                        "failed to retain D3B2 accepted backing");
+                        }
+                        *pendingCompletion = std::make_unique<D3B2VirtualPresentPendingOperation>(
+                            self, std::move(insertion), std::move(pending),
+                            deviceRetirementReactor, detachedGpuBacking,
+                            std::move(completionFds));
+                        return SwapchainPresentResult::internal(result);
                     }
+                    if (!pendingCompletion)
+                        throw std::logic_error("D3B1 async presenter completion is unavailable");
+                    const auto self = shared_from_this();
+                    const auto* vkPtr = &vk;
+                    auto operationBacking =
+                        std::make_shared<D3B1TerminalPendingGpuBacking>(
+                            vk, graphicsFinalQueue->family);
+                    auto detachedGpuBacking = combineGpuRetirementBacking(
+                        operationBacking, runtimeGpuLifetime);
                     D3B1PresentPath presentPath{
                         .source = {
                             .image = view.image(), .format = view.format(),
@@ -789,10 +2744,10 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                             .sourceQueueFamily = view.sourceQueueFamily(),
                             .destinationQueueFamily = view.destinationQueueFamily(),
                             .ownershipAcquireRequired = view.handoffPendingAcquire()},
-                        .hiddenAcquire = this->virtualFinalAcquireSemaphore->handle(),
-                        .returnedForPresent = this->returnedForGraphics->handle(),
-                        .finalPresentSemaphore = this->virtualFinalPresentSemaphore->handle(),
-                        .renderFence = this->renderFence->handle(),
+                        .hiddenAcquire = operationBacking->acquireSemaphore(),
+                        .returnedForPresent = this->returnedForGraphicsWaitAuthority->semaphore(),
+                        .finalPresentSemaphore = operationBacking->presentSemaphore(),
+                        .renderFence = operationBacking->completionFence(),
                         .commandPoolFamily = this->virtualFinalCommandFamily,
                         .submitQueueFamily = graphicsFinalQueue->family,
                         .submitQueueFlags = graphicsFinalQueue->flags,
@@ -803,93 +2758,101 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                             (destinationProperties.formatProperties.optimalTilingFeatures
                                 & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0,
                         .state = &this->d3b1State};
-                    presentPath.acquireHidden = [&] {
+                    presentPath.acquireHidden = [self, vkPtr, swapchain, stopToken,
+                            operationBacking] {
                         uint32_t index{};
-                        const auto result = acquireRealSwapchainImage(vk, swapchain,
-                            this->virtualFinalAcquireSemaphore->handle(), &index, stopToken);
+                        const auto result = acquireRealSwapchainImage(*vkPtr, swapchain,
+                            operationBacking->acquireSemaphore(), &index, stopToken);
                         if (result != VK_SUCCESS)
                             throw ls::vulkan_error(result, "D3B1 hidden WSI acquire failed");
                         return D3B1HiddenImage{
-                            this->info.realImages.at(index), index, this->info.extent};
+                            self->info.realImages.at(index), index, self->info.extent};
                     };
-                    presentPath.recordBlit = [&](const auto& pre, VkImage source,
+                    presentPath.recordBlit = [vkPtr, operationBacking](const auto& pre,
+                            VkImage source,
                             VkImage destination, VkExtent2D sourceExtent,
                             VkExtent2D destinationExtent, const auto& post) {
-                        const auto& finalCommand = *this->virtualFinalCommandBuffer;
-                        finalCommand.begin(vk);
-                        finalCommand.blitImage(vk, pre, {source, destination},
+                        const auto& finalCommand = operationBacking->command();
+                        finalCommand.begin(*vkPtr);
+                        finalCommand.blitImage(*vkPtr, pre, {source, destination},
                             {sourceExtent, destinationExtent}, post);
-                        finalCommand.end(vk);
-                        this->renderFence->reset(vk);
+                        finalCommand.end(*vkPtr);
                     };
-                    presentPath.submitAndPresent = [&](const auto& waits, const auto&,
+                    presentPath.submitAndPresent = [self, vkPtr, queue, queueMutex,
+                            swapchain, operationBacking](
+                            const auto& waits, const auto&,
                             VkSemaphore signal, VkFence fence, uint32_t index) {
+                        const auto presentFence = operationBacking->presentationFence();
+                        const VkSwapchainPresentFenceInfoKHR fences{
+                            .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
+                            .swapchainCount = 1, .pFences = &presentFence};
                         const VkPresentInfoKHR info{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                            .pNext = &fences,
                             .waitSemaphoreCount = 1, .pWaitSemaphores = &signal,
                             .swapchainCount = 1, .pSwapchains = &swapchain,
                             .pImageIndices = &index};
                         const std::scoped_lock queueLock(*queueMutex);
-                        this->virtualFinalCommandBuffer->submit(vk, queue, waits,
-                            VK_NULL_HANDLE, 0, {signal}, VK_NULL_HANDLE, 0, fence,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT);
-                        const auto presentResult = vk.df().QueuePresentKHR(queue, &info);
+                        submitReturnedForGraphicsTerminalWait(
+                            *self->returnedForGraphicsWaitAuthority,
+                            TerminalSubmitRole::D3B1TerminalConsumption,
+                            self->terminalContext->contextIdentity(),
+                            operationBacking->command(), *vkPtr, queue, waits,
+                            {signal}, fence, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                        const auto presentResult = vkPtr->df().QueuePresentKHR(queue, &info);
                         return D3B1SubmitPresentResult{presentResult, true};
                     };
-                    presentPath.waitRenderFence = [&] {
-                        const auto result = this->renderFence->wait(vk, UINT64_MAX);
-                        return result;
-                    };
-                    presentPath.completeDiagnostics = [&] {
-                        this->generatedOutputReturnDiagnosticSession
+                    presentPath.tryRetireRenderFence = [] { return VK_NOT_READY; };
+                    presentPath.completeDiagnostics = [self] {
+                        self->generatedOutputReturnDiagnosticSession
                             ->completePresentationDiagnostics();
-                        const auto result = this->generatedOutputReturnDiagnosticSession
+                        const auto result = self->generatedOutputReturnDiagnosticSession
                             ->gpuChainedPassed();
                         return result;
                     };
-                    presentPath.retire = [&] {
-                        this->generatedOutputReturnDiagnosticSession.reset();
-                        this->returnedForGraphics.reset();
+                    presentPath.retire = [self] {
+                        self->generatedOutputReturnDiagnosticSession.reset();
+                        self->returnedForGraphicsWaitAuthority->terminalWaitRetired();
+                        self->returnedForGraphicsWaitAuthority.reset();
+                        self->returnedForGraphicsLease.reset();
                     };
                     presentPath.emitMarker = [] {
                         std::cerr << "DG2X_P4C_D3B1_RETURNED_GENERATED_FRAME_PRESENT_PASS\n";
                     };
-                    const auto result = executeD3B1PresentPath(presentPath);
-                    this->captureOnlyPhase = 6;
-                    if (stopAfterCompletion
-                            && d3b1StopAfterTerminalPass(
-                                d3b1OneShotRequested(std::getenv("LSFGVK_D3B1_ONESHOT")),
-                                this->d3b1State)) {
-                        *stopAfterCompletion = true;
-                        std::cerr << "[D3B1-ONESHOT] terminal PASS; worker stop requested\n";
+                    D3B1PendingPresent pending;
+                    const auto result = submitD3B1PresentNonblocking(presentPath, pending);
+                    std::vector<int> completionFds;
+                    try {
+                        completionFds.push_back(
+                            operationBacking->exportCompletionFd(vk));
+                        completionFds.push_back(
+                            operationBacking->exportPresentationFd(vk));
+                    } catch (...) {
+                        for (const auto fd : completionFds)
+                            if (fd >= 0) static_cast<void>(::close(fd));
+                        completionFds.clear();
+                        if (deviceRetirementReactor)
+                            if (!deviceRetirementReactor->retainEventSourceLost(
+                                        detachedGpuBacking))
+                                throw ls::vulkan_error(
+                                    VK_ERROR_OUT_OF_HOST_MEMORY,
+                                    "failed to retain D3B1 accepted backing");
                     }
-                    return result;
+                    *pendingCompletion = std::make_unique<D3B1VirtualPresentPendingOperation>(
+                        self, std::move(presentPath), std::move(pending),
+                        deviceRetirementReactor, detachedGpuBacking,
+                        std::move(completionFds));
+                    return SwapchainPresentResult::internal(result);
                 }
             }
             this->captureOnlyPhase++;
-            if (this->captureOnlyPhase <= 5) return VK_SUCCESS;
+            if (this->captureOnlyPhase <= 5)
+                return SwapchainPresentResult::internal(VK_SUCCESS);
         }
         throw ls::error(
             d3b1PresentationDiagnosticEnabled()
                 ? "D3B1_ASYNC_PRESENTATION_NOT_YET_CONNECTED"
                 : "cross-device generated-frame diagnostic completed; output transport remains disconnected");
     }
-    const bool adaptiveBypass = isAdaptiveBypass(this->profile);
-
-    // Legacy Adaptive 1x = OFF: when the application still owns real WSI
-    // images, preserve the original direct-present path exactly.
-    if (adaptiveBypass && !this->info.virtualized) {
-        const VkPresentInfoKHR presentInfo{
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = next_chain,
-            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
-            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
-            .swapchainCount = 1,
-            .pSwapchains = &swapchain,
-            .pImageIndices = &imageIdx,
-        };
-        return vk.df().QueuePresentKHR(queue, &presentInfo);
-    }
-
     const auto& swapchainImage = this->info.images.at(imageIdx);
     const auto& outputImages = this->info.virtualized
         ? this->info.realImages
@@ -936,17 +2899,18 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             // reach WSI. Complete the consumed logical present fence after all
             // earlier hidden queue work so the application can safely retire
             // its present resources and recreate the swapchain.
-            const VkSubmitInfo submitInfo{
-                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO
+            const auto submit = [&](VkQueue actualQueue,
+                    const VkSubmitInfo& submitInfo, VkFence actualFence) {
+                if (workerOffload) {
+                    const std::scoped_lock queueLock(*queueMutex);
+                    return vk.df().QueueSubmit(
+                        actualQueue, 1, &submitInfo, actualFence);
+                }
+                return vk.df().QueueSubmit(
+                    actualQueue, 1, &submitInfo, actualFence);
             };
-
-            VkResult signalResult{};
-            if (workerOffload) {
-                const std::scoped_lock queueLock(*queueMutex);
-                signalResult = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
-            } else {
-                signalResult = vk.df().QueueSubmit(queue, 1, &submitInfo, fence);
-            }
+            const auto signalResult = compensateEnqueuedPresentAbort(
+                queue, fence, submit);
 
             if (signalResult == VK_SUCCESS) {
                 std::cerr << "lsfg-vk: compensated aborted logical present fence after "
@@ -961,108 +2925,109 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     // 3C5E: Adaptive 1x over the stable virtual topology. The runtime has
     // already consumed the application's present waits and supplies one ready
     // semaphore. No LSFG generation images or backend context exist here.
-    if (adaptiveBypass) {
-        if (semaphores.size() != 1 || !queueMutex
+    if (transformationBypass) {
+        if (semaphores.size() != 1 || !queueMutex || !pendingCompletion
                 || !this->virtualFinalCommandBuffer.has_value()
                 || !this->virtualFinalAcquireSemaphore.has_value()
-                || !this->virtualFinalPresentSemaphore.has_value()
-                || !this->renderFence.has_value()) {
+                || !this->virtualFinalPresentSemaphore.has_value()) {
             throw ls::vulkan_error(VK_ERROR_INITIALIZATION_FAILED,
                 "virtual Adaptive 1x bridge is not initialized");
         }
 
-        if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
-            throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
-        this->renderFence->reset(vk);
+        if (this->info.releaseBackend == SwapchainReleaseBackend::None)
+            throw ls::vulkan_error(VK_ERROR_FEATURE_NOT_PRESENT,
+                "virtual Adaptive 1x recovery requires swapchain maintenance release");
 
-        uint32_t realImageIdx{};
-        auto res = acquireRealSwapchainImage(vk, swapchain,
-            this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
-            stopToken);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
-            const auto fenceResult =
-                compensateAbortedLogicalPresentFence("hidden Adaptive 1x acquire");
-            if (fenceResult != VK_SUCCESS)
-                throw ls::vulkan_error(fenceResult,
-                    "failed to compensate aborted logical present fence");
-        }
-        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
-
-        const auto& realImage = outputImages.at(realImageIdx);
-        const auto& finalCmdbuf = *this->virtualFinalCommandBuffer;
-        finalCmdbuf.begin(vk);
-        finalCmdbuf.blitImage(vk,
-            {
-                barrierHelper(swapchainImage,
-                    VK_ACCESS_NONE,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                ),
-                barrierHelper(realImage,
-                    VK_ACCESS_NONE,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-                ),
-            },
-            { swapchainImage, realImage },
-            this->info.extent,
-            {
-                barrierHelper(swapchainImage,
-                    VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_ACCESS_MEMORY_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
-                ),
-                barrierHelper(realImage,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_ACCESS_MEMORY_READ_BIT,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
-                ),
+        const auto applicationFence = applicationPresentFence(next_chain);
+        auto completionPublication = std::make_shared<
+            std::unique_ptr<VirtualPresentPendingOperation>>();
+        auto reservation = this->reserveAdaptive1xPreparation(vk, queue,
+            queueMutex, swapchain, imageIdx, applicationFence, stopToken,
+            runtimeGpuLifetime, deviceRetirementReactor,
+            borrowedPresentFences, completionPublication);
+        const auto executeReservation = [&]() -> Adaptive1xPreparedLogicalFinal {
+#ifdef LSFGVK_TESTING_SHADOW_SPLIT
+            struct ExecuteHookGuard final {
+                void (*after)(){};
+                ~ExecuteHookGuard() { if (after) after(); }
+            };
+            const auto before = adaptiveReservationBeforeExecute.load(
+                std::memory_order_acquire);
+            const auto after = adaptiveReservationAfterExecute.load(
+                std::memory_order_acquire);
+            if (before) before();
+            ExecuteHookGuard hookGuard{after};
+#endif
+            return reservation.execute(semaphores.front());
+        };
+        auto prepared = [&]() -> Adaptive1xPreparedLogicalFinal {
+            try {
+                return executeReservation();
+            } catch (const ls::vulkan_error& e) {
+                // Preserve the qualified single-swapchain behavior: if the
+                // hidden physical Acquire rejects an otherwise consumed logical
+                // present, complete only this logical present's application
+                // fence. Future multi-swapchain batch code must handle this at
+                // whole-batch scope instead of reusing this per-entry policy.
+                if (classifyPresentResult(e.error())
+                        == PresentResultClass::EnqueuedRejection) {
+                    const auto fenceResult = compensateAbortedLogicalPresentFence(
+                        "hidden Adaptive 1x acquire");
+                    if (fenceResult != VK_SUCCESS)
+                        throw ls::vulkan_error(fenceResult,
+                            "failed to compensate aborted logical present fence");
+                }
+                throw;
             }
-        );
-        finalCmdbuf.end(vk);
+        }();
+        VkResult res{VK_SUCCESS};
 
+        OwnedInternalPresentFenceProjection internalFenceProjection;
+        if (prepared.requiresInternalPresentFence()
+                && !internalFenceProjection.prepare(next_chain,
+                    prepared.internalPresentFence())) {
+            static_cast<void>(prepared.abandonWithoutLogicalPresent());
+            throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                "failed to prepare owned internal present-fence projection");
+        }
+        if (!prepared.markLogicalPresentCalled())
+            throw ls::error("virtual Adaptive logical-present call authority was lost");
+        const auto physicalSwapchain = prepared.physicalSwapchain();
+        const auto physicalImageIndex = prepared.physicalImageIndex();
+        const auto readySemaphore = prepared.presentReadySemaphore();
+        const VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = presentNextChain(prepared.requiresInternalPresentFence()
+                ? const_cast<void*>(internalFenceProjection.head) : next_chain),
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &readySemaphore,
+            .swapchainCount = 1,
+            .pSwapchains = &physicalSwapchain,
+            .pImageIndices = &physicalImageIndex};
+        // Preparation deliberately does not carry queue-lock ownership across
+        // this boundary. Both operations target the same queue (whose Vulkan
+        // submission order is externally synchronized by each short scope),
+        // and the logical present additionally waits on this operation's
+        // private producer-ready binary semaphore. This permits multiple
+        // preparations to coexist without weakening producer->present order.
         {
             const std::scoped_lock queueLock(*queueMutex);
-            finalCmdbuf.submit(vk, queue,
-                {
-                    semaphores.front(),
-                    this->virtualFinalAcquireSemaphore->handle()
-                },
-                VK_NULL_HANDLE, 0,
-                { this->virtualFinalPresentSemaphore->handle() },
-                VK_NULL_HANDLE, 0,
-                this->renderFence->handle()
-            );
-
-            const VkPresentInfoKHR presentInfo{
-                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                .pNext = presentNextChain(next_chain),
-                .waitSemaphoreCount = 1,
-                .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
-                .swapchainCount = 1,
-                .pSwapchains = &swapchain,
-                .pImageIndices = &realImageIdx,
-            };
             res = vk.df().QueuePresentKHR(queue, &presentInfo);
         }
-
+        const auto presentClass = classifyPresentResult(res);
+        if ((presentClass == PresentResultClass::Normal
+                || presentClass == PresentResultClass::EnqueuedRejection)
+                && presentedIdentity)
+            *presentedIdentity = prepared.presentedIdentity();
+        const auto finalized = prepared.finalizeLogicalPresent(res);
+        if (finalized != VK_SUCCESS)
+            throw ls::vulkan_error(finalized,
+                "virtual Adaptive logical-present finalization failed");
+        if (*completionPublication)
+            *pendingCompletion = std::move(*completionPublication);
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
-
-        constexpr uint64_t WORKER_FENCE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
-        while (!this->renderFence->wait(vk, WORKER_FENCE_SLICE_NS)) {
-            if (stopToken.stop_requested())
-                throw ls::vulkan_error(VK_ERROR_OUT_OF_DATE_KHR,
-                    "virtual Adaptive 1x presentation worker stopped");
-        }
-
-        this->fidx++;
-        return res;
+            throw LogicalPresentError(res, "logical vkQueuePresentKHR() failed");
+        return SwapchainPresentResult::logical(res);
     }
 
     const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
@@ -1131,30 +3096,18 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         throw ls::error("failed to schedule frames", e);
     }
 
-    // Preserve existing behavior for an application-provided per-present mode
-    // structure. LSFG's own single-swapchain structure is injected separately
-    // by presentNextChain() when the dual-mode topology is active.
-    if (this->profile.pacing == ls::Pacing::None) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunknown-warning-option"
-#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
-        auto* info = reinterpret_cast<VkSwapchainPresentModeInfoKHR*>(next_chain);
-        while (info) {
-            if (info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR) {
-                for (size_t i = 0; i < info->swapchainCount; i++)
-                    const_cast<VkPresentModeKHR*>(info->pPresentModes)[i] =
-                        selectedPresentMode;
-            }
-
-            info = reinterpret_cast<VkSwapchainPresentModeInfoKHR*>(
-                const_cast<void*>(info->pNext));
-        }
-#pragma clang diagnostic pop
-    }
+    // Application-provided per-present mode structures are immutable input.
+    // When the application owns one, preserve it exactly; LSFG injects its
+    // internal mode only when the chain has no such structure.
 
     // wait for completion of previous frame
-    if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
-        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+    if (this->fidx) {
+        const auto previous = vk.df().GetFenceStatus(
+            vk.dev(), this->renderFence->handle());
+        if (previous != VK_SUCCESS)
+            throw ls::vulkan_error(previous,
+                "previous frame completion is not retired");
+    }
     this->renderFence->reset(vk);
 
     // copy application-visible swapchain image into backend source image
@@ -1173,7 +3126,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 VK_ACCESS_NONE,
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                fullSwapchainRange(this->info.arrayLayers)
             ),
             sourcePreBarrier,
         },
@@ -1269,6 +3224,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     this->idx = timeline.sourceReady + 1;
     this->sourceReturnValues.at((this->fidx + 1) % 2) = timeline.sourceReturn;
 
+    std::vector<PresentedPhysicalImageAcquireToken> consumedPhysicalAcquires;
     for (size_t i = 0; i < generatedFrames; i++) {
         auto& pcs = this->postCopySemaphores.at(this->idx % this->postCopySemaphores.size());
         auto& destinationImage = this->destinationImages.at(i);
@@ -1279,7 +3235,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto res = acquireRealSwapchainImage(vk, swapchain,
             pass.acquireSemaphore.handle(), &aqImageIdx,
             workerOffload ? stopToken : std::stop_token{});
-        if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (classifyPresentResult(res) == PresentResultClass::EnqueuedRejection) {
             const auto fenceResult =
                 compensateAbortedLogicalPresentFence("hidden generated-frame acquire");
             if (fenceResult != VK_SUCCESS)
@@ -1288,6 +3244,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
             throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
+
+        std::optional<PresentedPhysicalImageAcquireToken> priorPhysicalLease;
+        if (this->info.virtualized) {
+            priorPhysicalLease = this->presentedPhysicalImages->reacquired(
+                this->terminalContext->deviceIdentity(),
+                this->physicalSwapchainLifecycleIdentity,
+                reinterpret_cast<uintptr_t>(swapchain), aqImageIdx,
+                nextRetirementOperationIdentity.fetch_add(
+                    1, std::memory_order_relaxed));
+        }
 
         const auto& acquiredSwapchainImage = outputImages.at(aqImageIdx);
 
@@ -1327,57 +3293,165 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             waitSemaphores.push_back(prevPCS.second.handle());
         }
 
+        std::shared_ptr<PresentedWsiSemaphoreBacking> generatedPresentBacking;
+        VkSemaphore generatedPresentReady = pcs.first.handle();
+        if (this->info.virtualized) {
+            generatedPresentBacking =
+                std::make_shared<PresentedWsiSemaphoreBacking>(vk);
+            generatedPresentReady = generatedPresentBacking->ready.handle();
+        }
         const std::vector<VkSemaphore> signalSemaphores{
-            pcs.first.handle(),
-            pcs.second.handle()
-        };
+            generatedPresentReady, pcs.second.handle()};
 
+        if (priorPhysicalLease) {
+            consumedPhysicalAcquires.push_back(*priorPhysicalLease);
+        }
+
+        std::optional<PresentedPhysicalImageIdentity> generatedPresented;
+        std::optional<PresentedPhysicalImageLeaseRegistry::PreparedPresentedLease>
+            generatedPreparedLease;
+        std::optional<BorrowedPresentFenceRegistry::PreparedBorrowedPresentFence>
+            generatedPreparedFence;
+        OwnedInternalPresentFenceProjection generatedInternalProjection;
+        bool generatedUsesInternalFence{};
+        if (generatedPresentBacking) {
+            generatedPresented = PresentedPhysicalImageIdentity{
+                .deviceLifetimeIdentity = this->terminalContext->deviceIdentity(),
+                .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+                .physicalSwapchainIdentity = reinterpret_cast<uintptr_t>(swapchain),
+                .physicalImageIndex = aqImageIdx,
+                .presentOperationIdentity = nextRetirementOperationIdentity.fetch_add(
+                    1, std::memory_order_relaxed)};
+            const auto generatedFence = applicationPresentFence(
+                this->info.virtualized ? nullptr : ((!i) ? next_chain : nullptr));
+            PresentedPhysicalImageLeaseRegistry::PrepareFailure leaseFailure{};
+            generatedPreparedLease = this->presentedPhysicalImages->prepare(
+                *generatedPresented, generatedPresentBacking, &leaseFailure,
+                generatedFence == VK_NULL_HANDLE
+                    ? std::function<VkResult()>{[backing = generatedPresentBacking,
+                            vkPtr = &vk] {
+                        return backing->waitForCompletion(*vkPtr);
+                    }} : std::function<VkResult()>{});
+            if (!generatedPreparedLease) {
+                if (leaseFailure == PresentedPhysicalImageLeaseRegistry::PrepareFailure::OutOfHostMemory)
+                    throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                        "failed to prepare generated physical-image WSI lease");
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "generated physical image already owns a WSI lease reservation");
+            }
+            if (generatedFence != VK_NULL_HANDLE && borrowedPresentFences) {
+                BorrowedPresentFenceRegistry::PrepareFailure fenceFailure{};
+                generatedPreparedFence = borrowedPresentFences->prepare(
+                    generatedFence, this->presentedPhysicalImages,
+                    *generatedPresented, &fenceFailure);
+                if (!generatedPreparedFence) {
+                    this->presentedPhysicalImages->abort(*generatedPreparedLease);
+                    if (fenceFailure == BorrowedPresentFenceRegistry::PrepareFailure::OutOfHostMemory)
+                        throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                            "failed to prepare generated present-fence generation");
+                    throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                        "generated application present fence is untracked");
+                }
+            }
+            generatedUsesInternalFence = generatedFence == VK_NULL_HANDLE;
+            const void* generatedLogicalChain = this->info.virtualized
+                ? nullptr : ((!i) ? next_chain : nullptr);
+            if (generatedUsesInternalFence
+                    && !generatedInternalProjection.prepare(generatedLogicalChain,
+                        generatedPresentBacking->internalPresentFence.handle())) {
+                if (generatedPreparedFence)
+                    borrowedPresentFences->abort(*generatedPreparedFence);
+                this->presentedPhysicalImages->abort(*generatedPreparedLease);
+                throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+                    "failed to prepare generated internal present-fence projection");
+            }
+        }
+
+        // All ownership needed to retain the producer semaphore now exists;
+        // only then may the producer submit signal it.
         passCmdbuf.end(vk);
+        auto& destinationReturn = this->destinationReturnStates.at(i);
+        vk::LayerDestinationReturnSubmitStorage generatedSubmitStorage;
+        vk::prepareLayerDestinationReturnSubmit(waitSemaphores, signalSemaphores,
+            this->syncSemaphore->handle(), timeline.destinationReady(i),
+            this->destinationReturnSemaphores.at(i).handle(), destinationReturn,
+            generatedSubmitStorage);
         if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
-            passCmdbuf.submit(vk, queue,
-                waitSemaphores, this->syncSemaphore->handle(), timeline.destinationReady(i),
-                signalSemaphores, VK_NULL_HANDLE, 0,
-                VK_NULL_HANDLE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
-            );
+            passCmdbuf.submit(vk, queue, generatedSubmitStorage.submission);
         } else {
-            passCmdbuf.submit(vk,
-                waitSemaphores, this->syncSemaphore->handle(), timeline.destinationReady(i),
-                signalSemaphores, VK_NULL_HANDLE, 0,
+            passCmdbuf.submit(vk, generatedSubmitStorage.submission,
                 (!this->info.virtualized && i == generatedFrames - 1)
-                    ? this->renderFence->handle()
-                    : VK_NULL_HANDLE,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
-            );
+                    ? this->renderFence->handle() : VK_NULL_HANDLE);
         }
+        // The generation becomes authoritative only after QueueSubmit accepts
+        // the release-to-backend and matching GPU timeline signal.
+        destinationReturn.returnSubmitAccepted();
 
         // Generated frames never carry the application's pNext when the
         // application is rendering into virtual images. The logical present
         // metadata belongs to the final real application frame.
         const VkPresentInfoKHR presentInfo{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = this->info.virtualized
-                ? presentNextChain(nullptr)
-                : ((!i) ? next_chain : nullptr),
+            .pNext = generatedUsesInternalFence
+                ? presentNextChain(const_cast<void*>(generatedInternalProjection.head))
+                : (this->info.virtualized
+                    ? presentNextChain(nullptr) : ((!i) ? next_chain : nullptr)),
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &pcs.first.handle(),
+            .pWaitSemaphores = &generatedPresentReady,
             .swapchainCount = 1,
             .pSwapchains = &swapchain,
             .pImageIndices = &aqImageIdx,
         };
         paceFixedWorkerOutput();
-        if (workerOffload) {
+        try { if (workerOffload) {
             const std::scoped_lock queueLock(*queueMutex);
             res = vk.df().QueuePresentKHR(queue, &presentInfo);
         } else {
             res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        } } catch (...) {
+            if (generatedPreparedFence)
+                borrowedPresentFences->abort(*generatedPreparedFence);
+            if (generatedPreparedLease)
+                this->presentedPhysicalImages->abort(*generatedPreparedLease);
+            throw;
+        }
+        if (generatedPreparedLease) {
+            const auto generatedClass = classifyPresentResult(res);
+            if (generatedClass == PresentResultClass::PreEnqueueFailure) {
+                if (generatedPresentBacking && deviceRetirementReactor
+                        && !deviceRetirementReactor->retainEventSourceLost(
+                            generatedPresentBacking))
+                    throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                        "failed to retain generated producer backing after present OOM");
+                if (generatedPreparedFence)
+                    borrowedPresentFences->abort(*generatedPreparedFence);
+                this->presentedPhysicalImages->abort(*generatedPreparedLease);
+            } else if (!this->presentedPhysicalImages->commit(*generatedPreparedLease)) {
+                throw ls::error("prepared generated WSI lease commit was lost");
+            } else if (generatedPreparedFence
+                    && (generatedClass == PresentResultClass::Normal
+                        || generatedClass == PresentResultClass::EnqueuedRejection)) {
+                static_cast<void>(borrowedPresentFences->commit(*generatedPreparedFence));
+                if (generatedPreparedFence->valid())
+                    throw ls::error("prepared generated present-fence commit was lost");
+            } else if (generatedPreparedFence) {
+                borrowedPresentFences->abort(*generatedPreparedFence);
+            }
+            if (generatedUsesInternalFence
+                    && (generatedClass == PresentResultClass::Normal
+                        || generatedClass == PresentResultClass::EnqueuedRejection))
+                static_cast<void>(armInternalPresentFence(vk,
+                    generatedPresentBacking, this->presentedPhysicalImages,
+                    *generatedPresented, deviceRetirementReactor));
         }
         // In the virtual topology generated-frame presents never carry the
         // application's pNext chain. If one goes OUT_OF_DATE, the later logical
         // present will not run and its present fence would otherwise remain
         // unsignaled. Legacy non-virtual generated presents may already have
         // forwarded the application's pNext, so never compensate those here.
-        if (this->info.virtualized && res == VK_ERROR_OUT_OF_DATE_KHR) {
+        if (this->info.virtualized
+                && classifyPresentResult(res) == PresentResultClass::EnqueuedRejection) {
             const auto fenceResult =
                 compensateAbortedLogicalPresentFence("hidden generated-frame present");
             if (fenceResult != VK_SUCCESS)
@@ -1385,7 +3459,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                     "failed to compensate aborted logical present fence");
         }
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+            throw ls::vulkan_error(res, "hidden generated vkQueuePresentKHR() failed");
         markFixedWorkerOutput();
 
         this->idx++;
@@ -1410,10 +3484,10 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         };
         auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
         if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+            throw LogicalPresentError(res, "logical vkQueuePresentKHR() failed");
 
         this->fidx++;
-        return res;
+        return SwapchainPresentResult::logical(res);
     }
 
     // Virtual swapchain path: the application's image cannot be passed to WSI.
@@ -1424,7 +3498,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     auto res = acquireRealSwapchainImage(vk, swapchain,
         this->virtualFinalAcquireSemaphore->handle(), &realImageIdx,
         workerOffload ? stopToken : std::stop_token{});
-    if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+    if (classifyPresentResult(res) == PresentResultClass::EnqueuedRejection) {
         const auto fenceResult =
             compensateAbortedLogicalPresentFence("hidden final acquire");
         if (fenceResult != VK_SUCCESS)
@@ -1433,6 +3507,16 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkAcquireNextImageKHR() failed");
+
+    if (const auto token = this->presentedPhysicalImages->reacquired(
+            this->terminalContext->deviceIdentity(),
+            this->physicalSwapchainLifecycleIdentity,
+            reinterpret_cast<uintptr_t>(swapchain), realImageIdx,
+            nextRetirementOperationIdentity.fetch_add(
+                1, std::memory_order_relaxed)))
+        consumedPhysicalAcquires.push_back(*token);
+    auto finalPresentBacking =
+        std::make_shared<PresentedWsiSemaphoreBacking>(vk);
 
     const auto& realImage = outputImages.at(realImageIdx);
     const auto& finalCmdbuf = *this->virtualFinalCommandBuffer;
@@ -1449,7 +3533,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 VK_ACCESS_NONE,
                 VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                fullSwapchainRange(this->info.arrayLayers)
             ),
         },
         { swapchainImage, realImage },
@@ -1459,19 +3545,71 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_ACCESS_MEMORY_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                fullSwapchainRange(this->info.arrayLayers)
             ),
             barrierHelper(realImage,
                 VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_MEMORY_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                fullSwapchainRange(this->info.arrayLayers)
             ),
-        }
+        },
+        this->info.arrayLayers
     );
     finalCmdbuf.end(vk);
 
-    if (workerOffload) {
+    const PresentedPhysicalImageIdentity finalPresented{
+        .deviceLifetimeIdentity = this->terminalContext->deviceIdentity(),
+        .swapchainLifecycleIdentity = this->physicalSwapchainLifecycleIdentity,
+        .physicalSwapchainIdentity = reinterpret_cast<uintptr_t>(swapchain),
+        .physicalImageIndex = realImageIdx,
+        .presentOperationIdentity = nextRetirementOperationIdentity.fetch_add(
+            1, std::memory_order_relaxed)};
+    PresentedPhysicalImageLeaseRegistry::PrepareFailure leaseFailure{};
+    const auto applicationFence = applicationPresentFence(next_chain);
+    auto preparedLease = this->presentedPhysicalImages->prepare(
+        finalPresented, finalPresentBacking, &leaseFailure,
+        applicationFence == VK_NULL_HANDLE
+            ? std::function<VkResult()>{[backing = finalPresentBacking, vkPtr = &vk] {
+                return backing->waitForCompletion(*vkPtr);
+            }} : std::function<VkResult()>{});
+    if (!preparedLease) {
+        if (leaseFailure == PresentedPhysicalImageLeaseRegistry::PrepareFailure::OutOfHostMemory)
+            throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                "failed to prepare final physical-image WSI lease");
+        throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+            "final physical image already owns a WSI lease reservation");
+    }
+    std::optional<BorrowedPresentFenceRegistry::PreparedBorrowedPresentFence>
+        preparedFence;
+    if (applicationFence != VK_NULL_HANDLE && borrowedPresentFences) {
+        BorrowedPresentFenceRegistry::PrepareFailure fenceFailure{};
+        preparedFence = borrowedPresentFences->prepare(applicationFence,
+            this->presentedPhysicalImages, finalPresented, &fenceFailure);
+        if (!preparedFence) {
+            this->presentedPhysicalImages->abort(*preparedLease);
+            if (fenceFailure == BorrowedPresentFenceRegistry::PrepareFailure::OutOfHostMemory)
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "failed to prepare final borrowed present-fence generation");
+            throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+            "final application present fence has no current object identity");
+        }
+    }
+    OwnedInternalPresentFenceProjection internalFenceProjection;
+    const bool useInternalFence = applicationFence == VK_NULL_HANDLE;
+    if (useInternalFence && !internalFenceProjection.prepare(next_chain,
+            finalPresentBacking->internalPresentFence.handle())) {
+        if (preparedFence) borrowedPresentFences->abort(*preparedFence);
+        this->presentedPhysicalImages->abort(*preparedLease);
+        throw ls::vulkan_error(VK_ERROR_DEVICE_LOST,
+            "failed to prepare final internal present-fence projection");
+    }
+
+    try { if (workerOffload) {
         const std::scoped_lock queueLock(*queueMutex);
         finalCmdbuf.submit(vk, queue,
             {
@@ -1479,7 +3617,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 this->virtualFinalAcquireSemaphore->handle()
             },
             VK_NULL_HANDLE, 0,
-            { this->virtualFinalPresentSemaphore->handle() },
+            { finalPresentBacking->ready.handle() },
             VK_NULL_HANDLE, 0,
             this->renderFence->handle()
         );
@@ -1490,17 +3628,22 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 this->virtualFinalAcquireSemaphore->handle()
             },
             VK_NULL_HANDLE, 0,
-            { this->virtualFinalPresentSemaphore->handle() },
+            { finalPresentBacking->ready.handle() },
             VK_NULL_HANDLE, 0,
             this->renderFence->handle()
         );
+    } } catch (...) {
+        if (preparedFence) borrowedPresentFences->abort(*preparedFence);
+        this->presentedPhysicalImages->abort(*preparedLease);
+        throw;
     }
 
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-        .pNext = presentNextChain(next_chain),
+        .pNext = presentNextChain(useInternalFence
+            ? const_cast<void*>(internalFenceProjection.head) : next_chain),
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &this->virtualFinalPresentSemaphore->handle(),
+        .pWaitSemaphores = &finalPresentBacking->ready.handle(),
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &realImageIdx,
@@ -1512,25 +3655,56 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     } else {
         res = vk.df().QueuePresentKHR(queue, &presentInfo);
     }
+    for (const auto& token : consumedPhysicalAcquires) {
+        if (!this->presentedPhysicalImages->markAcquireConsumed(token))
+            throw ls::error("final acquire consumption authority was lost");
+    }
+    const auto presentClass = classifyPresentResult(res);
+    if (presentClass == PresentResultClass::PreEnqueueFailure) {
+        if (deviceRetirementReactor
+                && !deviceRetirementReactor->retainEventSourceLost(finalPresentBacking))
+            throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                "failed to retain producer backing after present OOM");
+        if (preparedFence) borrowedPresentFences->abort(*preparedFence);
+        this->presentedPhysicalImages->abort(*preparedLease);
+    } else if (!this->presentedPhysicalImages->commit(*preparedLease)) {
+        throw ls::error("prepared final physical-image WSI lease commit was lost");
+    } else if (preparedFence && (presentClass == PresentResultClass::Normal
+            || presentClass == PresentResultClass::EnqueuedRejection)) {
+        static_cast<void>(borrowedPresentFences->commit(*preparedFence));
+        if (preparedFence->valid())
+            throw ls::error("prepared final borrowed present-fence commit was lost");
+    } else if (preparedFence) {
+        borrowedPresentFences->abort(*preparedFence);
+    }
+    if (useInternalFence && (presentClass == PresentResultClass::Normal
+            || presentClass == PresentResultClass::EnqueuedRejection))
+        static_cast<void>(armInternalPresentFence(vk, finalPresentBacking,
+            this->presentedPhysicalImages, finalPresented,
+            deviceRetirementReactor));
+    if ((presentClass == PresentResultClass::Normal
+            || presentClass == PresentResultClass::EnqueuedRejection)
+            && presentedIdentity)
+        *presentedIdentity = finalPresented;
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-        throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+        throw LogicalPresentError(res, "logical vkQueuePresentKHR() failed");
     markFixedWorkerOutput();
 
-    // The application may reacquire this virtual image only after the worker
-    // completes it. Use bounded waits in worker mode so swapchain destruction
-    // can request cancellation instead of joining a thread stuck in an
-    // infinite fence wait.
-    if (workerOffload) {
-        constexpr uint64_t WORKER_FENCE_SLICE_NS = 50ULL * 1000ULL * 1000ULL;
-        while (!this->renderFence->wait(vk, WORKER_FENCE_SLICE_NS)) {
-            if (stopToken.stop_requested())
-                throw ls::vulkan_error(VK_ERROR_OUT_OF_DATE_KHR,
-                    "fixed presentation worker stopped");
+    if (pendingCompletion) {
+        if (!deviceRetirementReactor)
+            throw ls::error("fixed virtual event retirement is unavailable");
+        int completionFd{-1};
+        try { completionFd = this->renderFence->exportSyncFd(vk); }
+        catch (...) {
+            if (!deviceRetirementReactor->retainEventSourceLost(shared_from_this()))
+                throw ls::vulkan_error(VK_ERROR_OUT_OF_HOST_MEMORY,
+                    "failed to retain fixed virtual accepted backing");
+            throw;
         }
-    } else if (!this->renderFence->wait(vk, UINT64_MAX)) {
-        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+        *pendingCompletion = std::make_unique<ReactorFencePendingOperation>(
+            shared_from_this(), deviceRetirementReactor, completionFd,
+            std::move(consumedPhysicalAcquires), true, runtimeGpuLifetime);
+        return SwapchainPresentResult::logical(res);
     }
-
-    this->fidx++;
-    return res;
+    throw ls::error("fixed virtual presentation requires persistent event retirement");
 }

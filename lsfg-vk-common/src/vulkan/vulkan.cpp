@@ -397,6 +397,14 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
         khrProperties2 ? "vkGetPhysicalDeviceFormatProperties2KHR" : "vkGetPhysicalDeviceFormatProperties2");
     const auto imageFormatProperties2 = ipa<PFN_vkGetPhysicalDeviceImageFormatProperties2>(mpa, i,
         khrProperties2 ? "vkGetPhysicalDeviceImageFormatProperties2KHR" : "vkGetPhysicalDeviceImageFormatProperties2");
+    const auto externalSemaphoreProperties = ipa<
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, i,
+        khrProperties2 ? "vkGetPhysicalDeviceExternalSemaphorePropertiesKHR"
+                       : "vkGetPhysicalDeviceExternalSemaphoreProperties");
+    const auto externalFenceProperties = ipa<
+        PFN_vkGetPhysicalDeviceExternalFenceProperties>(mpa, i,
+        khrProperties2 ? "vkGetPhysicalDeviceExternalFencePropertiesKHR"
+                       : "vkGetPhysicalDeviceExternalFenceProperties");
     return {
         .DestroyInstance = ipa<PFN_vkDestroyInstance>(mpa, i, "vkDestroyInstance"),
         .EnumeratePhysicalDevices = ipa<PFN_vkEnumeratePhysicalDevices>(mpa, i,
@@ -416,6 +424,9 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
         .GetDeviceProcAddr = ipa<PFN_vkGetDeviceProcAddr>(mpa, i, "vkGetDeviceProcAddr"),
         .GetPhysicalDeviceImageFormatProperties2 = imageFormatProperties2,
         .GetPhysicalDeviceFormatProperties2 = formatProperties2,
+        .GetPhysicalDeviceExternalSemaphoreProperties =
+            externalSemaphoreProperties,
+        .GetPhysicalDeviceExternalFenceProperties = externalFenceProperties,
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,
@@ -461,6 +472,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CmdFillBuffer = dpa<PFN_vkCmdFillBuffer>(f, d, "vkCmdFillBuffer"),
         .CmdCopyBuffer = dpa<PFN_vkCmdCopyBuffer>(f, d, "vkCmdCopyBuffer"),
         .CmdBlitImage = dpa<PFN_vkCmdBlitImage>(f, d, "vkCmdBlitImage"),
+        .CmdCopyImage = dpa<PFN_vkCmdCopyImage>(f, d, "vkCmdCopyImage"),
         .CmdClearColorImage = dpa<PFN_vkCmdClearColorImage>(f, d, "vkCmdClearColorImage"),
         .CmdBindPipeline = dpa<PFN_vkCmdBindPipeline>(f, d, "vkCmdBindPipeline"),
         .CmdBindDescriptorSets = dpa<PFN_vkCmdBindDescriptorSets>(f, d, "vkCmdBindDescriptorSets"),
@@ -475,6 +487,9 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CreateFence = dpa<PFN_vkCreateFence>(f, d, "vkCreateFence"),
         .DestroyFence = dpa<PFN_vkDestroyFence>(f, d, "vkDestroyFence"),
         .GetFenceStatus = dpa<PFN_vkGetFenceStatus>(f, d, "vkGetFenceStatus"),
+        .GetFenceFdKHR = dpa<PFN_vkGetFenceFdKHR>(f, d, "vkGetFenceFdKHR"),
+        .ImportFenceFdKHR = dpa<PFN_vkImportFenceFdKHR>(f, d,
+            "vkImportFenceFdKHR"),
         .ResetFences = dpa<PFN_vkResetFences>(f, d, "vkResetFences"),
         .WaitForFences = dpa<PFN_vkWaitForFences>(f, d, "vkWaitForFences"),
         .CreateImage = dpa<PFN_vkCreateImage>(f, d, "vkCreateImage"),
@@ -505,6 +520,8 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
 
         .SignalSemaphoreKHR = dpa<PFN_vkSignalSemaphoreKHR>(f, d, "vkSignalSemaphoreKHR"),
         .WaitSemaphoresKHR = dpa<PFN_vkWaitSemaphoresKHR>(f, d, "vkWaitSemaphoresKHR"),
+        .GetSemaphoreCounterValueKHR = dpa<PFN_vkGetSemaphoreCounterValueKHR>(
+            f, d, "vkGetSemaphoreCounterValueKHR"),
         .GetMemoryFdKHR = dpa<PFN_vkGetMemoryFdKHR>(f, d, "vkGetMemoryFdKHR"),
         .ImportSemaphoreFdKHR = dpa<PFN_vkImportSemaphoreFdKHR>(f, d, "vkImportSemaphoreFdKHR"),
         .GetSemaphoreFdKHR = dpa<PFN_vkGetSemaphoreFdKHR>(f, d, "vkGetSemaphoreFdKHR"),

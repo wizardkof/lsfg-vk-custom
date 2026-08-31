@@ -70,6 +70,7 @@ namespace vk {
     /// optional creation details for non-standard images
     struct ImageCreateOptions {
         VkImageCreateFlags flags{};
+        uint32_t arrayLayers{1};
         VkSharingMode sharingMode{VK_SHARING_MODE_EXCLUSIVE};
         std::span<const uint32_t> queueFamilyIndices{};
         const void* pNext{};

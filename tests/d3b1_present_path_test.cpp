@@ -138,6 +138,40 @@ int main() {
         assert(executeD3B1PresentPath(path) == VK_SUCCESS);
         assert(t.pre.size() == 1 && t.waits.at(1) == path.returnedForPresent);
     }
+    {
+        Trace t; auto state = D3B1PresentationState::A_HANDOFF_SUBMITTED;
+        auto path = makePath(t, state);
+        std::vector statuses{VK_NOT_READY, VK_SUCCESS};
+        size_t statusIndex{};
+        path.tryRetireRenderFence = [&] { return statuses.at(statusIndex++); };
+        D3B1PendingPresent pending;
+        assert(submitD3B1PresentNonblocking(path, pending) == VK_SUCCESS);
+        assert(state == D3B1PresentationState::PRESENT_SUCCESS);
+        assert(pending.submitAccepted && !pending.completed);
+        assert(t.fenceWaits == 0 && t.retires == 0 && t.markers == 0);
+        assert(tryRetireD3B1Present(path, pending)
+            == D3B1RetirementResult::NOT_READY);
+        assert(state == D3B1PresentationState::PRESENT_SUCCESS);
+        assert(t.retires == 0 && t.fenceWaits == 0);
+        assert(tryRetireD3B1Present(path, pending)
+            == D3B1RetirementResult::RETIRED);
+        assert(state == D3B1PresentationState::PASS && pending.completed);
+        assert(t.retires == 1 && t.markers == 1 && t.fenceWaits == 0);
+        assert(tryRetireD3B1Present(path, pending)
+            == D3B1RetirementResult::FAILED);
+        assert(t.retires == 1 && t.markers == 1 && statusIndex == 2);
+    }
+    {
+        Trace t; auto state = D3B1PresentationState::A_HANDOFF_SUBMITTED;
+        auto path = makePath(t, state);
+        path.tryRetireRenderFence = [] { return VK_ERROR_DEVICE_LOST; };
+        D3B1PendingPresent pending;
+        assert(submitD3B1PresentNonblocking(path, pending) == VK_SUCCESS);
+        assert(tryRetireD3B1Present(path, pending)
+            == D3B1RetirementResult::DEVICE_LOST);
+        assert(state == D3B1PresentationState::FAILED);
+        assert(!pending.completed && t.retires == 0 && t.fenceWaits == 0);
+    }
     for (int variant = 0; variant < 9; ++variant) {
         Trace t; auto state = D3B1PresentationState::A_HANDOFF_SUBMITTED;
         auto path = makePath(t, state);
